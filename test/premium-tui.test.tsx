@@ -24,7 +24,7 @@ import { render } from "ink-testing-library";
 // The wall opens a browser; a test must not spawn one.
 vi.mock("../src/browser.ts", () => ({ openBrowser: () => undefined }));
 import { App } from "../src/tui/app.tsx";
-import { PremiumLockedError } from "../src/client.ts";
+import { NO_PREMIUM_CREDITS, PremiumLockedError } from "../src/client.ts";
 import type { CliConfig } from "../src/config.ts";
 import type { ChatMessage, ChatOptions, ChatTurn, GatewayClient, WalletInfo } from "../src/client.ts";
 
@@ -121,6 +121,9 @@ describe("a premium turn on bonus credits", () => {
     expect(out).toContain("Premium: complete an offer-wall survey or buy credits from $5.");
     expect(out).toContain(`${PREMIUM} is a premium model`);
     expect(out.replace(/\s+/g, " ")).toContain("It runs on credits from offer-wall surveys or purchases.");
+    // No earned credits at all, so it says so: a screened-out survey is not
+    // one that should have counted.
+    expect(out.replace(/\s+/g, " ")).toContain(NO_PREMIUM_CREDITS);
     expect(out).not.toMatch(/streak/i);
     expect(out).toContain("bonus credits");
     expect(out).toContain("Your request is kept.");

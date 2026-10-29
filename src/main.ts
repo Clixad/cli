@@ -28,6 +28,7 @@ import {
   accessColumn,
   adsPerTaskLabel,
   grantLabel,
+  NO_PREMIUM_CREDITS,
   premiumHeadline,
   premiumLocked,
   packsFromClause,
@@ -363,14 +364,14 @@ function printPremiumRefusal(err: PremiumLockedError) {
   console.log(
     c.yellow(`${err.model} is a premium model. It runs on credits from offer-wall surveys or purchases.`),
   );
-  if (err.premiumCredits > 0) {
-    console.log(
-      c.yellow(
-        `This turn needs about ${err.neededCredits.toLocaleString("en-US")} of those credits, ` +
-          `and you have ${err.premiumCredits.toLocaleString("en-US")}.`,
-      ),
-    );
-  }
+  console.log(
+    c.yellow(
+      err.premiumCredits > 0
+        ? `This turn needs about ${err.neededCredits.toLocaleString("en-US")} of those credits, ` +
+            `and you have ${err.premiumCredits.toLocaleString("en-US")}.`
+        : NO_PREMIUM_CREDITS,
+    ),
+  );
   console.log(c.yellow(`Run \`clixad earn\` for a survey on the offer walls. Offers pay ${grantLabel(err.grantPerAd)}.`));
   if (err.unlockUsd) {
     console.log(

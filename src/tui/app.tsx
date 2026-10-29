@@ -22,6 +22,7 @@ import {
   accessColumn,
   parseSpendable,
   adsPerTaskLabel,
+  NO_PREMIUM_CREDITS,
   premiumHeadline,
   premiumLocked,
   premiumUnlockHint,
@@ -2093,7 +2094,7 @@ export function App({
             err.premiumCredits > 0
               ? `  This turn needs about ${err.neededCredits.toLocaleString("en-US")} of those credits, ` +
                 `and you have ${err.premiumCredits.toLocaleString("en-US")}.\n`
-              : "";
+              : `  ${NO_PREMIUM_CREDITS}\n`;
           push({
             kind: "notice",
             tone: "warn",

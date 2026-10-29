@@ -141,6 +141,14 @@ export function premiumHeadline(unlockUsd: number | null | undefined): string {
     : "Premium: complete an offer-wall survey to unlock it.";
 }
 
+/**
+ * The gateway's line for a premium refusal when the account holds no earned
+ * or bought credits at all, word for word, so a screened-out survey is not
+ * read as one that should have counted.
+ */
+export const NO_PREMIUM_CREDITS =
+  "You have no credits from offer-wall surveys or purchases right now. A survey that screens you out pays little or nothing.";
+
 /** 5 → "$5", 7.5 → "$7.50": a pack price as the premium hints quote it. */
 export function usd(v: number): string {
   return Number.isInteger(v) ? `$${v}` : `$${v.toFixed(2)}`;
