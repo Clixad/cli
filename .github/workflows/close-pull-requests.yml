@@ -1,0 +1,28 @@
+# This repository is a one-way copy of a private one, so a pull request cannot
+# be merged here. Close each one with a note pointing at issues.
+#
+# pull_request_target runs this file as it is on main, never the pull
+# request's version of it, and nothing here checks out or runs the pull
+# request's code: the only thing read from the event is its number.
+name: Close pull requests
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  close:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Close with a note
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr close "$NUMBER" --repo "$REPO" --comment "Thanks for taking the time. This repository is an automatic one-way copy of the Clixad CLI, which is developed in a private repository, so pull requests cannot be merged here and are closed automatically. Please open an issue describing the change instead: https://github.com/$REPO/issues/new"

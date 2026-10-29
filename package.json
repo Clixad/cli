@@ -1,0 +1,53 @@
+{
+  "name": "clixad",
+  "version": "0.0.1-beta.39",
+  "description": "Free AI coding agent in your terminal, funded by rewarded ads.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/clixad/cli.git"
+  },
+  "homepage": "https://github.com/clixad/cli#readme",
+  "bugs": {
+    "url": "https://github.com/clixad/cli/issues"
+  },
+  "bin": {
+    "clixad": "dist/clixad.mjs"
+  },
+  "files": [
+    "dist",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "beta"
+  },
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "build": "node build.mjs",
+    "prepack": "node build.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.2.17",
+    "esbuild": "^0.28.1",
+    "ink-testing-library": "^4.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "@adtention/sdk": "^0.4.0",
+    "ink": "^7.1.1",
+    "react": "^19.2.8",
+    "slice-ansi": "^9.0.0",
+    "string-width": "^8.2.0",
+    "wrap-ansi": "^10.0.0"
+  }
+}

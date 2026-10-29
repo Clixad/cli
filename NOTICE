@@ -1,0 +1,20 @@
+Clixad CLI
+Copyright 2026 Florian Rappold
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this software except in compliance with the License. A copy is in the
+LICENSE file, and at https://www.apache.org/licenses/LICENSE-2.0.
+
+The `clixad code` command configures and starts Kimi CLI, a separate program
+by Moonshot AI, licensed under the Apache License, Version 2.0
+(https://github.com/MoonshotAI/kimi-cli). No part of Kimi CLI is contained in
+or bundled into this software. You install it separately
+(`uv tool install kimi-cli` or `pipx install kimi-cli`), and `clixad code`
+writes a configuration file and launches that installed program.
+
+"Kimi" is a trademark of Moonshot AI. Its use here only identifies the program
+being launched and does not imply affiliation with or endorsement by Moonshot
+AI.
+
+The License does not cover the name "Clixad" or its logo (see section 6 of the
+License).
