@@ -5,7 +5,14 @@
  * sentence, never a number derived here.
  */
 import { describe, expect, it } from "vitest";
-import { freeAlternativeLine, freeHelpLine, freeModelToName, freeTierNotice, type FreeTier } from "../src/free-tier.ts";
+import {
+  freeAlternativeLine,
+  freeHelpLine,
+  freeModelToName,
+  freeTierNotice,
+  webSearchCostLine,
+  type FreeTier,
+} from "../src/free-tier.ts";
 import { helpText } from "../src/tui/commands.ts";
 
 const FREE: FreeTier = {
@@ -133,6 +140,31 @@ describe("/help", () => {
     expect(freeHelpLine(PAUSED)).toBeUndefined();
     expect(helpText(freeHelpLine(undefined))).toBe(helpText());
     expect(helpText().split("\n")[0]).toContain("/help");
+  });
+
+  it("says web searches are not free when search is on, and nothing about them when it is off", () => {
+    expect(freeHelpLine(FREE, 1_050)!.desc).toContain("web searches are not free, ~1,050 credits each");
+    expect(freeHelpLine(SPENT, 1_050)!.desc).toContain("web searches are not free");
+    expect(freeHelpLine(FREE)!.desc).not.toContain("web search");
+  });
+});
+
+describe("what a web search costs, said before one runs", () => {
+  it("says on a free model that a search is paid from the balance anyway", () => {
+    expect(webSearchCostLine(1_050, true)).toBe(
+      "Web searches are not free: about 1,050 credits each, from your balance, also on a free model.",
+    );
+  });
+
+  it("says it on a paid model as a cost on top of the tokens", () => {
+    expect(webSearchCostLine(1_050, false)).toBe(
+      "Web searches cost about 1,050 credits each from your balance, on top of the model's tokens.",
+    );
+  });
+
+  it("says nothing without the gateway's figure", () => {
+    expect(webSearchCostLine(undefined, true)).toBeUndefined();
+    expect(webSearchCostLine(0, true)).toBeUndefined();
   });
 });
 

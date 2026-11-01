@@ -73,18 +73,43 @@ export function freeTierNotice(o: {
 }
 
 /**
+ * The sentence that says a web search is paid from the balance, or undefined
+ * when the gateway quoted no price.
+ *
+ * Said because the free models made it easy to miss: a free turn charges
+ * nothing for its model calls and still charges for every search in it. The
+ * figure is the gateway's flat price per search; the few tokens a search rides
+ * on come on top, which "about" covers and the tool row then shows exactly.
+ */
+export function webSearchCostLine(credits: number | undefined, onFreeModel: boolean): string | undefined {
+  if (credits === undefined || !(credits > 0)) return undefined;
+  const each = `about ${credits.toLocaleString("en-US")} credits each`;
+  return onFreeModel
+    ? `Web searches are not free: ${each}, from your balance, also on a free model.`
+    : `Web searches cost ${each} from your balance, on top of the model's tokens.`;
+}
+
+/**
  * The `/help` line about the free models, or undefined when there are none.
  *
  * Quotes `credits_left` rather than a turn count: the REPL keeps that figure
  * current from every free call's usage event, while `turns_left` is only as
  * fresh as the last wallet read, and `/help` is typed at any point in a session.
  */
-export function freeHelpLine(free: FreeTier | undefined): { label: string; desc: string } | undefined {
+export function freeHelpLine(
+  free: FreeTier | undefined,
+  /** What one web search is charged, when search is on; the line then says it is not free. */
+  searchCredits?: number,
+): { label: string; desc: string } | undefined {
   if (!free || !(free.daily_credits > 0)) return undefined;
-  if (free.credits_left <= 0) return { label: "free models", desc: "used up today, back at midnight UTC" };
+  const search =
+    searchCredits !== undefined && searchCredits > 0
+      ? ` · web searches are not free, ~${searchCredits.toLocaleString("en-US")} credits each`
+      : "";
+  if (free.credits_left <= 0) return { label: "free models", desc: `used up today, back at midnight UTC${search}` };
   return {
     label: "free today",
-    desc: `${free.models.length} models, ${free.credits_left.toLocaleString("en-US")} free credits left · /model switches`,
+    desc: `${free.models.length} models, ${free.credits_left.toLocaleString("en-US")} free credits left · /model switches${search}`,
   };
 }
 

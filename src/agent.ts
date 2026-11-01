@@ -40,7 +40,7 @@ import {
   type ImageAttachment,
   type Spendable,
   type ToolCall,
-  type WebSearchResult,
+  type WebSearchOutcome,
   withoutReasoning,
 } from "./client.ts";
 
@@ -85,6 +85,16 @@ export type AgentEvent =
       /** What may be spent next, worked out from `balance` (`Spendable`); absent on a free call. */
       spendable?: Spendable;
     }
+  /**
+   * What one web search was charged, the moment it is. A search comes out of
+   * the balance on every model, free ones included, which is why it is its own
+   * event rather than part of `usage`: a free turn's model calls charge nothing
+   * and its searches still do. `id` is the tool call it belongs to, absent on
+   * one forwarded from a sub-agent, whose tool calls the transcript never
+   * shows. `creditsCharged` is 0 on a cached answer and absent from a gateway
+   * too old to say; `balance` likewise.
+   */
+  | { type: "search"; id?: string; creditsCharged?: number; balance?: number; cached: boolean }
   | { type: "final"; content: string; creditsCharged: number; balance: number }
   | { type: "aborted" }
   | { type: "max_steps" };
@@ -131,7 +141,7 @@ export interface RunAgentOptions {
   /** Loop guard: max model round-trips before giving up. */
   maxSteps?: number;
   /** Backs `web_search`; absent = the tool says so rather than returning nothing. */
-  webSearch?: (query: string, opts: { count?: number; signal?: AbortSignal }) => Promise<WebSearchResult[]>;
+  webSearch?: (query: string, opts: { count?: number; signal?: AbortSignal }) => Promise<WebSearchOutcome>;
   /**
    * Whether this gateway actually has a search key.
    *
@@ -182,6 +192,12 @@ export interface AgentResult {
    */
   creditsWaived: number;
   freeCreditsLeft?: number;
+  /**
+   * Credits web searches took during the turn, sub-agents' included. Apart from
+   * `creditsCharged`, which is the model calls': on a free turn that is 0 while
+   * the searches are not, and the meta line says both.
+   */
+  searchCredits: number;
   steps: number;
   stopped?: "aborted" | "max_steps";
 }
@@ -289,13 +305,23 @@ export async function runAgent(
 ): Promise<AgentResult> {
   const maxSteps = opts.maxSteps ?? 16;
   const depth = opts.depth ?? 0;
-  const emit = (e: AgentEvent) => opts.onEvent?.(e);
-
   let creditsCharged = 0;
   let creditsWaived = 0;
   let freeCreditsLeft: number | undefined;
+  let searchCredits = 0;
   let balance = 0;
   let lastText = "";
+
+  // A search is counted here, as its event goes past, and nowhere else: a
+  // sub-agent's searches arrive as forwarded events and so are counted once,
+  // by the same line.
+  const emit = (e: AgentEvent) => {
+    if (e.type === "search") {
+      searchCredits += e.creditsCharged ?? 0;
+      if (e.balance !== undefined) balance = e.balance;
+    }
+    opts.onEvent?.(e);
+  };
 
   /**
    * Images a tool asked to put in front of the model this round.
@@ -422,6 +448,14 @@ export async function runAgent(
           emit(event);
           return;
         }
+        if (event.type === "search") {
+          // The same rule for a search, which is paid from the same wallet.
+          // Without its id: that names a tool call in the sub-agent's own
+          // conversation, which this transcript never shows.
+          const { id: _id, ...charge } = event;
+          emit(charge);
+          return;
+        }
         if (event.type === "tool_call") onProgress?.(`  ${event.name} ${firstArg(event.args)}`);
       },
     });
@@ -511,6 +545,7 @@ export async function runAgent(
         balance,
         creditsWaived,
         freeCreditsLeft,
+        searchCredits,
         steps: step + 1,
       };
     }
@@ -551,6 +586,7 @@ export async function runAgent(
     balance,
     creditsWaived,
     freeCreditsLeft,
+    searchCredits,
     steps: maxSteps,
     stopped: "max_steps",
   };
@@ -564,6 +600,7 @@ export async function runAgent(
       balance,
       creditsWaived,
       freeCreditsLeft,
+      searchCredits,
       steps: 0,
       stopped: reason,
     };
@@ -622,7 +659,29 @@ async function executeToolCall(
   }
   emit({ type: "tool_call", id, name, args });
 
-  const scoped: ToolContext = { ...ctx, onOutput: (chunk) => emit({ type: "tool_output", id, chunk }) };
+  const search = ctx.webSearch;
+  const scoped: ToolContext = {
+    ...ctx,
+    onOutput: (chunk) => emit({ type: "tool_output", id, chunk }),
+    // Reported against this call the moment it is charged, so the row says
+    // what it cost and the balance on screen moves with it.
+    ...(search
+      ? {
+          webSearch: async (query, options) => {
+            const outcome = await search(query, options);
+            const charged = outcome.cached ? 0 : outcome.creditsCharged;
+            emit({
+              type: "search",
+              id,
+              cached: outcome.cached,
+              ...(charged !== undefined ? { creditsCharged: charged } : {}),
+              ...(outcome.balance !== undefined ? { balance: outcome.balance } : {}),
+            });
+            return outcome;
+          },
+        }
+      : {}),
+  };
   try {
     const result = await dispatch(scoped, name, args);
     emit({ type: "tool_result", id, name, result, ok: true });

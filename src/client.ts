@@ -718,6 +718,22 @@ export interface WebSearchResult {
 }
 
 /**
+ * What one search came back with, and what it cost.
+ *
+ * A search is charged from the balance on every model, free ones included, so
+ * the charge travels with the results to be shown beside the tool call.
+ * `creditsCharged` is absent from a gateway too old to say and on an answer
+ * from its cache, which costs nothing (`cached`); `balance` is the balance
+ * after the charge, absent where the gateway did not send one.
+ */
+export interface WebSearchOutcome {
+  results: WebSearchResult[];
+  creditsCharged?: number;
+  balance?: number;
+  cached: boolean;
+}
+
+/**
  * A message's content, in the two shapes an OpenAI-compatible API accepts.
  *
  * A plain string is still what almost every message is, and keeping it means no
@@ -1781,6 +1797,7 @@ export class GatewayClient {
       data: ModelInfo[];
       capabilities?: Partial<GatewayCapabilities>;
       task_shape?: unknown;
+      web_search_credits?: unknown;
       cli_latest?: unknown;
       retired_models?: unknown;
       premium_unlock_usd?: unknown;
@@ -1791,6 +1808,10 @@ export class GatewayClient {
     this.unlockUsd =
       typeof data.premium_unlock_usd === "number" && data.premium_unlock_usd > 0 ? data.premium_unlock_usd : null;
     this.shape = parseTaskShape(data.task_shape);
+    this.searchCredits =
+      typeof data.web_search_credits === "number" && Number.isFinite(data.web_search_credits) && data.web_search_credits > 0
+        ? Math.round(data.web_search_credits)
+        : undefined;
     this.latest = typeof data.cli_latest === "string" ? data.cli_latest : undefined;
     // Read defensively, like every field a newer gateway adds: a malformed
     // entry costs that entry, and only ids the catalog actually lists count as
@@ -1833,6 +1854,16 @@ export class GatewayClient {
     return this.shape;
   }
   private shape: TaskShape | undefined;
+
+  /**
+   * What one web search is charged before its tokens, as of the last catalog
+   * fetch, or undefined when the gateway did not say. Undefined means the CLI
+   * does not quote a figure; it still shows each search's charge as it lands.
+   */
+  get webSearchCredits(): number | undefined {
+    return this.searchCredits;
+  }
+  private searchCredits: number | undefined;
 
   /**
    * What the gateway said it can do, as of the last catalog fetch.
@@ -2026,7 +2057,7 @@ export class GatewayClient {
   async webSearch(
     query: string,
     opts: { count?: number; signal?: AbortSignal } = {},
-  ): Promise<WebSearchResult[]> {
+  ): Promise<WebSearchOutcome> {
     const url = new URL(`${this.config.gatewayUrl}/v1/web/search`);
     url.searchParams.set("q", query);
     if (opts.count) url.searchParams.set("count", String(opts.count));
@@ -2070,8 +2101,21 @@ export class GatewayClient {
       const body = (await peeked.res.json().catch(() => ({}))) as { message?: string };
       throw new Error(body.message ?? `web search failed: ${res.status}`);
     }
-    const data = (await res.json()) as { results?: WebSearchResult[] };
-    return data.results ?? [];
+    const data = (await res.json()) as {
+      results?: WebSearchResult[];
+      credits_charged?: unknown;
+      balance?: unknown;
+      cached?: unknown;
+    };
+    const count = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? Math.round(v) : undefined);
+    const charged = count(data.credits_charged);
+    const balance = count(data.balance);
+    return {
+      results: Array.isArray(data.results) ? data.results : [],
+      ...(charged !== undefined && charged >= 0 ? { creditsCharged: charged } : {}),
+      ...(balance !== undefined ? { balance } : {}),
+      cached: data.cached === true,
+    };
   }
 
   // There is deliberately no way to earn from here. Earning goes through the

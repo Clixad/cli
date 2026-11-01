@@ -66,8 +66,18 @@ import { NO_SEARCH_INSTRUCTION, runAgent, type AgentEvent } from "../agent.ts";
 import { collectContext, INIT_HINT, INIT_PROMPT, shouldSuggestInit } from "../context.ts";
 import { expandMentions } from "../mentions.ts";
 import { compact, conversationTokens, estimateTokens, shouldCompact } from "../compact.ts";
-import { estimateClause, estimateTask, taskVerdict } from "../estimate.ts";
-import { freeHelpLine, freeTierNotice } from "../free-tier.ts";
+import {
+  estimateClause,
+  estimateTask,
+  premiumLowNotice,
+  premiumShortNotice,
+  rowTaskHint,
+  shortCredits,
+  spendOn,
+  taskHint,
+  taskVerdict,
+} from "../estimate.ts";
+import { freeHelpLine, freeTierNotice, webSearchCostLine, type FreeTier } from "../free-tier.ts";
 import { contextTokensFor } from "../kimi.ts";
 import { openBrowser } from "../browser.ts";
 import { VERSION, VERSION_LABEL, isNewerVersion } from "../version.ts";
@@ -841,6 +851,25 @@ export function App({
    */
   const searchRef = useRef(false);
   /**
+   * Whether this session has said that a web search comes out of the balance.
+   * Once: when the REPL opens on a free model, or else at the first search.
+   */
+  const searchCostToldRef = useRef(false);
+  /** What each search in the running turn was charged, by tool call id, for its row. */
+  const searchChargesRef = useRef(new Map<string, { creditsCharged?: number; cached: boolean }>());
+  /**
+   * The premium task being typed when even a typical one would not fit, as the
+   * status line's preview worked it out on the last render; the Enter check
+   * reads it, so the two can never disagree. Undefined otherwise.
+   */
+  const premiumShortRef = useRef<
+    { model: string; range: { low: number; high: number }; credits: number; floor: boolean } | undefined
+  >(undefined);
+  /** Whether the Enter check has stopped a task this session: it does so once. */
+  const premiumCheckedRef = useRef(false);
+  /** Whether the line about premium credits below the next task has been said since they last covered one. */
+  const premiumLowToldRef = useRef(false);
+  /**
    * Full output of every committed tool call that had more to show, in the
    * order they happened, so ctrl+o can keep the promise the "… +N lines
    * (ctrl+o)" label makes. It used to be a single string — the most recent
@@ -1330,6 +1359,16 @@ export function App({
         catalogRef.current = m;
         setCatalogArrived((n) => n + 1);
         searchRef.current = client.capabilities?.web_search === true;
+        // A free model charges nothing for its calls and still charges for a
+        // search, which is the part people missed. Said under the free line
+        // when the REPL opened with one, on a free model with search on.
+        const onFree = m.find((x) => x.id === modelRef.current)?.free === true;
+        const searchLine =
+          searchRef.current && freeLine && onFree ? webSearchCostLine(client.webSearchCredits, true) : undefined;
+        if (searchLine) {
+          searchCostToldRef.current = true;
+          push({ kind: "notice", text: `  ${searchLine}` });
+        }
         // An installed CLI never heard about a release until now: npm pins the
         // version of the day it was installed. One line, when there is
         // something newer, and nothing otherwise. The command is the one that
@@ -1765,6 +1804,16 @@ export function App({
           setLive((l) => ({ ...(l ?? { text: "" }), text: "" }));
           return;
         case "tool_call": {
+          // The first search of a session says, before it is charged, that it
+          // will be: on a free model that is the one thing in the turn that costs.
+          if (event.name === "web_search" && !searchCostToldRef.current) {
+            const onFree = catalogRef.current?.find((x) => x.id === modelRef.current)?.free === true;
+            const line = webSearchCostLine(client.webSearchCredits, onFree);
+            if (line) {
+              searchCostToldRef.current = true;
+              push({ kind: "notice", text: `  ${line}` });
+            }
+          }
           const summary = toolSummary(event.name, event.args);
           runningToolRef.current = { name: event.name, summary };
           setLive((l) => ({ text: l?.text ?? "", tool: { name: event.name, summary, output: "" } }));
@@ -1776,7 +1825,9 @@ export function App({
           );
           return;
         case "tool_result": {
-          const summary = runningToolRef.current?.summary ?? "";
+          const charge = event.name === "web_search" ? searchChargesRef.current.get(event.id) : undefined;
+          searchChargesRef.current.delete(event.id);
+          const summary = (runningToolRef.current?.summary ?? "") + (charge ? searchChargeLabel(charge) : "");
           setLive((l) => (l ? { text: l.text, tool: undefined } : l));
           // A permission refusal says one thing to the model and a shorter one
           // to the user; when it does, that short line is the whole entry and
@@ -1844,11 +1895,32 @@ export function App({
             );
           }
           return;
+        case "search":
+          // A sub-agent's search reaches here without its tool call, so this is
+          // the first moment the session hears of it.
+          if (!searchCostToldRef.current) {
+            const onFree = catalogRef.current?.find((x) => x.id === modelRef.current)?.free === true;
+            const line = webSearchCostLine(client.webSearchCredits, onFree);
+            if (line) {
+              searchCostToldRef.current = true;
+              push({ kind: "notice", text: `  ${line}` });
+            }
+          }
+          // Paid from the balance on every model, so the figures move now and
+          // not at the end of the turn. The balance moving without figures
+          // also drops the usable row and asks the wallet once, `spendable`'s rule.
+          if (event.id) searchChargesRef.current.set(event.id, event);
+          if (event.balance !== undefined) {
+            balanceSeqRef.current++;
+            setBalance(event.balance);
+          }
+          if (event.creditsCharged) setSpent((s) => s + event.creditsCharged!);
+          return;
         default:
           return;
       }
     },
-    [cols, flushDelta, push, setPremium, takeSpendable],
+    [client, cols, flushDelta, push, setPremium, takeSpendable],
   );
 
   // Figures that no longer belong to the balance on screen, or to today, are
@@ -2038,6 +2110,40 @@ export function App({
                 if (line) push({ kind: "notice", tone: "warn", text: `  ${line}` });
               })
               .catch(() => undefined);
+          }
+          // On a premium model, what premium may still spend against what a
+          // typical next task here costs, from the conversation as it now
+          // stands, so the next task is not started into a stop part way. Said
+          // once each time it drops below; silent at a zero balance, where the
+          // notice above speaks.
+          const info = catalogRef.current.find((m) => m.id === model);
+          const shape = client.taskShape;
+          if (info?.access === "premium" && shape && result.balance > 0) {
+            const s = spendableRef.current;
+            const { credits } = spendOn(info, {
+              balance: result.balance,
+              ...(s && s.balance === result.balance && s.day === utcDay() ? { figures: s.figures } : {}),
+              premium: premiumRef.current,
+            });
+            const schema = estimateTokens(
+              JSON.stringify(
+                toolSchemaFor(permRef.current.mode, mcpRef.current.toolSchemas(), { webSearch: searchRef.current }),
+              ),
+            );
+            const { low } = estimateTask(
+              info,
+              conversationTokens([{ role: "system", content: contextRef.current.systemPrompt }, ...next]) + schema,
+              shape,
+            );
+            if (credits >= low) premiumLowToldRef.current = false;
+            else if (!premiumLowToldRef.current) {
+              premiumLowToldRef.current = true;
+              push({
+                kind: "notice",
+                tone: "warn",
+                text: premiumLowNotice({ model, credits, low, unlockUsd: client.premiumUnlockUsd }),
+              });
+            }
           }
           // Only a turn that actually answered is rateable, which is why this
           // sits in this branch and not in the `finally`. There is nothing
@@ -2741,6 +2847,39 @@ export function App({
     [balance, client, push, refreshPremium, runBusy, runTurn],
   );
 
+  /**
+   * What each model row says a task costs, at the conversation's size now and
+   * against what this account may spend on that kind of model. Undefined for
+   * a row while the balance is unknown or the gateway sent no task shape, and
+   * the row then says what it always did.
+   */
+  const modelTaskHints = useCallback(
+    (
+      balanceNow: number | undefined,
+      o: { figures?: Spendable | undefined; premium?: PremiumAccess; free?: FreeTier },
+    ): ((m: ModelInfo) => string | undefined) => {
+      if (balanceNow === undefined) return () => undefined;
+      const context =
+        conversationTokens([{ role: "system", content: contextRef.current.systemPrompt }, ...messagesRef.current]) +
+        estimateTokens(
+          JSON.stringify(toolSchemaFor(permRef.current.mode, mcpRef.current.toolSchemas(), { webSearch: searchRef.current })),
+        );
+      return (m) =>
+        rowTaskHint(m, {
+          shape: client.taskShape,
+          contextTokens: context,
+          spend: {
+            balance: balanceNow,
+            ...(o.figures ? { figures: o.figures } : {}),
+            ...(o.premium ? { premium: o.premium } : {}),
+            ...(o.free ? { free: o.free } : {}),
+          },
+          floor: effortRaised(m, resolveEffort(m, config.effort?.[m.id])),
+        });
+    },
+    [client, config],
+  );
+
   // ---- slash commands -----------------------------------------------------
   const runCommand = useCallback(
     async (line: string) => {
@@ -2752,7 +2891,10 @@ export function App({
           exit();
           return;
         case "help":
-          push({ kind: "notice", text: helpText(freeHelpLine(freeTier)) });
+          push({
+            kind: "notice",
+            text: helpText(freeHelpLine(freeTier, searchRef.current ? client.webSearchCredits : undefined)),
+          });
           return;
         // Clears both halves of what "clear" means: the model's context *and*
         // the screen. It used to drop only the context, so nothing visibly
@@ -2853,9 +2995,11 @@ export function App({
             // (2026-10-04), so a premium row is marked locked *before* anybody
             // picks it. Only here: it is a read of the account's whole ledger,
             // and this is the one moment it is shown.
+            let read: WalletInfo | undefined;
             const free = await client
               .wallet(signal, { premium: true })
               .then((w) => {
+                read = w;
                 setBalance(w.balance);
                 setFreeTier(w.free_tier);
                 setPremium(w.premium);
@@ -2867,6 +3011,15 @@ export function App({
               });
             const premium = premiumRef.current;
             const unlockUsd = client.premiumUnlockUsd;
+            // Each row says what a task costs on it from the conversation as it
+            // stands, and whether what this account may spend on that kind of
+            // model covers it (2026-11-01). It used to be "~1.3 ads/task", one
+            // fixed call priced in offers, which said nothing about a balance.
+            const rowTask = modelTaskHints(read?.balance ?? balance, {
+              figures: parseSpendable(read?.spendable),
+              premium,
+              free,
+            });
 
             const items: PickerItem[] = models.map((m) => ({
               value: m.id,
@@ -2874,8 +3027,8 @@ export function App({
               hint:
                 accessColumn(m, premium) +
                 (m.access === "premium" && premiumLocked(premium)
-                  ? premiumUnlockHint(unlockUsd)
-                  : modelHint(m, free)),
+                  ? [rowTask(m), premiumUnlockHint(unlockUsd)].filter(Boolean).join(" · ")
+                  : modelHint(m, free, rowTask(m))),
               current: m.id === model,
             }));
             const preselect = items.findIndex((i) => i.value === arg);
@@ -2982,10 +3135,17 @@ export function App({
           await runBusy(LOADING, async (signal) => {
             const ms = await client.models(signal);
             catalogRef.current = ms;
+            const rowTask = modelTaskHints(balance, {
+              ...(spendableRef.current && spendableRef.current.balance === balance && spendableRef.current.day === utcDay()
+                ? { figures: spendableRef.current.figures }
+                : {}),
+              premium,
+              free: freeTier,
+            });
             push({
               kind: "notice",
               text: ms
-                .map((m) => `  ${m.id.padEnd(24)} ${accessColumn(m, premium)}${modelHint(m, freeTier)}`)
+                .map((m) => `  ${m.id.padEnd(24)} ${accessColumn(m, premium)}${modelHint(m, freeTier, rowTask(m))}`)
                 .join("\n"),
             });
           });
@@ -3195,7 +3355,7 @@ export function App({
           push({ kind: "notice", tone: "warn", text: `  unknown command: /${cmd} — try /help` });
       }
     },
-    [client, cols, config, cycleMode, exit, model, premium, push, root, runAdWall, runBusy, runBuy, runLogin, runTurn, setPremium, writeToStdout],
+    [client, cols, config, cycleMode, exit, model, modelTaskHints, premium, push, root, runAdWall, runBusy, runBuy, runLogin, runTurn, setPremium, writeToStdout],
   );
 
   /**
@@ -3403,6 +3563,20 @@ export function App({
   const submit = useCallback(
     async (raw: string) => {
       const line = raw.trim();
+      // A premium task that would stop part way is held back once a session,
+      // with what it costs and the ways on, and the text stays in the box:
+      // Enter again sends it. Only when nothing is running, which is when the
+      // preview it reads was drawn.
+      const short = premiumShortRef.current;
+      if (short && line && !busyRef.current && !premiumCheckedRef.current && !/^[/!]/.test(line)) {
+        premiumCheckedRef.current = true;
+        push({
+          kind: "notice",
+          tone: "warn",
+          text: premiumShortNotice({ ...short, unlockUsd: client.premiumUnlockUsd }),
+        });
+        return;
+      }
       setEditor(ed.EMPTY);
       setHistIdx(-1);
       setMenuOff(false);
@@ -3421,7 +3595,7 @@ export function App({
       if (busyRef.current) return void enqueue(line);
       return runSerially(line);
     },
-    [enqueue, runSerially],
+    [client, enqueue, push, runSerially],
   );
 
   // Kick off `clixad agent "<task>"` once the UI is mounted.
@@ -4231,11 +4405,16 @@ export function App({
    */
   const typed = ed.toText(editor);
   let estimate: { variants: string[]; warn: boolean } | undefined;
+  premiumShortRef.current = undefined;
   const info = catalogRef.current.find((m) => m.id === model);
   // What a call on this model may spend right now, from figures that belong to
   // the balance on screen and to today (`spendable`), and only when the
   // catalog says which kind of model it is. Anything less certain leaves the
   // bare balance, which claims nothing about what can be spent.
+  const figuresNow =
+    spendable && balance !== undefined && spendable.balance === balance && spendable.day === utcDay()
+      ? spendable.figures
+      : undefined;
   const usable: StatusUsable | undefined = (() => {
     const s = spendable;
     if (!s || balance === undefined || s.balance !== balance || s.day !== utcDay() || !info?.access) return undefined;
@@ -4251,21 +4430,21 @@ export function App({
   // catalog has arrived the saved value is shown as it is.
   const effortNow = info ? resolveEffort(info, effortBy[model]) : effortBy[model];
   const shape = client.taskShape;
-  // No preview on a raised setting: `task_shape` was measured at the models'
-  // defaults, so it would understate exactly the tasks that think longer, and
-  // a preview shown too low is the one that meets the paywall halfway. A
-  // lowered setting keeps it, since there it errs toward a dearer figure.
+  // On a raised setting only the floor (2026-11-01): `task_shape` was measured
+  // at the models' defaults, so it would understate exactly the tasks that
+  // think longer, and a preview shown too low is the one that meets the
+  // paywall halfway. What a task costs at least still holds, and a lowered
+  // setting keeps the whole range, since there it errs toward a dearer figure.
   if (
     !busy &&
     info &&
     shape &&
     balance !== undefined &&
-    !effortRaised(info, resolveEffort(info, effortBy[model])) &&
     typed.trim() !== "" &&
     !/^[/!]/.test(typed.trimStart())
   ) {
+    const raised = effortRaised(info, resolveEffort(info, effortBy[model]));
     const range = estimateTask(info, conversationUsed + schemaTokens + estimateTokens(typed), shape);
-    const onFree = Boolean(info.free && freeTier?.models.includes(model));
     // On a premium model only the credits premium takes count (2026-10-04): a
     // balance of bonus credits shown as covering the task would be a preview
     // for a turn the gateway is about to refuse. Unknown counts the balance,
@@ -4275,16 +4454,26 @@ export function App({
     // belongs to the balance on screen: past the daily limit on bonus credits a
     // budget model is in the same position, and the preview said "covered"
     // over a wallet the gateway was about to refuse.
-    const canSpend = usable
-      ? usable.credits
-      : info.access === "premium" && premium && !premium.unlocked
-        ? Math.min(balance, premium.credits)
-        : balance;
-    const verdict = taskVerdict(range, {
-      balance: canSpend,
-      ...(onFree ? { freeLeft: freeTier!.credits_left } : {}),
+    const spend = spendOn(info, { balance, figures: figuresNow, premium, free: freeTier });
+    const verdict = taskVerdict(raised ? { low: range.low, high: range.low } : range, {
+      balance: spend.credits,
+      ...(spend.freeLeft !== undefined ? { freeLeft: spend.freeLeft } : {}),
     });
-    estimate = estimateClause(range, verdict, !onFree && (freeTier?.credits_left ?? 0) > 0);
+    // The premium figure is named when it is below the balance and the status
+    // line does not already show it as the usable figure.
+    const against =
+      info.access === "premium" && !usable && spend.credits < balance
+        ? `${shortCredits(spend.credits, "down")} premium`
+        : undefined;
+    estimate = estimateClause(range, verdict, spend.freeLeft === undefined && (freeTier?.credits_left ?? 0) > 0, {
+      floor: raised,
+      ...(against ? { against } : {}),
+    });
+    // With no premium credits at all the gateway's own refusal and its chooser
+    // say it better, so the Enter check stands aside.
+    if (info.access === "premium" && verdict === "short" && spend.credits > 0) {
+      premiumShortRef.current = { model, range, credits: spend.credits, floor: raised };
+    }
   }
 
   // The status line, fitted to one row before anything is drawn.
@@ -4729,8 +4918,10 @@ function renderInput(state: ed.EditorState, from: number, rows: number): React.R
 export function modelHint(
   m: ModelInfo,
   free: { models: string[]; turns_left: Record<string, number> } | undefined,
+  /** What a task costs on this row (`rowTaskHint`); absent, the gateway's ads-per-task figure as before. */
+  task?: string,
 ): string {
-  const effort = adsPerTaskLabel(m.est_ads_per_task);
+  const effort = task ?? adsPerTaskLabel(m.est_ads_per_task);
   // `m.free` is the catalog's own flag and `free.models` is this account's
   // allowance; both have to agree before a row claims to be free, so a paused
   // tier (which answers with an empty allowance) cannot leave "free" on screen.
@@ -4759,17 +4950,30 @@ export function turnMeta(result: {
   creditsCharged: number;
   creditsWaived: number;
   freeCreditsLeft?: number;
+  /** What web searches took, apart from the model calls; a free turn's searches are still paid. */
+  searchCredits?: number;
   balance: number;
 }): string {
   const n = (v: number) => v.toLocaleString("en-US");
   const balance = `balance ${n(result.balance)}`;
-  if (result.creditsWaived <= 0) return `[${n(result.creditsCharged)} credits · ${balance}]`;
+  const search = result.searchCredits && result.searchCredits > 0 ? ` · web search ${n(result.searchCredits)} credits` : "";
+  if (result.creditsWaived <= 0) return `[${n(result.creditsCharged)} credits${search} · ${balance}]`;
   const left =
     result.freeCreditsLeft === undefined ? "" : ` · ${n(result.freeCreditsLeft)} free credits left`;
   if (result.creditsCharged > 0) {
-    return `[free: ${n(result.creditsWaived)} credits · then ${n(result.creditsCharged)} charged · ${balance}]`;
+    return `[free: ${n(result.creditsWaived)} credits · then ${n(result.creditsCharged)} charged${search} · ${balance}]`;
   }
-  return `[free · ${n(result.creditsWaived)} credits waived${left}]`;
+  // A free turn's balance only moves for a search, so it is shown only then.
+  return search
+    ? `[free · ${n(result.creditsWaived)} credits waived${left}${search} · ${balance}]`
+    : `[free · ${n(result.creditsWaived)} credits waived${left}]`;
+}
+
+/** What a search's row says it cost: the charge, or that a cached answer cost nothing. */
+export function searchChargeLabel(charge: { creditsCharged?: number; cached: boolean }): string {
+  if (charge.cached) return " · cached, no charge";
+  if (charge.creditsCharged === undefined) return "";
+  return ` · ${charge.creditsCharged.toLocaleString("en-US")} credits`;
 }
 
 /**

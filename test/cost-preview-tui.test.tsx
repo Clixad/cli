@@ -176,10 +176,11 @@ describe("the cost preview", () => {
     view.unmount();
   });
 
-  it("is not there on a raised /effort setting, and stays on a lowered one", async () => {
-    // `task_shape` was measured at the models' defaults, so it would understate
-    // a task that thinks longer, and a preview shown too low is the one that
-    // meets the paywall halfway. A lowered setting errs the other way.
+  it("is only the floor on a raised /effort setting, and the whole range on a lowered one", async () => {
+    // `task_shape` was measured at the models' defaults, so its high end would
+    // understate a task that thinks longer, and a preview shown too low is the
+    // one that meets the paywall halfway. What a task costs at least still
+    // holds (2026-11-01). A lowered setting errs the other way.
     const w = wallet(5_000_000);
     const opus = { ...row(PAID, 750_000, 3_750_000, false), efforts: ["low", "medium", "high", "xhigh", "max"], default_effort: "high" };
     const client = { ...stubClient(w), models: async () => [opus] } as unknown as GatewayClient;
@@ -191,7 +192,10 @@ describe("the cost preview", () => {
       await tick();
       const frame = strip(view.lastFrame()!);
       if (shown) expect(frame, effort).toContain("task ≈");
-      else expect(frame, effort).not.toContain("task ≈");
+      else {
+        expect(frame, effort).not.toContain("task ≈");
+        expect(frame, effort).toMatch(/task ≥ [\d.]+k? cr/);
+      }
       view.unmount();
     }
   });

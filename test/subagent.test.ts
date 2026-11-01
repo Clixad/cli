@@ -209,10 +209,59 @@ describe("task", () => {
       webSearchAvailable: true,
       webSearch: async (query) => {
         searched = query;
-        return [{ title: "Vitest", url: "https://vitest.dev/", snippet: "docs" }];
+        return { results: [{ title: "Vitest", url: "https://vitest.dev/", snippet: "docs" }], cached: false };
       },
     });
     expect(searched).toBe("vitest fake timers");
+  });
+
+  it("reports a search's charge against its own tool call, and a cached one as free", async () => {
+    const events: AgentEvent[] = [];
+    let n = 0;
+    const client = new TwoLevelClient({
+      parent: [
+        toolTurn("t1", "web_search", { query: "a" }),
+        toolTurn("t2", "web_search", { query: "a" }),
+        say("done"),
+      ],
+      sub: [],
+    });
+    const res = await runAgent(client, "go", {
+      model: "m",
+      root,
+      webSearchAvailable: true,
+      webSearch: async () =>
+        n++ === 0
+          ? { results: [], creditsCharged: 1_050, balance: 950, cached: false }
+          : { results: [], cached: true },
+      onEvent: (e) => events.push(e),
+    });
+    expect(events.filter((e) => e.type === "search")).toEqual([
+      { type: "search", id: "t1", cached: false, creditsCharged: 1_050, balance: 950 },
+      { type: "search", id: "t2", cached: true, creditsCharged: 0 },
+    ]);
+    expect(res.searchCredits).toBe(1_050);
+  });
+
+  it("passes a sub-agent's search charge up once, without its tool call id", async () => {
+    // A search is paid from the same wallet as the parent's calls: the event
+    // moves the status line, the total fills in the meta line, and neither may
+    // count it twice.
+    const events: AgentEvent[] = [];
+    const client = new TwoLevelClient({
+      parent: [toolTurn("t1", "task", { description: "look up", prompt: "look it up" }), say("done")],
+      sub: [toolTurn("s1", "web_search", { query: "vitest fake timers" }), say("found it")],
+    });
+    const res = await runAgent(client, "go", {
+      model: "m",
+      root,
+      webSearchAvailable: true,
+      webSearch: async () => ({ results: [], creditsCharged: 1_069, balance: 8_931, cached: false }),
+      onEvent: (e) => events.push(e),
+    });
+    const searches = events.filter((e) => e.type === "search");
+    expect(searches).toEqual([{ type: "search", creditsCharged: 1_069, balance: 8_931, cached: false }]);
+    expect(res.searchCredits).toBe(1_069);
   });
 });
 

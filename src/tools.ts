@@ -19,7 +19,7 @@ import { killTree, shells, ShellError, type ShellRegistry, type ShellSnapshot } 
 import { parseTodos, todoResult, TodoError, type TodoList } from "./todos.ts";
 import { fetchPage, WebError } from "./web.ts";
 import { isMcpToolName, McpError, type McpHub } from "./mcp.ts";
-import { PaywallError, type ImageAttachment, type WebSearchResult } from "./client.ts";
+import { PaywallError, type ImageAttachment, type WebSearchOutcome, type WebSearchResult } from "./client.ts";
 import type { Permit, PermissionMode, PermissionRequest, PlanDecision } from "./permissions.ts";
 
 export class ToolError extends Error {}
@@ -91,7 +91,7 @@ export interface ToolContext {
    * held any provider credential — the thing the whole architecture is arranged
    * to avoid.
    */
-  webSearch?: (query: string, opts: { count?: number; signal?: AbortSignal }) => Promise<WebSearchResult[]>;
+  webSearch?: (query: string, opts: { count?: number; signal?: AbortSignal }) => Promise<WebSearchOutcome>;
   /**
    * Put a multiple-choice question to the user and wait for the answer. Absent
    * = nobody is watching (`clixad -p`), and the tool raises rather than picking
@@ -785,7 +785,7 @@ export const TOOLS = {
     const count = Math.min(MAX_SEARCH_RESULTS, countArg(args.count, DEFAULT_SEARCH_RESULTS));
     let results: WebSearchResult[];
     try {
-      results = await ctx.webSearch(query, { count, ...(ctx.signal ? { signal: ctx.signal } : {}) });
+      ({ results } = await ctx.webSearch(query, { count, ...(ctx.signal ? { signal: ctx.signal } : {}) }));
     } catch (err) {
       networkToolError(err);
     }

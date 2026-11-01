@@ -6,7 +6,7 @@
  *                            create/attach an account (dev shortcut for now)
  *   clixad logout            forget the stored token
  *   clixad whoami            show current account + balance
- *   clixad models            list models with credit prices and ads/task
+ *   clixad models            list models with credit prices and what a task costs
  *   clixad model <id>        set the default model
  *   clixad wallet            show balance, ads today, recent ledger
  *   clixad earn              open the ad wall, wait for the reward to land
@@ -32,6 +32,7 @@ import {
   premiumHeadline,
   premiumLocked,
   packsFromClause,
+  parseSpendable,
   usd,
   ledgerReasonLabel,
   redeemMessage,
@@ -67,7 +68,9 @@ import { openBrowser } from "./browser.ts";
 import { palette } from "./color.ts";
 import { clearTerminalTitle, setTerminalTitle } from "./title.ts";
 import { VERSION } from "./version.ts";
-import { savedEffort } from "./effort.ts";
+import { effortRaised, resolveEffort, savedEffort } from "./effort.ts";
+import { conversationTokens, estimateTokens } from "./compact.ts";
+import { rowTaskHint } from "./estimate.ts";
 
 /**
  * The one-shot commands' palette, gated on the stream they are writing to.
@@ -115,7 +118,7 @@ async function main() {
     case "whoami":
       return whoami(client, config);
     case "models":
-      return listModels(client);
+      return listModels(client, config);
     case "model":
       return setModel(client, config, rest[0]);
     case "wallet":
@@ -318,7 +321,7 @@ function earnedToday(w: WalletInfo): string {
   return `earned today: ${offers} · $${w.earned_usd_today.toFixed(2)}/$${w.max_reward_usd_per_day.toFixed(2)}`;
 }
 
-async function listModels(client: GatewayClient) {
+async function listModels(client: GatewayClient, config: CliConfig) {
   const models = await client.models();
   // The allowance, so the free rows can say what is actually left rather than
   // only that they are free, and whether premium models are open to this
@@ -328,7 +331,28 @@ async function listModels(client: GatewayClient) {
   const wallet = await client.wallet(undefined, { premium: true }).catch(() => undefined);
   const free = wallet?.free_tier;
   const premium = wallet?.premium;
-  console.log(c.bold("Models  (credit prices per 1M tokens)"));
+  // What a task costs on each model, from a new session in this directory,
+  // and whether what this account may spend on that kind of model covers it
+  // (2026-11-01). It was "~1.3 ads/task": one fixed call priced in offers.
+  const context =
+    conversationTokens([{ role: "system", content: collectContext(process.cwd()).systemPrompt }]) +
+    estimateTokens(JSON.stringify(toolSchemaFor("normal", [], { webSearch: client.capabilities.web_search })));
+  const figures = parseSpendable(wallet?.spendable);
+  const task = (m: (typeof models)[number]) =>
+    wallet
+      ? rowTaskHint(m, {
+          shape: client.taskShape,
+          contextTokens: context,
+          spend: {
+            balance: wallet.balance,
+            ...(figures ? { figures } : {}),
+            ...(premium ? { premium } : {}),
+            ...(free ? { free } : {}),
+          },
+          floor: effortRaised(m, resolveEffort(m, savedEffort(config, m.id))),
+        })
+      : undefined;
+  console.log(c.bold("Models  (credit prices per 1M tokens; a task is a typical to a long one, from a new session)"));
   for (const m of models) {
     const tag = m.ad_fundable ? "" : c.dim(" [paid/BYOK]");
     // `free` is a fact about the deployment and `turns_left` is a fact about
@@ -349,7 +373,7 @@ async function listModels(client: GatewayClient) {
     console.log(
       `  ${c.cyan(m.id.padEnd(22))} ${accessColumn(m, premium)} ` +
         `in ${String(m.credits_per_mtoken_input).padStart(9)}  out ${String(m.credits_per_mtoken_output).padStart(9)}  ` +
-        `${adsPerTaskLabel(m.est_ads_per_task)}${tag}${freeTag}${lockTag}`,
+        `${task(m) ?? adsPerTaskLabel(m.est_ads_per_task)}${tag}${freeTag}${lockTag}`,
     );
   }
 }
@@ -634,8 +658,11 @@ async function printCmd(client: GatewayClient, config: CliConfig, task: string) 
           ? `free: ${res.creditsWaived} credits · then ${res.creditsCharged} charged`
           : `free · ${res.creditsWaived} credits waived`
         : `${res.creditsCharged} credits`;
+    // Searches are paid from the balance on every model, so a free run that
+    // searched still says what it took.
+    const search = res.searchCredits > 0 ? ` · web search ${res.searchCredits} credits` : "";
     console.log(
-      c.dim(`\n  [${cost} · balance ${res.balance} · ${res.steps} step(s)]`),
+      c.dim(`\n  [${cost}${search} · balance ${res.balance} · ${res.steps} step(s)]`),
     );
   } catch (err) {
     if (err instanceof PremiumLockedError) {
@@ -692,6 +719,12 @@ function printAgentEvent(event: AgentEvent) {
     }
     case "attachment":
       console.log(c.dim(`    (showing the model: ${event.labels.join(", ")})`));
+      break;
+    case "search":
+      if (event.cached) console.log(c.dim("    (web search: cached, no charge)"));
+      else if (event.creditsCharged !== undefined) {
+        console.log(c.dim(`    (web search: ${event.creditsCharged.toLocaleString("en-US")} credits from your balance)`));
+      }
       break;
     case "final":
       process.stdout.write("\n");

@@ -53,7 +53,11 @@ describe("web_search", () => {
   it("renders titles, urls and snippets, and points at web_fetch", async () => {
     const ctxWithSearch: ToolContext = {
       ...ctx,
-      webSearch: async () => [result("Vitest docs", "https://vitest.dev/"), result("Guide", "https://vitest.dev/guide")],
+      webSearch: async () => ({
+        results: [result("Vitest docs", "https://vitest.dev/"), result("Guide", "https://vitest.dev/guide")],
+        creditsCharged: 1_069,
+        cached: false,
+      }),
     };
     const out = await TOOLS.web_search(ctxWithSearch, { query: "vitest mocking" });
     expect(out).toContain("Vitest docs");
@@ -67,7 +71,7 @@ describe("web_search", () => {
       ...ctx,
       webSearch: async (_q, opts) => {
         asked = opts.count ?? 0;
-        return [];
+        return { results: [], cached: false };
       },
     };
     await TOOLS.web_search(ctxWithSearch, { query: "x", count: 999 });
@@ -77,7 +81,7 @@ describe("web_search", () => {
   });
 
   it("says nothing matched, which is not the same as a failure", async () => {
-    const out = await TOOLS.web_search({ ...ctx, webSearch: async () => [] }, { query: "asdkjhasd" });
+    const out = await TOOLS.web_search({ ...ctx, webSearch: async () => ({ results: [], cached: false }) }, { query: "asdkjhasd" });
     expect(out).toContain('no results for "asdkjhasd"');
   });
 

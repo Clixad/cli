@@ -14,7 +14,7 @@
  * precisely how that happened last time.
  */
 import { describe, expect, it } from "vitest";
-import { modelHint, statusLine, turnMeta } from "../src/tui/app.tsx";
+import { modelHint, searchChargeLabel, statusLine, turnMeta } from "../src/tui/app.tsx";
 import { visibleLength } from "../src/banner.ts";
 import type { ModelInfo } from "../src/client.ts";
 
@@ -114,6 +114,30 @@ describe("the turn meta line", () => {
     const line = turnMeta({ creditsCharged: 1_200, creditsWaived: 300, balance });
     expect(line).toContain("free: 300");
     expect(line).toContain("then 1,200 charged");
+  });
+
+  it("names what web searches took on a free turn, and the balance they took it from", () => {
+    // A free turn's model calls charge nothing; its searches do not stop being paid.
+    const line = turnMeta({ creditsCharged: 0, creditsWaived: 4_000, freeCreditsLeft: 56_000, searchCredits: 2_138, balance });
+    expect(line).toBe("[free · 4,000 credits waived · 56,000 free credits left · web search 2,138 credits · balance 4,988]");
+  });
+
+  it("names searches beside a paid turn's model credits, and nothing when there were none", () => {
+    expect(turnMeta({ creditsCharged: 240, creditsWaived: 0, searchCredits: 1_069, balance })).toBe(
+      "[240 credits · web search 1,069 credits · balance 4,988]",
+    );
+    expect(turnMeta({ creditsCharged: 240, creditsWaived: 0, searchCredits: 0, balance })).toBe(
+      "[240 credits · balance 4,988]",
+    );
+  });
+});
+
+describe("a search row's charge", () => {
+  it("says what the search cost, or that a cached one cost nothing", () => {
+    expect(searchChargeLabel({ creditsCharged: 1_069, cached: false })).toBe(" · 1,069 credits");
+    expect(searchChargeLabel({ creditsCharged: 0, cached: true })).toBe(" · cached, no charge");
+    // A gateway too old to say: nothing is invented.
+    expect(searchChargeLabel({ cached: false })).toBe("");
   });
 });
 

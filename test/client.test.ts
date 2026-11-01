@@ -384,6 +384,38 @@ describe("the maintenance refusal", () => {
   });
 });
 
+describe("what a web search cost", () => {
+  const ok = (body: unknown) => respond(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+
+  it("carries the charge and the balance after it alongside the results", async () => {
+    ok({ results: [{ title: "Vitest", url: "https://vitest.dev/", snippet: "docs" }], credits_charged: 1_069, balance: 8_931 });
+    const out = await new GatewayClient({ ...config }).webSearch("vitest");
+    expect(out).toEqual({
+      results: [{ title: "Vitest", url: "https://vitest.dev/", snippet: "docs" }],
+      creditsCharged: 1_069,
+      balance: 8_931,
+      cached: false,
+    });
+  });
+
+  it("says a cached answer was cached, and invents no charge from a gateway that sends none", async () => {
+    ok({ results: [], cached: true });
+    expect(await new GatewayClient({ ...config }).webSearch("vitest")).toEqual({ results: [], cached: true });
+    ok({ results: [] });
+    expect(await new GatewayClient({ ...config }).webSearch("vitest")).toEqual({ results: [], cached: false });
+  });
+
+  it("reads the flat price off the catalog, and nothing from a gateway that sends none", async () => {
+    const client = new GatewayClient({ ...config });
+    ok({ data: [], web_search_credits: 1_050 });
+    await client.models();
+    expect(client.webSearchCredits).toBe(1_050);
+    ok({ data: [], web_search_credits: "lots" });
+    await client.models();
+    expect(client.webSearchCredits).toBeUndefined();
+  });
+});
+
 describe("the sponsor config and report, with three formats", () => {
   const ok = (body: unknown) => respond(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
 

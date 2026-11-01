@@ -18,7 +18,7 @@
  * `task_shape` gets no estimate at all rather than one built on a shape typed
  * into this file.
  */
-import type { ModelInfo } from "./client.ts";
+import { usd, type ModelInfo, type PremiumAccess } from "./client.ts";
 
 /** What the gateway says a task looks like, from its own ledger. */
 export interface TaskShape {
@@ -134,28 +134,189 @@ export function estimateClause(
   range: { low: number; high: number },
   verdict: TaskVerdict,
   freeElsewhere: boolean,
+  opts: {
+    /**
+     * Only the low end, as `task ≥ low`: on a raised `/effort`, where the
+     * shape (measured at the defaults) can say what a task costs at least
+     * but not what a long one costs.
+     */
+    floor?: boolean;
+    /**
+     * What the verdict was measured against, when that is not the balance on
+     * the status line ("9.8k premium"): said in the longest phrasing of a
+     * warning, so a balance of bonus credits cannot read as covering a
+     * premium task.
+     */
+    against?: string;
+  } = {},
 ): { variants: string[]; warn: boolean } {
-  const span =
-    range.low === range.high
+  const span = opts.floor
+    ? shortCredits(range.low, "down")
+    : range.low === range.high
       ? shortCredits(range.high, "up")
       : `${shortCredits(range.low, "down")}–${shortCredits(range.high, "up")}`;
-  const head = `task ≈ ${span}`;
-  const tight = `≈${span}`;
+  const head = `task ${opts.floor ? "≥" : "≈"} ${span}`;
+  const tight = `${opts.floor ? "≥" : "≈"}${span}`;
+  const against = opts.against ? ` · ${opts.against}` : "";
   switch (verdict) {
     case "free":
       return { variants: [`${head} · free`, `${tight} free`], warn: false };
     case "fits":
       return { variants: [`${head} cr`, `${tight} cr`], warn: false };
     case "tight":
-      return { variants: [`${head} · may run short`, `${tight}, may run short`, `${tight} tight`], warn: true };
-    case "short":
       return {
         variants: [
-          `${head} · not enough, ${freeElsewhere ? "/model" : "/earn"}`,
+          ...(against ? [`${head}${against} · may run short`] : []),
+          `${head} · may run short`,
+          `${tight}, may run short`,
+          `${tight} tight`,
+        ],
+        warn: true,
+      };
+    case "short": {
+      const way = freeElsewhere ? "/model" : "/earn";
+      return {
+        variants: [
+          ...(against ? [`${head}${against} · not enough, ${way}`] : []),
+          `${head} · not enough, ${way}`,
           `${tight}, not enough`,
           `${tight} short`,
         ],
         warn: true,
       };
+    }
   }
+}
+
+/**
+ * What one call on `model` may spend for this account, and the free allowance
+ * that covers it first, in the shape `taskVerdict` takes.
+ *
+ * The gateway's own figure for this kind of model when it has one for the
+ * balance on screen (`figures`, from `spendable`); else, on a premium model,
+ * the premium credits it said this account has, since bonus credits never
+ * reach one; else the balance, which claims nothing more. `free` counts only
+ * on a model in today's free set.
+ */
+export function spendOn(
+  model: Pick<ModelInfo, "id" | "access" | "free">,
+  o: {
+    balance: number;
+    figures?: { budget: number; premium: number };
+    premium?: PremiumAccess;
+    free?: { models: string[]; credits_left: number };
+  },
+): { credits: number; freeLeft?: number } {
+  const balance = Math.max(0, o.balance);
+  const credits = o.figures
+    ? Math.max(0, Math.min(balance, model.access === "premium" ? o.figures.premium : o.figures.budget))
+    : model.access === "premium" && o.premium && !o.premium.unlocked
+      ? Math.max(0, Math.min(balance, o.premium.credits))
+      : balance;
+  const onFree = Boolean(model.free && o.free?.models.includes(model.id));
+  return { credits, ...(onFree ? { freeLeft: o.free!.credits_left } : {}) };
+}
+
+/**
+ * What a `/model` row and `clixad models` say a task costs on that model, from
+ * the conversation as it stands: `task ≈ 31k–164k · not enough (9.8k premium
+ * credits)`. The verdict is against what this account may spend on that kind
+ * of model (`spendOn`), which on a premium row is its premium credits, named
+ * whenever it does not cover the task. The verdict comes before the figure
+ * because a picker row is cut from the right on a narrow terminal. `floor` is
+ * a raised `/effort`, where only the low end is known. A free row says nothing
+ * more when the allowance covers it: the row already says it is free.
+ */
+export function taskHint(
+  range: { low: number; high: number },
+  verdict: TaskVerdict,
+  o: { credits: number; premium: boolean; heldBack: boolean; floor?: boolean },
+): string {
+  const span = o.floor
+    ? `task ≥ ${shortCredits(range.low, "down")}`
+    : range.low === range.high
+      ? `task ≈ ${shortCredits(range.high, "up")}`
+      : `task ≈ ${shortCredits(range.low, "down")}–${shortCredits(range.high, "up")}`;
+  const have = `${shortCredits(o.credits, "down")} ${o.premium ? "premium credits" : o.heldBack ? "usable" : "credits"}`;
+  switch (verdict) {
+    case "free":
+      return span;
+    case "fits":
+      return `${span} · covered`;
+    case "tight":
+      return `${span} · may run short (${have})`;
+    case "short":
+      return `${span} · not enough (${have})`;
+  }
+}
+
+/**
+ * The task a model row quotes, at `contextTokens` of conversation, or undefined
+ * when the gateway sent no task shape. One function for the picker and
+ * `clixad models`, so the two say the same thing about the same row.
+ */
+export function rowTaskHint(
+  model: ModelInfo,
+  o: {
+    shape: TaskShape | undefined;
+    contextTokens: number;
+    spend: Parameters<typeof spendOn>[1];
+    floor: boolean;
+  },
+): string | undefined {
+  if (!o.shape) return undefined;
+  const range = estimateTask(model, o.contextTokens, o.shape);
+  const { credits, freeLeft } = spendOn(model, o.spend);
+  const verdict = taskVerdict(o.floor ? { low: range.low, high: range.low } : range, {
+    balance: credits,
+    ...(freeLeft !== undefined ? { freeLeft } : {}),
+  });
+  return taskHint(range, verdict, {
+    credits,
+    premium: model.access === "premium",
+    heldBack: credits < Math.max(0, o.spend.balance),
+    floor: o.floor,
+  });
+}
+
+/**
+ * The notice in front of a premium task that would stop part way, shown once a
+ * session instead of sending it: what it likely costs, what premium may spend,
+ * and the ways on. Enter again sends it anyway. The figures are the estimate's
+ * and the gateway's; nothing is decided here but the wording.
+ */
+export function premiumShortNotice(o: {
+  model: string;
+  range: { low: number; high: number };
+  credits: number;
+  floor?: boolean;
+  unlockUsd: number | null;
+}): string {
+  const cost = o.floor
+    ? `at least ${shortCredits(o.range.low, "down")}`
+    : `about ${shortCredits(o.range.low, "down")}–${shortCredits(o.range.high, "up")}`;
+  return (
+    `  This task likely costs ${cost} credits on ${o.model}, and premium models can spend ` +
+    `${o.credits.toLocaleString("en-US")} of yours, so it would stop part way.\n` +
+    "  Enter sends it anyway. /model picks a budget model, /earn opens the offer walls" +
+    (typeof o.unlockUsd === "number" && o.unlockUsd > 0 ? `, /buy sells credits from ${usd(o.unlockUsd)}.` : ".")
+  );
+}
+
+/**
+ * The line under a finished premium turn when what premium may still spend is
+ * below what a typical next task here costs, so the next one is not started
+ * blind into a paywall.
+ */
+export function premiumLowNotice(o: {
+  model: string;
+  credits: number;
+  low: number;
+  unlockUsd: number | null;
+}): string {
+  return (
+    `  ${o.credits.toLocaleString("en-US")} premium credits left, under what a typical next task on ${o.model} ` +
+    `costs (about ${shortCredits(o.low, "down")}). /model picks a budget model, /earn` +
+    (typeof o.unlockUsd === "number" && o.unlockUsd > 0 ? ` or /buy adds credits.` : " adds credits.")
+  );
 }
