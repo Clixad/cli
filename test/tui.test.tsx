@@ -24,6 +24,7 @@ import { AuthError, messageText } from "../src/client.ts";
 import { MODE_LABEL, MODES } from "../src/permissions.ts";
 import { MODE_STYLE } from "../src/tui/views.tsx";
 import type { ChatMessage, ChatOptions, ChatTurn, GatewayClient, WalletInfo } from "../src/client.ts";
+import { frameIn, waitFor } from "./helpers/wait.ts";
 
 const config: CliConfig = {
   gatewayUrl: "http://127.0.0.1:8787",
@@ -142,7 +143,7 @@ describe("TUI", () => {
     const { stdin, lastFrame } = render(<App client={stubClient()} config={config} wallet={wallet} />);
 
     stdin.write("/mod");
-    await tick();
+    await frameIn(lastFrame, { has: ["/model ", "/models", "/mode [name]", "↑↓ choose", "❯ /model "] });
     const menu = strip(lastFrame() ?? "");
     expect(menu).toContain("/model ");
     expect(menu).toContain("/models");
@@ -151,11 +152,11 @@ describe("TUI", () => {
     expect(menu).toContain("❯ /model "); // first row highlighted
 
     stdin.write(ARROW_DOWN);
-    await tick();
+    await frameIn(lastFrame, { has: ["❯ /models"] });
     expect(strip(lastFrame() ?? "")).toContain("❯ /models");
 
     stdin.write("\t"); // tab completes into the box without running
-    await tick();
+    await frameIn(lastFrame, { has: ["❯ /models", "ask before edits"] });
     const done = strip(lastFrame() ?? "");
     expect(done).toContain("❯ /models");
     expect(done).toContain("ask before edits"); // menu closed, status line back
@@ -167,7 +168,7 @@ describe("TUI", () => {
     stdin.write("/model");
     await tick();
     stdin.write("\r"); // the menu's first row is /model → runs it
-    await tick(120);
+    await frameIn(lastFrame, { has: ["Select model", "1. gemini-2.5-flash-lite", "3. claude-sonnet-4.6", "~18 ads/task", "← current", "⏎ confirm"] });
 
     const picker = strip(lastFrame() ?? "");
     expect(picker).toContain("Select model");
@@ -178,11 +179,11 @@ describe("TUI", () => {
     expect(picker).toContain("⏎ confirm");
 
     stdin.write(ARROW_DOWN);
-    await tick();
+    await frameIn(lastFrame, { has: ["❯ 2. gpt-5-nano"] });
     expect(strip(lastFrame() ?? "")).toContain("❯ 2. gpt-5-nano");
 
     stdin.write("\r");
-    await tick(80);
+    await frameIn(lastFrame, { has: ["model → gpt-5-nano", "gpt-5-nano ·"], hasNot: ["Select model"] });
     const after = strip(lastFrame() ?? "");
     expect(after).toContain("model → gpt-5-nano");
     expect(after).not.toContain("Select model"); // dialog closed
@@ -197,17 +198,17 @@ describe("TUI", () => {
     await tick(120);
 
     stdin.write("3");
-    await tick(80);
+    await frameIn(lastFrame, { has: ["model → claude-sonnet-4.6"] });
     expect(strip(lastFrame() ?? "")).toContain("model → claude-sonnet-4.6");
   });
 
   it("cycles the permission mode with shift+tab", async () => {
     const { stdin, lastFrame } = render(<App client={stubClient()} config={config} wallet={wallet} />);
     stdin.write("\x1b[Z"); // shift+tab
-    await tick();
+    await frameIn(lastFrame, { has: ["auto-accept edits"] });
     expect(strip(lastFrame() ?? "")).toContain("auto-accept edits");
     stdin.write("\x1b[Z");
-    await tick();
+    await frameIn(lastFrame, { has: ["plan mode"] });
     expect(strip(lastFrame() ?? "")).toContain("plan mode");
   });
 
@@ -321,14 +322,14 @@ describe("TUI /earn wait", () => {
     stdin.write("/earn");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameIn(lastFrame, { has: ["waiting for the offer…", "esc to stop"] });
 
     const waiting = strip(lastFrame() ?? "");
     expect(waiting).toContain("waiting for the offer…"); // not "working…" — no model call is running
     expect(waiting).toContain("esc to stop");
 
     stdin.write(ESC);
-    await tick(120);
+    await frameIn(lastFrame, { has: ["stopped waiting", "ask before edits"], hasNot: ["esc to stop"] });
 
     const stopped = strip(lastFrame() ?? "");
     expect(stopped).toContain("stopped waiting");
@@ -337,7 +338,7 @@ describe("TUI /earn wait", () => {
 
     // And the keyboard really is back: the next keystroke lands in the editor.
     stdin.write("hi");
-    await tick();
+    await frameIn(lastFrame, { has: ["hi"] });
     expect(strip(lastFrame() ?? "")).toContain("hi");
   });
 
@@ -348,7 +349,7 @@ describe("TUI /earn wait", () => {
     stdin.write("\r");
     await tick(120);
     stdin.write(ESC);
-    await tick(120);
+    await frameIn(lastFrame, { matches: [/still lands whenever the offer clears/], matchesNot: [/error|failed/i] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toMatch(/still lands whenever the offer clears/);
@@ -383,18 +384,18 @@ describe("TUI esc during a slash command", () => {
     stdin.write("/wallet");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameIn(lastFrame, { has: ["loading…"] });
     expect(strip(lastFrame() ?? "")).toContain("loading…");
 
     stdin.write(ESC);
-    await tick(120);
+    await frameIn(lastFrame, { has: ["(stopped)"], hasNot: ["esc to stop"] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("(stopped)"); // not the AbortError's message as an error
     expect(out).not.toContain("esc to stop");
 
     stdin.write("hi");
-    await tick();
+    await frameIn(lastFrame, { has: ["hi"] });
     expect(strip(lastFrame() ?? "")).toContain("hi");
   });
 });
@@ -445,14 +446,14 @@ describe("TUI /login", () => {
     stdin.write("/login");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameIn(lastFrame, { has: ["ABCD-1234", "https://github.com/login/device", "signing in…"] });
 
     const waiting = strip(lastFrame() ?? "");
     expect(waiting).toContain("ABCD-1234");
     expect(waiting).toContain("https://github.com/login/device");
     expect(waiting).toContain("signing in…"); // its own label, not "working…"
 
-    await tick(1400); // one poll interval, clamped to a second
+    await frameIn(lastFrame, { has: ["signed in as FlosGit", "12,345 credits"] });
 
     const done = strip(lastFrame() ?? "");
     expect(done).toContain("signed in as FlosGit");
@@ -479,7 +480,7 @@ describe("TUI /login", () => {
     stdin.write("/login");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameIn(lastFrame, { has: ["at least 18", "https://clixad.io/terms.html", "https://clixad.io/privacy.html"] });
 
     const frame = strip(lastFrame() ?? "");
     expect(frame).toContain("at least 18");
@@ -500,18 +501,18 @@ describe("TUI /login", () => {
     stdin.write("/login");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameIn(lastFrame, { has: ["signing in…"] });
     expect(strip(lastFrame() ?? "")).toContain("signing in…");
 
     stdin.write(ESC);
-    await tick(120);
+    await frameIn(lastFrame, { has: ["(stopped)"], hasNot: ["esc to stop"] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("(stopped)");
     expect(out).not.toContain("esc to stop");
 
     stdin.write("hi");
-    await tick();
+    await frameIn(lastFrame, { has: ["hi"] });
     expect(strip(lastFrame() ?? "")).toContain("hi");
   });
 
@@ -588,12 +589,12 @@ describe("TUI esc at the permission dialog", () => {
     stdin.write("write nope.txt");
     await tick();
     stdin.write("\r");
-    await tick(200);
+    await frameIn(lastFrame, { has: ["[y/⏎] once", "esc stops the turn"] });
     expect(strip(lastFrame() ?? "")).toContain("[y/⏎] once"); // the dialog is up
     expect(strip(lastFrame() ?? "")).toContain("esc stops the turn"); // and says so
 
     stdin.write(ESC);
-    await tick(250);
+    await frameIn(lastFrame, { has: ["(stopped)"], hasNot: ["denied: create nope.txt"] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("(stopped)");
@@ -604,7 +605,7 @@ describe("TUI esc at the permission dialog", () => {
     expect(calls).toBe(1);
 
     stdin.write("hi");
-    await tick();
+    await frameIn(lastFrame, { has: ["hi"] });
     expect(strip(lastFrame() ?? "")).toContain("hi"); // keyboard is back
   });
 
@@ -625,7 +626,7 @@ describe("TUI esc at the permission dialog", () => {
     stdin.write("\r");
     await tick(200);
     stdin.write("n");
-    await tick(250);
+    await frameIn(lastFrame, { has: ["denied: create nope.txt", "Understood."] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("denied: create nope.txt");
@@ -655,7 +656,7 @@ describe("TUI esc at the permission dialog", () => {
     stdin.write("write nope.txt");
     await tick();
     stdin.write("\r");
-    await tick(300);
+    await frameIn(lastFrame, { has: ["plan mode — create nope.txt was not run"], hasNot: ["Do not attempt further writes"] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("plan mode — create nope.txt was not run");
@@ -725,7 +726,7 @@ describe("TUI ctrl+o", () => {
     expect(seen()).toContain("AAA-20"); // then the one before it
 
     stdin.write("\x0f");
-    await tick(80);
+    await frameIn(lastFrame, { has: ["nothing left to expand"] });
     expect(strip(lastFrame() ?? "")).toContain("nothing left to expand");
   });
 
@@ -766,7 +767,7 @@ describe("TUI ctrl+o", () => {
     stdin.write("read them all");
     await tick();
     stdin.write("\r");
-    await tick(600);
+    await frameIn(lastFrame, { has: ["Read them all."] });
     expect(strip(lastFrame() ?? "")).toContain("Read them all.");
 
     // About 390,000 characters each: the newest five fit under 2,000,000.
@@ -802,7 +803,7 @@ describe("TUI paste", () => {
 
     const { stdin, lastFrame } = render(<App client={client} config={config} wallet={wallet} />);
     stdin.write("\x1b[200~Error: boom\n  at one.ts:1\n  at two.ts:2\x1b[201~");
-    await tick(120);
+    await frameIn(lastFrame, { has: ["Error: boom", "at two.ts:2"] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("Error: boom");
@@ -912,7 +913,7 @@ describe("TUI paste without brackets", () => {
     await tick(150);
     const beforeEnter = sent.length;
     stdin.write("\r"); // the person's own Enter, long after the paste
-    await tick(150);
+    await waitFor(() => sent.length > beforeEnter);
     return { beforeEnter, sent };
   }
 
@@ -995,7 +996,7 @@ describe("TUI paste without brackets", () => {
     }
     await tick(80);
     stdin.write("\r");
-    await tick(150);
+    await waitFor(() => sent.length > 0);
     expect(sent).toEqual(["hello"]);
   });
 });
@@ -1038,7 +1039,7 @@ describe("TUI agent turn", () => {
     stdin.write("create hello.txt");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameIn(lastFrame, { has: ["create hello.txt", "hi there", "[y/⏎] once"] });
 
     // The permission dialog shows what is about to happen, with the diff.
     const asking = strip(lastFrame() ?? "");
@@ -1082,7 +1083,7 @@ describe("TUI agent turn", () => {
     stdin.write("write nope.txt");
     await tick();
     stdin.write("\r");
-    await tick(250);
+    await frameIn(lastFrame, { has: ["Here is the plan instead."] });
 
     expect(strip(lastFrame() ?? "")).toContain("Here is the plan instead.");
     expect(() => readFileSync(join(root, "nope.txt"), "utf8")).toThrow();

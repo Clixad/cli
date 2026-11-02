@@ -26,6 +26,7 @@ import { describe, expect, it } from "vitest";
 import { render } from "ink-testing-library";
 import { App } from "../src/tui/app.tsx";
 import type { CliConfig } from "../src/config.ts";
+import { frameIn } from "./helpers/wait.ts";
 import type {
   ChatMessage,
   ChatOptions,
@@ -161,7 +162,7 @@ describe("answering it", () => {
   it("reports what it paid", async () => {
     const { stdin, lastFrame } = await turnAt(49);
     stdin.write("\r");
-    await tick(200);
+    await frameIn(lastFrame, { has: ["+500 credits"] });
     expect(strip(lastFrame() ?? "")).toContain("+500 credits");
   });
 });
@@ -190,7 +191,7 @@ describe("skipping it", () => {
     // Esc and the skip row are the same outcome — a skip that cost something is
     // a prompt people stop reading.
     stdin.write("next");
-    await tick();
+    await frameIn(lastFrame, { has: ["next"] });
     expect(strip(lastFrame() ?? "")).toContain("next");
   });
 
@@ -205,6 +206,7 @@ describe("skipping it", () => {
     await tick();
     stdin.write("\r");
     await tick(300);
+    await frameIn(lastFrame, { hasNot: ["Was that last answer any good?"] });
     expect(strip(lastFrame() ?? "")).not.toContain("Was that last answer any good?");
     expect(sent).toHaveLength(0);
   });
@@ -221,7 +223,7 @@ describe("a gateway that says nothing about rewards", () => {
     stdin.write("why does the build fail?");
     await tick();
     stdin.write("\r");
-    await tick(300);
+    await frameIn(lastFrame, { has: ["Both answers pay the same"], matchesNot: [/pay [\d,]+ credits/] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("Both answers pay the same");

@@ -26,6 +26,7 @@ import { modeInstruction } from "../src/permissions.ts";
 import { TOOL_SCHEMA, toolSchemaFor } from "../src/tools.ts";
 import type { CliConfig } from "../src/config.ts";
 import type { ChatMessage, ChatOptions, ChatTurn, GatewayClient, WalletInfo } from "../src/client.ts";
+import { frameIn } from "./helpers/wait.ts";
 
 const config: CliConfig = {
   gatewayUrl: "http://127.0.0.1:8787",
@@ -293,14 +294,14 @@ describe("the plan dialog in the REPL", () => {
     stdin.write("make out.txt");
     await tick();
     stdin.write("\r");
-    await tick(250);
+    await frameIn(lastFrame, { has: ["Ready to act on this plan?", "create out.txt"] });
 
     const asking = strip(lastFrame() ?? "");
     expect(asking).toContain("Ready to act on this plan?");
     expect(asking).toContain("create out.txt");
 
     stdin.write("a"); // yes, auto-accept edits
-    await tick(350);
+    await frameIn(lastFrame, { has: ["plan approved", "auto-accept edits", "Created out.txt."] });
 
     const done = strip(lastFrame() ?? "");
     expect(done).toContain("plan approved");
@@ -319,7 +320,7 @@ describe("the plan dialog in the REPL", () => {
     stdin.write("\r");
     await tick(250);
     stdin.write("n");
-    await tick(300);
+    await frameIn(lastFrame, { has: ["keeping plan mode on", "plan mode (read-only)"] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("keeping plan mode on");
@@ -336,7 +337,7 @@ describe("the plan dialog in the REPL", () => {
     stdin.write("\r");
     await tick(250);
     stdin.write(ESC);
-    await tick(300);
+    await frameIn(lastFrame, { has: ["(stopped)", "plan mode (read-only)"] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("(stopped)");
@@ -344,7 +345,7 @@ describe("the plan dialog in the REPL", () => {
     expect(() => readFileSync(join(root, "out.txt"), "utf8")).toThrow();
 
     stdin.write("hi");
-    await tick();
+    await frameIn(lastFrame, { has: ["hi"] });
     expect(strip(lastFrame() ?? "")).toContain("hi"); // keyboard back
   });
 });

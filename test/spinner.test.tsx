@@ -19,6 +19,7 @@ import { App } from "../src/tui/app.tsx";
 import { BRAILLE_FRAMES, DUCK_FRAMES, SPINNER_TICKS_PER_FRAME, spinnerFrames } from "../src/banner.ts";
 import type { CliConfig } from "../src/config.ts";
 import type { ChatMessage, ChatOptions, ChatTurn, GatewayClient, WalletInfo } from "../src/client.ts";
+import { frameWithout, until } from "./helpers/wait.ts";
 
 const config: CliConfig = {
   gatewayUrl: "http://127.0.0.1:8787",
@@ -87,7 +88,10 @@ describe("the working line", () => {
     stdin.write("do something");
     await tick();
     stdin.write("\r");
-    await tick(150);
+    await until(
+      () => strip(lastFrame() ?? ""),
+      (f) => f.includes("working…") && DUCK_FRAMES.some((d) => f.includes(d)),
+    );
 
     const frame = strip(lastFrame() ?? "");
     expect(frame).toContain("working…");
@@ -102,12 +106,17 @@ describe("the working line", () => {
 
     // The frame advances every SPINNER_TICKS_PER_FRAME ticks of 120 ms, so a
     // second is comfortably more than one turn of the bird.
+    // Read until every frame has been seen, rather than for a fixed second: on
+    // a loaded machine the spinner's own timer runs late, not wrong.
     const seen = new Set<string>();
-    for (let i = 0; i < 12; i++) {
-      await tick(120);
-      const frame = strip(lastFrame() ?? "");
-      for (const glyph of DUCK_FRAMES) if (frame.includes(glyph)) seen.add(glyph);
-    }
+    await until(
+      () => {
+        const frame = strip(lastFrame() ?? "");
+        for (const glyph of DUCK_FRAMES) if (frame.includes(glyph)) seen.add(glyph);
+        return seen.size;
+      },
+      (n) => n === DUCK_FRAMES.length,
+    );
     expect(seen.size).toBe(DUCK_FRAMES.length);
   });
 
@@ -123,11 +132,14 @@ describe("the working line", () => {
     stdin.write("hello");
     await tick();
     stdin.write("\r");
-    await tick(150);
+    await until(
+      () => lastFrame() ?? "",
+      (f) => DUCK_FRAMES.some((d) => f.includes(d)),
+    );
     expect(DUCK_FRAMES.some((f) => (lastFrame() ?? "").includes(f))).toBe(true);
 
     finish?.({ message: { role: "assistant", content: "done" }, finishReason: "stop", creditsCharged: 7, balance: 4981 });
-    await tick(200);
+    await frameWithout(lastFrame, "esc to stop");
 
     // `lastFrame` carries the scrollback, so the check is on the live region:
     // the working line and its duck go together.

@@ -21,6 +21,7 @@ import { LimitRefusalError } from "../src/client.ts";
 import type { CliConfig } from "../src/config.ts";
 import type { ChatOptions, ChatTurn, GatewayClient, Spendable, WalletInfo } from "../src/client.ts";
 import { visibleLength } from "../src/banner.ts";
+import { frameIn } from "./helpers/wait.ts";
 
 const BUDGET = "kimi-k2.5";
 const PREMIUM = "claude-opus-5.5";
@@ -124,7 +125,7 @@ describe("the usable figure on the status line", () => {
       walletReads: [],
     };
     const { lastFrame } = open(PREMIUM, script);
-    await tick(100);
+    await frameIn(lastFrame, { has: ["500 cr usable · 32,896 bonus locked on premium"] });
     expect(strip(lastFrame() ?? "")).toContain("500 cr usable · 32,896 bonus locked on premium");
   });
 
@@ -135,7 +136,7 @@ describe("the usable figure on the status line", () => {
       walletReads: [],
     };
     const { lastFrame } = open(BUDGET, script);
-    await tick(100);
+    await frameIn(lastFrame, { has: ["37 cr usable · 55,321 bonus locked, 40,000 usable from 00:00 UTC"] });
     expect(strip(lastFrame() ?? "")).toContain("37 cr usable · 55,321 bonus locked, 40,000 usable from 00:00 UTC");
   });
 
@@ -159,7 +160,7 @@ describe("the usable figure on the status line", () => {
       walletReads: [],
     };
     const view = open(BUDGET, script);
-    await tick(100);
+    await frameIn(view.lastFrame, { has: ["10,000 cr usable"] });
     expect(strip(view.lastFrame() ?? "")).toContain("10,000 cr usable");
     await turn(view);
     expect(strip(view.lastFrame() ?? "")).toContain("6,000 cr usable · 23,396 bonus locked until 00:00 UTC");
@@ -295,7 +296,7 @@ describe("/wallet", () => {
     view.stdin.write("/wallet");
     await tick();
     view.stdin.write("\r");
-    await tick(200);
+    await frameIn(view.lastFrame, { has: ["usable now: 0 credits on budget models, 0 on premium models", "33,396 bonus credits are over today's limit and become usable at 00:00 UTC"] });
     const out = strip(view.lastFrame() ?? "");
     expect(out).toContain("usable now: 0 credits on budget models, 0 on premium models");
     expect(out).toContain("33,396 bonus credits are over today's limit and become usable at 00:00 UTC");

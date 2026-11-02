@@ -21,6 +21,7 @@ import { AD_LABEL, SPONSOR_MARKER } from "../src/sponsor/render.ts";
 import type { CliConfig } from "../src/config.ts";
 import type { ServedLine } from "../src/sponsor/network.ts";
 import type { ChatMessage, ChatOptions, ChatTurn, GatewayClient, WalletInfo } from "../src/client.ts";
+import { frameWith, frameWithout, waitFor } from "./helpers/wait.ts";
 
 const config: CliConfig = {
   gatewayUrl: "http://127.0.0.1:8787",
@@ -176,14 +177,14 @@ describe("the sponsored line in the TUI", () => {
     stdin.write("hello");
     await tick();
     stdin.write("\r");
-    await tick(80);
+    await frameWith(lastFrame, ["working…", SPONSOR_MARKER]);
     const during = strip(lastFrame() ?? "");
     expect(during).toContain(SPONSOR_MARKER);
     expect(during).toContain("working…"); // the spinner is untouched, and still says esc
     expect(during).toContain("esc to stop");
 
     release();
-    await tick(80);
+    await frameWithout(lastFrame, "working…");
     expect(strip(lastFrame() ?? "")).not.toContain(SPONSOR_MARKER);
   });
 
@@ -195,7 +196,7 @@ describe("the sponsored line in the TUI", () => {
     stdin.write("hello");
     await tick();
     stdin.write("\r");
-    await tick(80);
+    await frameWith(lastFrame, "working…");
     const during = strip(lastFrame() ?? "");
     expect(during).toContain("working…"); // the turn really is running
     expect(during).not.toContain(SPONSOR_MARKER);
@@ -213,7 +214,7 @@ describe("the sponsored line in the TUI", () => {
     stdin.write("hello");
     await tick();
     stdin.write("\r");
-    await tick(80);
+    await frameWith(lastFrame, "working…");
     const during = strip(lastFrame() ?? "");
     expect(during).toContain("working…");
     expect(during).not.toContain(SPONSOR_MARKER);
@@ -229,7 +230,7 @@ describe("the sponsored line in the TUI", () => {
     stdin.write("hello");
     await tick();
     stdin.write("\r");
-    await tick(80);
+    await frameWith(lastFrame, "working…");
     expect(strip(lastFrame() ?? "")).not.toContain(SPONSOR_MARKER);
     release();
     await tick(40);
@@ -242,11 +243,11 @@ describe("the sponsored line in the TUI", () => {
     stdin.write("hello");
     await tick();
     stdin.write("\r");
-    await tick(80);
+    await frameWith(lastFrame, ["working…", SPONSOR_MARKER]);
     expect(strip(lastFrame() ?? "")).toContain(SPONSOR_MARKER);
 
     release();
-    await tick(80);
+    await frameWithout(lastFrame, "working…");
     // Between turns there is none at all — the first was not committed anywhere.
     expect(strip(lastFrame() ?? "")).not.toContain(SPONSOR_MARKER);
 
@@ -256,7 +257,7 @@ describe("the sponsored line in the TUI", () => {
     stdin.write("again");
     await tick();
     stdin.write("\r");
-    await tick(80);
+    await frameWith(lastFrame, ["working…", SPONSOR_MARKER]);
     const frame = strip(lastFrame() ?? "");
     expect(frame).toContain("working…");
     expect(frame.split(SPONSOR_MARKER).length - 1).toBe(1);
@@ -275,16 +276,16 @@ describe("the sponsored line in the TUI", () => {
     stdin.write("hello");
     await tick();
     stdin.write("\r");
-    await tick(80);
+    await frameWith(lastFrame, ["working…", SPONSOR_MARKER]);
     const first = lineOf(strip(lastFrame() ?? ""));
     expect(first).toBeTruthy();
 
     release();
-    await tick(80);
+    await frameWithout(lastFrame, "working…");
     stdin.write("again");
     await tick();
     stdin.write("\r");
-    await tick(80);
+    await frameWith(lastFrame, ["working…", SPONSOR_MARKER]);
     const second = lineOf(strip(lastFrame() ?? ""));
 
     expect(second).toBeTruthy();
@@ -305,7 +306,7 @@ describe("reporting an impression", () => {
     stdin.write("hello");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameWith(lastFrame, ["working…", SPONSOR_MARKER]);
     expect(strip(lastFrame() ?? "")).toContain(SPONSOR_MARKER);
     expect(reported).toEqual([]);
     release();
@@ -324,7 +325,7 @@ describe("reporting an impression", () => {
     process.env.CLIXAD_SPONSOR = "0";
     const { client, reported, release } = reportingClient();
     let serves = 0;
-    const { stdin } = renderTui(
+    const { stdin, lastFrame } = renderTui(
       <App
         client={client}
         config={config}
@@ -338,6 +339,7 @@ describe("reporting an impression", () => {
     stdin.write("hello");
     await tick();
     stdin.write("\r");
+    await frameWith(lastFrame, "working…");
     await tick(120);
     expect(serves).toBe(0);
     expect(reported).toEqual([]);
@@ -363,7 +365,7 @@ describe("when the impression is reported", () => {
     stdin.write("hello");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameWith(lastFrame, [served.text, "working…"]);
 
     // The line is on screen and the turn is genuinely still running...
     const during = strip(lastFrame() ?? "");
@@ -375,29 +377,30 @@ describe("when the impression is reported", () => {
     expect(reported).toEqual([]);
 
     release();
-    await tick(120);
+    await waitFor(() => reported.length > 0);
     expect(reported).toEqual(["imp_0001"]);
   });
 
   it("reports a line once, not once per turn it stayed up for", async () => {
     const { client, reported, release } = reportingClient();
-    const { stdin } = renderTui(
+    const { stdin, lastFrame } = renderTui(
       <App client={client} config={config} wallet={wallet} sponsorServe={async () => served} />,
     );
 
     stdin.write("hello");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameWith(lastFrame, [served.text, "working…"]);
     release();
-    await tick(120);
+    await waitFor(() => reported.length === 1);
+    await frameWithout(lastFrame, "working…");
 
     stdin.write("again");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameWith(lastFrame, [served.text, "working…"]);
     release();
-    await tick(120);
+    await waitFor(() => reported.length === 2);
 
     // Two turns, two serves, and the SDK's dwell means the second is the same
     // impression from its cache. The gateway counts an impression id once, but
@@ -418,9 +421,10 @@ describe("when the impression is reported", () => {
     stdin.write("hello");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameWith(lastFrame, ["working…", SPONSOR_MARKER]);
     expect(strip(lastFrame() ?? "")).toContain(SPONSOR_MARKER);
     release();
+    await frameWithout(lastFrame, "working…");
     await tick(120);
     expect(reported).toEqual([]);
   });
@@ -433,17 +437,17 @@ describe("when the impression is reported", () => {
       resolveServe = r;
     });
     const { client, reported, release } = reportingClient();
-    const { stdin } = renderTui(
+    const { stdin, lastFrame } = renderTui(
       <App client={client} config={config} wallet={wallet} sponsorServe={() => late} />,
     );
 
     stdin.write("hello");
     await tick();
     stdin.write("\r");
-    await tick(80);
+    await frameWith(lastFrame, "working…");
     // The turn ends while the serve is still in flight.
     release();
-    await tick(120);
+    await frameWithout(lastFrame, "working…");
     resolveServe(served);
     await tick(120);
 
@@ -476,7 +480,7 @@ describe("the ad mark on screen", () => {
     stdin.write("hello");
     await tick();
     stdin.write("\r");
-    await tick(60);
+    await frameWith(lastFrame, ["working…", SPONSOR_MARKER]);
 
     const MARKED = `${SPONSOR_MARKER} ${AD_LABEL} · `;
     const house = sponsorLineOf(lastFrame());
@@ -484,7 +488,7 @@ describe("the ad mark on screen", () => {
     expect(house).not.toContain(MARKED);
 
     land(served);
-    await tick(120);
+    await frameWith(lastFrame, served.text);
     const ad = sponsorLineOf(lastFrame());
     expect(ad).toContain(served.text);
     expect(ad).toContain(MARKED);
@@ -496,7 +500,10 @@ describe("the ad mark on screen", () => {
   });
 
   it("stays one row of chrome, marked or not", async () => {
-    for (const serve of [async () => served, async () => null]) {
+    for (const [serve, shows] of [
+      [async () => served, served.text],
+      [async () => null, SPONSOR_MARKER],
+    ] as const) {
       const { client, release } = hangingClient();
       const { stdin, lastFrame } = renderTui(
         <App client={client} config={config} wallet={wallet} sponsorServe={serve} />,
@@ -504,7 +511,7 @@ describe("the ad mark on screen", () => {
       stdin.write("hello");
       await tick();
       stdin.write("\r");
-      await tick(140);
+      await frameWith(lastFrame, ["working…", shows]);
 
       const frame = strip(lastFrame() ?? "");
       const rows = frame.split("\n").filter((l) => l.includes(SPONSOR_MARKER));

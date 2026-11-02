@@ -27,6 +27,7 @@ import { App } from "../src/tui/app.tsx";
 import { NO_PREMIUM_CREDITS, PremiumLockedError } from "../src/client.ts";
 import type { CliConfig } from "../src/config.ts";
 import type { ChatMessage, ChatOptions, ChatTurn, GatewayClient, WalletInfo } from "../src/client.ts";
+import { frameIn } from "./helpers/wait.ts";
 
 const PREMIUM = "claude-opus-5.5";
 const FREE = "deepseek-v4-flash";
@@ -134,7 +135,7 @@ describe("a premium turn on bonus credits", () => {
   it("opens a chooser on enter: the survey, the pack, then the free budget models", async () => {
     const { stdin, lastFrame } = await runIntoTheGate({ calls: [] });
     stdin.write("\r");
-    await tick(100);
+    await frameIn(lastFrame, { has: ["complete an offer-wall survey", "~41,000 credits on completion (median)", "buy credits from $5", "bought credits work on every model", FREE, "~82 turns left today"] });
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("complete an offer-wall survey");
     expect(out).toContain("~41,000 credits on completion (median)");
@@ -175,6 +176,7 @@ describe("a premium turn on bonus credits", () => {
     expect(strip(lastFrame() ?? "")).toContain("Premium: complete an offer-wall survey to unlock it.");
     stdin.write("\r");
     await tick(100);
+    await frameIn(lastFrame, { hasNot: ["buy credits from"] });
     expect(strip(lastFrame() ?? "")).not.toContain("buy credits from");
   });
 
@@ -205,7 +207,7 @@ describe("a premium turn on bonus credits", () => {
     await tick(100);
     expect(script.calls).toHaveLength(1);
     stdin.write("\r");
-    await tick(100);
+    await frameIn(lastFrame, { has: ["complete an offer-wall survey"] });
     expect(strip(lastFrame() ?? "")).toContain("complete an offer-wall survey");
   });
 });
@@ -256,7 +258,7 @@ describe("/model before anybody picks", () => {
     stdin.write(ARROW_DOWN);
     await tick();
     stdin.write("\r");
-    await tick(150);
+    await frameIn(lastFrame, { has: [`model → ${PREMIUM}`, "Premium: complete an offer-wall survey or buy credits from $5.", "/buy sells credits from $5 that work on every model."] });
     const out = strip(lastFrame() ?? "");
     expect(out).toContain(`model → ${PREMIUM}`);
     expect(out).toContain("Premium: complete an offer-wall survey or buy credits from $5.");

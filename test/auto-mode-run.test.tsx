@@ -20,6 +20,7 @@ import { createPermit, createState, MODE_LABEL } from "../src/permissions.ts";
 import { MODE_STYLE } from "../src/tui/views.tsx";
 import { messageText, type ChatMessage, type ChatOptions, type ChatTurn, type GatewayClient, type WalletInfo } from "../src/client.ts";
 import type { CliConfig } from "../src/config.ts";
+import { frameIn } from "./helpers/wait.ts";
 
 const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const tick = (ms = 40) => new Promise((r) => setTimeout(r, ms));
@@ -229,7 +230,7 @@ describe("auto mode in the REPL", () => {
     stdin.write("clean the machine");
     await tick();
     stdin.write("\r");
-    await tick(400);
+    await frameIn(lastFrame, { has: ["auto mode blocked this: it runs with administrator rights", "I will not do that."], hasNot: ["[y/⏎] once"] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("auto mode blocked this: it runs with administrator rights");
@@ -247,7 +248,7 @@ describe("auto mode in the REPL", () => {
     stdin.write("write from-repl.txt");
     await tick();
     stdin.write("\r");
-    await tick(1500);
+    await frameIn(lastFrame, { has: ["Wrote it."] });
 
     expect(strip(lastFrame() ?? "")).toContain("Wrote it.");
     expect(existsSync(join(root, "from-repl.txt"))).toBe(true);
@@ -280,11 +281,11 @@ describe("auto mode in the REPL", () => {
     stdin.write("plan it");
     await tick();
     stdin.write("\r");
-    await tick(250);
+    await frameIn(lastFrame, { has: ["u auto mode"] });
     // At 100 columns the dialog uses its shorter hint, which still names the key.
     expect(strip(lastFrame() ?? "")).toContain("u auto mode");
     stdin.write("u");
-    await tick(300);
+    await frameIn(lastFrame, { has: ["plan approved · mode → auto mode", `${MODE_STYLE.auto.glyph} ${MODE_LABEL.auto}`] });
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("plan approved · mode → auto mode");
     expect(out).toContain(`${MODE_STYLE.auto.glyph} ${MODE_LABEL.auto}`);
@@ -303,7 +304,7 @@ describe("auto mode in the REPL", () => {
     stdin.write("/mode auto");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameIn(lastFrame, { has: ["auto mode is not offered on gpt-5-nano; /model claude-haiku-5.5 has it"], hasNot: [`${MODE_STYLE.auto.glyph} ${MODE_LABEL.auto}`] });
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("auto mode is not offered on gpt-5-nano; /model claude-haiku-5.5 has it");
     expect(out).not.toContain(`${MODE_STYLE.auto.glyph} ${MODE_LABEL.auto}`);
@@ -325,7 +326,7 @@ describe("auto mode in the REPL", () => {
     stdin.write("\r");
     await tick(150);
     stdin.write("1"); // gpt-5-nano, the first row
-    await tick(150);
+    await frameIn(lastFrame, { has: ["auto mode is not offered on gpt-5-nano", `${MODE_STYLE.normal.glyph} ${MODE_LABEL.normal}`] });
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("auto mode is not offered on gpt-5-nano");
     expect(out).toContain(`${MODE_STYLE.normal.glyph} ${MODE_LABEL.normal}`);

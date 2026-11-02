@@ -23,6 +23,7 @@ import { App } from "../src/tui/app.tsx";
 import { messageText } from "../src/client.ts";
 import type { CliConfig } from "../src/config.ts";
 import type { ChatMessage, ChatOptions, ChatTurn, GatewayClient, WalletInfo } from "../src/client.ts";
+import { frameIn } from "./helpers/wait.ts";
 
 const config: CliConfig = {
   gatewayUrl: "http://127.0.0.1:8787",
@@ -118,7 +119,7 @@ describe("MCP in the REPL", () => {
     const { client, advertised } = stubClient([say("hello")]);
     const { stdin, lastFrame } = render(<App client={client} config={{ ...config }} wallet={wallet} />);
 
-    await tick(600);
+    await frameIn(lastFrame, { has: ["mcp: demo (1 tools)"] });
     expect(strip(lastFrame() ?? "")).toContain("mcp: demo (1 tools)");
 
     stdin.write("say hello");
@@ -140,7 +141,7 @@ describe("MCP in the REPL", () => {
     stdin.write("/mcp");
     await tick();
     stdin.write("\r");
-    await tick(150);
+    await frameIn(lastFrame, { matches: [/demo\s+ready\s+stdio\s+1 tool/] });
     const out = strip(lastFrame() ?? "");
     expect(out).toMatch(/demo\s+ready\s+stdio\s+1 tool/);
   });
@@ -151,14 +152,14 @@ describe("MCP in the REPL", () => {
     writeConfig({ ghost: { command: "definitely-not-a-real-binary-xyz" } });
     const { client } = stubClient([say("still working")]);
     const { stdin, lastFrame } = render(<App client={client} config={{ ...config }} wallet={wallet} />);
-    await tick(600);
+    await frameIn(lastFrame, { has: ["mcp: ghost did not start"] });
 
     expect(strip(lastFrame() ?? "")).toContain("mcp: ghost did not start");
     // And the REPL is perfectly usable.
     stdin.write("hi");
     await tick();
     stdin.write("\r");
-    await tick(200);
+    await frameIn(lastFrame, { has: ["still working"] });
     expect(strip(lastFrame() ?? "")).toContain("still working");
   });
 
@@ -168,7 +169,7 @@ describe("MCP in the REPL", () => {
     writeFileSync(join(root, ".mcp.json"), '{ "mcpServers": { "a": { "command": "x" }, } }', "utf8");
     const { client } = stubClient([]);
     const { lastFrame } = render(<App client={client} config={{ ...config }} wallet={wallet} />);
-    await tick(200);
+    await frameIn(lastFrame, { has: ["mcp config —"] });
     expect(strip(lastFrame() ?? "")).toContain("mcp config —");
   });
 
@@ -176,6 +177,7 @@ describe("MCP in the REPL", () => {
     const { client } = stubClient([]);
     const { lastFrame } = render(<App client={client} config={{ ...config }} wallet={wallet} />);
     await tick(200);
+    await frameIn(lastFrame, { hasNot: ["mcp:", "mcp config", "did not start"] });
     // Asserted on the two notices the effect can push, not on the substring
     // "mcp": the welcome banner carries a *randomly chosen* tip, one of which is
     // `/mcp`, so the broader check failed roughly one run in eight.

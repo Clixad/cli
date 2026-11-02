@@ -22,12 +22,14 @@ import {
   fakeStdin,
   fakeTerminal,
   lastInkedRow,
+  plain,
   restoreProcessStdout,
   screenOf,
   settle,
   type FakeTerminal,
   type Screen,
 } from "./helpers/terminal.tsx";
+import { until } from "./helpers/wait.ts";
 
 // /earn opens a browser, and /login would start a real device flow.
 vi.mock("../src/browser.ts", () => ({ openBrowser: () => undefined }));
@@ -106,21 +108,25 @@ const DOWN = "\u001b[B";
  * person would close it, since the shrink on the way *out* is where the rows
  * used to go missing.
  */
-const COMMANDS: Array<[name: string, keys: string[]]> = [
+/** Wait until the screen shows one of these before the next key: the picker or wait is open. */
+type Open = { open: string[] };
+const PICKER = { open: ["Select model"] };
+
+const COMMANDS: Array<[name: string, keys: Array<string | Open>]> = [
   ["/help", ["/help", "\r"]],
-  ["/model (esc)", ["/model", "\r", ESC_KEY]],
-  ["/model (pick)", ["/model", "\r", DOWN, "\r"]],
+  ["/model (esc)", ["/model", "\r", PICKER, ESC_KEY]],
+  ["/model (pick)", ["/model", "\r", PICKER, DOWN, "\r"]],
   ["/models", ["/models", "\r"]],
   ["/mode plan", ["/mode plan", "\r"]],
   ["/wallet", ["/wallet", "\r"]],
-  ["/earn (esc)", ["/earn", "\r", ESC_KEY]],
+  ["/earn (esc)", ["/earn", "\r", { open: ["waiting for the offer…"] }, ESC_KEY]],
   ["/refer", ["/refer", "\r"]],
   ["/redeem", ["/redeem", "\r", "ABCD-EFGH", "\r"]],
-  ["/buy (esc)", ["/buy", "\r", ESC_KEY]],
+  ["/buy (esc)", ["/buy", "\r", { open: ["Buy credits"] }, ESC_KEY]],
   ["/login", ["/login", "\r"]],
   ["/compact", ["/compact", "\r"]],
   ["/clear", ["/clear", "\r"]],
-  ["/resume", ["/resume", "\r", ESC_KEY]],
+  ["/resume", ["/resume", "\r", { open: ["Resume a session", "no saved sessions in this directory yet"] }, ESC_KEY]],
   ["/init", ["/init", "\r"]],
   ["/bg", ["/bg", "\r"]],
   ["/mcp", ["/mcp", "\r"]],
@@ -153,6 +159,16 @@ function boxBottom(screen: Screen): number {
   return -1;
 }
 
+/**
+ * Waiting for the layout, not for a length of time. A command that runs a turn
+ * or a request takes as long as the machine makes it take; what these tests
+ * measure is where the box ends up once it has, so they wait for that (bounded,
+ * then the assertion reads what is there). A box that stays out of place, which
+ * is the bug this file is for, still fails.
+ */
+const pinned = (term: FakeTerminal) => (s: Screen) =>
+  boxBottom(s) === term.rows - 3 && lastInkedRow(s) === term.rows - 2 && !s.rows.some((r) => r.includes("esc to stop"));
+
 function show(screen: Screen): string {
   return screen.rows.map((row, i) => `${String(i).padStart(2)}|${row}`).join("\n");
 }
@@ -163,12 +179,16 @@ for (const state of ["a fresh screen", "a full scrollback"] as const) {
       it(`${name} leaves the box at the bottom`, async () => {
         const term = fakeTerminal(24, 80);
         const stdin = mount(term);
-        await settle(150);
+        await until(() => screenOf(term), pinned(term));
         if (state === "a full scrollback") {
           stdin.send("hello");
           await settle(40);
           stdin.send("\r");
-          await settle(250);
+          // The long answer in, the turn over, the box back down.
+          await until(
+            () => screenOf(term),
+            (s) => [...s.scrollback, ...s.rows].some((r) => r.includes("line 40 of a long answer")) && pinned(term)(s),
+          );
         }
         const before = screenOf(term);
         // The premise: the box is pinned before anything is typed, with the one
@@ -181,15 +201,27 @@ for (const state of ["a fresh screen", "a full scrollback"] as const) {
         // what opens the whole command menu, and a command pasted in one chunk
         // would only ever show its own row of it.
         for (const key of keys) {
+          if (typeof key !== "string") {
+            await until(() => plain(term.output()), (out) => key.open.some((t) => out.includes(t)));
+            continue;
+          }
           const typed = /^[^\u001b\r\u007f]{2,}$/.test(key) ? [...key] : [key];
           for (const ch of typed) {
             stdin.send(ch);
             await settle(typed.length > 1 ? 25 : key === "\r" ? 300 : 80);
           }
+          // A person's Enter comes well after the last key. Sent 25 ms after it,
+          // it fell inside the paste window and was a newline, so these commands
+          // never opened their picker while the test still passed.
+          if (typed.length > 1) await settle(60);
         }
-        await settle(200);
-
-        const after = screenOf(term);
+        const after = await until(
+          () => screenOf(term),
+          (s) =>
+            boxBottom(s) === boxBottom(before) &&
+            lastInkedRow(s) === lastInkedRow(before) &&
+            !s.rows.some((r) => r.includes("esc to stop")),
+        );
         expect(boxBottom(after), show(after)).toBe(boxBottom(before));
         expect(lastInkedRow(after), show(after)).toBe(lastInkedRow(before));
         // /clear clears the screen itself; nothing else may have made ink do it.

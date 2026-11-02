@@ -13,6 +13,7 @@ import { App } from "../src/tui/app.tsx";
 import type { CliConfig } from "../src/config.ts";
 import type { GatewayClient, WalletInfo } from "../src/client.ts";
 import { VERSION } from "../src/version.ts";
+import { frameIn } from "./helpers/wait.ts";
 
 const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const tick = (ms = 80) => new Promise((r) => setTimeout(r, ms));
@@ -57,7 +58,7 @@ describe("what the REPL says when it opens", () => {
     const { lastFrame } = render(
       <App client={client({ retired: { "claude-opus-5": "claude-opus-5.5" } })} config={cfg} wallet={wallet} />,
     );
-    await tick();
+    await frameIn(lastFrame, { has: ["claude-opus-5 was retired; now using its successor, claude-opus-5.5.", "claude-opus-5.5 ·"] });
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("claude-opus-5 was retired; now using its successor, claude-opus-5.5.");
     expect(out).toContain("claude-opus-5.5 ·");
@@ -70,17 +71,19 @@ describe("what the REPL says when it opens", () => {
       <App client={client({ retired: { "claude-opus-5": "claude-opus-5.5" } })} config={cfg} wallet={wallet} />,
     );
     await tick();
+    await frameIn(lastFrame, { hasNot: ["was retired"] });
     expect(strip(lastFrame() ?? "")).not.toContain("was retired");
     expect(cfg.model).toBe("gpt-5-nano");
   });
 
   it("names a newer release once, and says nothing when there is none", async () => {
     const newer = render(<App client={client({ latest: "999.0.0" })} config={config("gpt-5-nano")} wallet={wallet} />);
-    await tick();
+    await frameIn(newer.lastFrame, { has: [`clixad 999.0.0 is out (you have ${VERSION})`] });
     expect(strip(newer.lastFrame() ?? "")).toContain(`clixad 999.0.0 is out (you have ${VERSION})`);
 
     const same = render(<App client={client({ latest: VERSION })} config={config("gpt-5-nano")} wallet={wallet} />);
     await tick();
+    await frameIn(same.lastFrame, { hasNot: ["is out"] });
     expect(strip(same.lastFrame() ?? "")).not.toContain("is out");
   });
 });

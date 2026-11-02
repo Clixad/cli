@@ -18,6 +18,7 @@ import { messageText } from "../src/client.ts";
 import { shells } from "../src/shells.ts";
 import type { CliConfig } from "../src/config.ts";
 import type { ChatMessage, ChatOptions, ChatTurn, GatewayClient, WalletInfo } from "../src/client.ts";
+import { frameIn } from "./helpers/wait.ts";
 
 const config: CliConfig = {
   gatewayUrl: "http://127.0.0.1:8787",
@@ -95,7 +96,7 @@ describe("ask_user in the REPL", () => {
     stdin.write("pick a database");
     await tick();
     stdin.write("\r");
-    await tick(150);
+    await frameIn(lastFrame, { has: ["Which database should I use?", "1. Postgres", "already in the repo", WAITING] });
 
     const dialog = strip(lastFrame() ?? "");
     expect(dialog).toContain("Which database should I use?");
@@ -104,7 +105,7 @@ describe("ask_user in the REPL", () => {
     expect(dialog).toContain(WAITING);
 
     stdin.write("2"); // the row number, as everywhere else
-    await tick(200);
+    await frameIn(lastFrame, { has: ["answered: SQLite"], hasNot: [WAITING] });
 
     const after = strip(lastFrame() ?? "");
     expect(after).toContain("answered: SQLite");
@@ -127,11 +128,11 @@ describe("ask_user in the REPL", () => {
     stdin.write("pick a database");
     await tick();
     stdin.write("\r");
-    await tick(150);
+    await frameIn(lastFrame, { has: [WAITING] });
     expect(strip(lastFrame() ?? "")).toContain(WAITING);
 
     stdin.write(ESC);
-    await tick(250);
+    await frameIn(lastFrame, { has: ["(stopped)"], hasNot: [WAITING, "no scripted turn left", "esc to stop"] });
 
     const after = strip(lastFrame() ?? "");
     expect(after).toContain("(stopped)");
@@ -140,7 +141,7 @@ describe("ask_user in the REPL", () => {
     // The keyboard is back: the working line is gone and typing lands in the box.
     expect(after).not.toContain("esc to stop");
     stdin.write("hello again");
-    await tick();
+    await frameIn(lastFrame, { has: ["hello again"] });
     expect(strip(lastFrame() ?? "")).toContain("hello again");
   });
 
@@ -153,6 +154,7 @@ describe("ask_user in the REPL", () => {
     await tick();
     stdin.write("\r");
     await tick(200);
+    await frameIn(lastFrame, { hasNot: [WAITING] });
 
     expect(strip(lastFrame() ?? "")).not.toContain(WAITING);
     const toolResult = sent.at(-1)!.find((m) => m.role === "tool");
@@ -167,7 +169,7 @@ describe("/mcp", () => {
     stdin.write("/mcp");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameIn(lastFrame, { has: ["no MCP servers configured", "mcpServers"] });
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("no MCP servers configured");
     expect(out).toContain("mcpServers");
@@ -181,7 +183,7 @@ describe("/bg", () => {
     stdin.write("/bg");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameIn(lastFrame, { has: ["no background commands have been started"] });
     expect(strip(lastFrame() ?? "")).toContain("no background commands have been started");
   });
 
@@ -195,7 +197,7 @@ describe("/bg", () => {
     stdin.write("/bg");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameIn(lastFrame, { has: ["/bg kill all"], matches: [/bash_\d+\s+running/] });
     const listed = strip(lastFrame() ?? "");
     expect(listed).toMatch(/bash_\d+\s+running/);
     expect(listed).toContain("/bg kill all");
@@ -203,7 +205,7 @@ describe("/bg", () => {
     stdin.write("/bg kill all");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameIn(lastFrame, { matches: [/stopped bash_\d+/] });
     expect(strip(lastFrame() ?? "")).toMatch(/stopped bash_\d+/);
     expect(shells.list().every((s) => s.status !== "running")).toBe(true);
   });

@@ -22,6 +22,7 @@ import { App } from "../src/tui/app.tsx";
 import { matchCommands } from "../src/tui/commands.ts";
 import type { CliConfig } from "../src/config.ts";
 import type { CreditPackInfo, GatewayClient, WalletInfo } from "../src/client.ts";
+import { frameIn } from "./helpers/wait.ts";
 
 const config: CliConfig = {
   gatewayUrl: "http://127.0.0.1:8787",
@@ -136,7 +137,7 @@ describe("/buy", () => {
     stdin.write(ARROW_DOWN);
     await tick();
     stdin.write("\r");
-    await tick(80);
+    await frameIn(lastFrame, { has: ["Plus", "456,000 credits", "$7.50", "clixad.io/terms.html"], matches: [/request that we deliver the credits immediately/, /14-day withdrawal period/, /right of withdrawal lapses/] });
 
     const out = strip(lastFrame() ?? "");
     // The pack that was actually chosen, with its price.
@@ -163,7 +164,7 @@ describe("/buy", () => {
     stdin.write("y");
     await tick();
     stdin.write("\r");
-    await tick(80);
+    await frameIn(lastFrame, { has: ["you have not been charged"] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("you have not been charged");
@@ -177,7 +178,7 @@ describe("/buy", () => {
     stdin.write("\r");
     await tick(80);
     stdin.write("\r");
-    await tick(80);
+    await frameIn(lastFrame, { has: ["you have not been charged"] });
 
     expect(strip(lastFrame() ?? "")).toContain("you have not been charged");
     expect(calls).toHaveLength(0);
@@ -190,7 +191,7 @@ describe("/buy", () => {
     stdin.write("\r");
     await tick(80);
     stdin.write("yes");
-    await tick();
+    await frameIn(lastFrame, { has: ["yes"] });
     // Echoed, so the answer is visible before it is sent.
     expect(strip(lastFrame() ?? "")).toContain("yes");
     stdin.write("\r");
@@ -221,7 +222,7 @@ describe("/buy", () => {
     stdin.write("\r");
     await tick(80);
     stdin.write(ESC);
-    await tick(80);
+    await frameIn(lastFrame, { has: ["you have not been charged"], matchesNot: [/request that we deliver/] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("you have not been charged");
@@ -230,7 +231,7 @@ describe("/buy", () => {
 
     // And the keyboard is back: the next keystroke lands in the editor.
     stdin.write("hi");
-    await tick();
+    await frameIn(lastFrame, { has: ["hi"] });
     expect(strip(lastFrame() ?? "")).toContain("hi");
   });
 
@@ -246,7 +247,7 @@ describe("/buy", () => {
     await tick(120);
 
     stdin.write(ESC);
-    await tick(150);
+    await frameIn(lastFrame, { has: ["/wallet", "ask before edits"], matches: [/Credits still land when the payment clears/], matchesNot: [/error|failed/i, /try again|pay again/i] });
 
     const out = strip(lastFrame() ?? "");
     // A payment that is still clearing is the ordinary reason to see this, so

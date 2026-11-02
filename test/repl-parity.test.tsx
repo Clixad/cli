@@ -15,6 +15,7 @@ import { render } from "ink-testing-library";
 import { App } from "../src/tui/app.tsx";
 import type { CliConfig } from "../src/config.ts";
 import type { ChatMessage, ChatOptions, ChatTurn, GatewayClient, WalletInfo } from "../src/client.ts";
+import { frameIn, until, waitFor } from "./helpers/wait.ts";
 
 const config: CliConfig = {
   gatewayUrl: "http://127.0.0.1:8787",
@@ -67,11 +68,11 @@ describe("typing while the agent works", () => {
     stdin.write("first");
     await tick();
     stdin.write("\r");
-    await tick(120);
+    await frameIn(lastFrame, { has: ["working…"] });
     expect(strip(lastFrame() ?? "")).toContain("working…");
 
     stdin.write("second thought");
-    await tick(80);
+    await frameIn(lastFrame, { has: ["second thought"] });
     // In the box, not lost: the turn is still running.
     expect(strip(lastFrame() ?? "")).toContain("second thought");
 
@@ -93,7 +94,7 @@ describe("typing while the agent works", () => {
     stdin.write("second");
     await tick();
     stdin.write("\r");
-    await tick(80);
+    await frameIn(lastFrame, { has: ["⏳ second"] });
 
     // Waiting, visibly, and not sent yet.
     expect(strip(lastFrame() ?? "")).toContain("⏳ second");
@@ -121,7 +122,7 @@ describe("typing while the agent works", () => {
     await tick(80);
 
     stdin.write(ESC);
-    await tick(250);
+    await frameIn(lastFrame, { has: ["not sent:", "· second", "(stopped)"] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("not sent:");
@@ -144,13 +145,13 @@ describe("/clear", () => {
     stdin.write("\r");
     await tick(120);
     release();
-    await tick(150);
+    await frameIn(lastFrame, { has: ["something memorable"], hasNot: ["working…"] });
     expect(strip(lastFrame() ?? "")).toContain("something memorable");
 
     stdin.write("/clear");
     await tick();
     stdin.write("\r");
-    await tick(150);
+    await frameIn(lastFrame, { has: ["cleared"], hasNot: ["something memorable"] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("cleared");
@@ -179,7 +180,7 @@ describe("/resume", () => {
     stdin.write("/resume");
     await tick();
     stdin.write("\r");
-    await tick(150);
+    await frameIn(lastFrame, { has: ["no saved sessions in this directory"] });
     expect(strip(lastFrame() ?? "")).toContain("no saved sessions in this directory");
   });
 
@@ -197,7 +198,7 @@ describe("/resume", () => {
     stdin.write("/resume");
     await tick();
     stdin.write("\r");
-    await tick(200);
+    await frameIn(lastFrame, { has: ["Resume a session", "remember this"] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("Resume a session");
@@ -226,7 +227,8 @@ describe("!command", () => {
     stdin.write("!echo hello-from-shell");
     await tick();
     stdin.write("\r");
-    await tick(600);
+    // The command and its output: the typed line alone, still in the box, is one.
+    await until(() => strip(lastFrame() ?? ""), (f) => f.split("hello-from-shell").length - 1 >= 2);
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("hello-from-shell");
@@ -236,7 +238,7 @@ describe("!command", () => {
     stdin.write("what did I just run?");
     await tick();
     stdin.write("\r");
-    await tick(150);
+    await waitFor(() => asked.length > 0);
     const sent = asked.join("\n");
     expect(sent).toContain("what did I just run?");
 
@@ -272,6 +274,7 @@ describe("the context indicator", () => {
     await tick();
     stdin.write("\r");
     await tick(200);
+    await frameIn(lastFrame, { matchesNot: [/context \d+%/] });
     // A number that reads 4% all day is a number nobody looks at, which is how
     // a status line stops being read at all.
     // Matched as a percentage, not as the bare word: the startup notice that
@@ -286,7 +289,10 @@ describe("the context indicator", () => {
     stdin.write("hi");
     await tick();
     stdin.write("\r");
-    await tick(300);
+    // Laying out a three-megabyte answer is the slow part of this test, about
+    // 1.7 s on a laptop and well past the usual bound on a loaded runner, so it
+    // gets a bound of its own.
+    await frameIn(lastFrame, { matches: [/context \d+%/] }, 15_000);
     expect(strip(lastFrame() ?? "")).toMatch(/context \d+%/);
-  });
+  }, 20_000);
 });

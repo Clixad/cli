@@ -783,14 +783,20 @@ describe("the frame never exceeds the terminal", () => {
         initialTask: "go",
       });
       await settle(200);
-      // Type while it runs: the queue rows are chrome and are counted.
+      // Type while it runs: the queue rows are chrome and are counted. The
+      // pauses are a person's, longer than the paste window on both sides of
+      // the Enter: at 20 ms each Enter was a newline and nothing ever queued.
       for (const queued of ["and then this", "and also this", "plus this", "and one more"]) {
         stdin.send(queued);
-        await settle(20);
+        await settle(50);
         stdin.send("\r");
-        await settle(20);
+        await settle(50);
       }
       await settle(250);
+      // Something really queued: this test had stopped queueing anything once
+      // without failing, so it now says what it relies on. Below ten rows the
+      // queue is one of the rows the layout gives up first, by design.
+      if (rows >= 10) expect(frameRows(term).some((row) => row.includes("⏳"))).toBe(true);
       expect(tallestFrameRows(term)).toBeGreaterThan(0);
       expect(tallestFrameRows(term)).toBeLessThanOrEqual(rows);
       for (const row of frameRows(term)) expect(visibleLength(row)).toBeLessThanOrEqual(cols);

@@ -36,6 +36,7 @@ import { App } from "../src/tui/app.tsx";
 import { PaywallError } from "../src/client.ts";
 import { loadConfig, type CliConfig } from "../src/config.ts";
 import type { ChatMessage, ChatOptions, ChatTurn, GatewayClient, WalletInfo } from "../src/client.ts";
+import { frameIn } from "./helpers/wait.ts";
 
 const PAID = "claude-opus-5.5";
 const FREE = "gpt-5-nano";
@@ -130,7 +131,8 @@ async function runIntoThePaywall(script: Script) {
   view.stdin.write(TASK);
   await tick();
   view.stdin.write("\r");
-  await tick(150);
+  // Both notices end on what enter does next.
+  await frameIn(view.lastFrame, { has: ["Press enter"] });
   return view;
 }
 
@@ -155,7 +157,7 @@ describe("the paywall offers a free model", () => {
     expect(script.calls).toEqual([{ model: PAID, prompt: TASK }]);
 
     stdin.write("\r"); // enter at the paywall opens the chooser
-    await tick(120);
+    await frameIn(lastFrame, { has: ["Pick a free model"] });
     expect(strip(lastFrame() ?? "")).toContain("Pick a free model");
 
     stdin.write("\r"); // and its first row is the model with the most turns left
@@ -177,7 +179,7 @@ describe("the paywall offers a free model", () => {
     const script: Script = { free: FREE_MODELS, calls: [] };
     const { stdin, lastFrame } = await runIntoThePaywall(script);
     stdin.write("\r");
-    await tick(120);
+    await frameIn(lastFrame, { has: ["earn credits instead", "offers pay ~51,000 credits on completion (median)"] });
 
     const chooser = strip(lastFrame() ?? "");
     expect(chooser).toContain("earn credits instead");
@@ -190,7 +192,7 @@ describe("the paywall offers a free model", () => {
     stdin.write(ARROW_DOWN);
     await tick();
     stdin.write("\r");
-    await tick(150);
+    await frameIn(lastFrame, { has: ["waiting for the offer…"] });
     expect(strip(lastFrame() ?? "")).toContain("waiting for the offer…");
   });
 
@@ -202,13 +204,14 @@ describe("the paywall offers a free model", () => {
     await tick(120);
     stdin.write(ESC);
     await tick(120);
+    await frameIn(lastFrame, { hasNot: ["Pick a free model"] });
 
     expect(strip(lastFrame() ?? "")).not.toContain("Pick a free model");
     expect(script.calls).toHaveLength(1); // nothing was run
 
     // Enter opens it again, which is what the notice said would happen.
     stdin.write("\r");
-    await tick(120);
+    await frameIn(lastFrame, { has: ["Pick a free model"] });
     expect(strip(lastFrame() ?? "")).toContain("Pick a free model");
   });
 });
@@ -276,7 +279,7 @@ describe("with nothing free left, the old path is untouched", () => {
     expect(notice).not.toContain("still free today");
 
     stdin.write("\r");
-    await tick(150);
+    await frameIn(lastFrame, { has: ["waiting for the offer…"], hasNot: ["Pick a free model"] });
     const out = strip(lastFrame() ?? "");
     expect(out).not.toContain("Pick a free model");
     expect(out).toContain("waiting for the offer…");
