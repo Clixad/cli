@@ -27,6 +27,7 @@ import {
   premiumLocked,
   premiumUnlockHint,
   packsFromClause,
+  rewardedAdLine,
   usd,
   grantLabel,
   shortfallHeadline,
@@ -665,12 +666,27 @@ export function App({
   /**
    * An Enter that will send once `PASTE_ENTER_MS` passes with nothing behind
    * it. The gap *before* an Enter can outgrow the window when a render lands
-   * between two reads of one paste; the gap after it cannot, because the rest
-   * of a paste is already waiting in the input buffer. So any input in that
-   * window turns it back into the newline it was.
+   * between two reads of one paste, so any input in that window turns it back
+   * into the newline it was.
+   *
+   * The gap after it can outgrow the window too, and the send must not decide
+   * that by the clock alone. Node runs expired timers before it reads input, so
+   * when handling one read takes longer than the window (a slow machine laying
+   * out a long buffer), the timer used to fire ahead of the rest of the paste
+   * although it was already waiting to be read: one line went out on its own.
+   * So the timer only hands the decision to `setImmediate`, which runs after
+   * the loop has read what is waiting, and the send happens only if nothing
+   * arrived by then. The ref holds the timer until that moment, so input in
+   * between still finds it set.
    */
   const pendingSendRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  useEffect(() => () => clearTimeout(pendingSendRef.current), []);
+  useEffect(
+    () => () => {
+      clearTimeout(pendingSendRef.current);
+      pendingSendRef.current = undefined;
+    },
+    [],
+  );
   const [busy, setBusy] = useState(false);
   const [live, setLive] = useState<Live | null>(null);
   /**
@@ -2209,6 +2225,7 @@ export function App({
               `  ${err.model} is a premium model. It runs on credits from offer-wall surveys or purchases.\n` +
               short +
               "  Your bonus credits (the signup bonus, our own surveys) still work on budget models.\n" +
+              rewardedAdLine(err.rewardedAd) +
               "  Press enter to unlock it or to switch to a budget model. Your request is kept.",
           });
         } else if (err instanceof PaywallError) {
@@ -2229,12 +2246,14 @@ export function App({
             ? `  Our own surveys pay ${err.ownSurvey.credits.toLocaleString("en-US")} credits each and nobody is ` +
               `screened out (${err.ownSurvey.leftToday} left today). They are first on the wall.\n`
             : "";
+          const ad = rewardedAdLine(err.rewardedAd);
           push({
             kind: "notice",
             tone: "warn",
             text: free
               ? `  ${shortfallHeadline(err, model)}\n` +
                 own +
+                ad +
                 `  Press enter — ${free.id} is still free today ` +
                 `(~${free.turnsLeft} turn${free.turnsLeft === 1 ? "" : "s"} left), or take an offer instead.\n` +
                 `  Your request is kept either way, so you will not have to type it again.\n` +
@@ -2242,6 +2261,7 @@ export function App({
                 `  /buy is there too${packsFromClause(err.cheapestPackUsd)}, if you would rather pay than do an offer.`
               : `  ${shortfallHeadline(err, model)}\n` +
                 own +
+                ad +
                 `  Press enter to open the ad wall — offers pay ${grantLabel(err.grantPerAd)}.\n` +
                 `  I'll continue automatically. Offers you are screened out of pay nothing;\n` +
                 `  that is normal, just start another.\n` +
@@ -3948,10 +3968,14 @@ export function App({
       if (!busy && pendingTaskRef.current && ed.isEmpty(editorRef.current)) {
         return void (pendingPremiumRef.current ? runPremiumChoice() : runPaywallChoice());
       }
-      pendingSendRef.current = setTimeout(() => {
-        pendingSendRef.current = undefined;
-        void submit(ed.toText(editorRef.current));
+      const timer = setTimeout(() => {
+        setImmediate(() => {
+          if (pendingSendRef.current !== timer) return; // more input came: a newline
+          pendingSendRef.current = undefined;
+          void submit(ed.toText(editorRef.current));
+        });
       }, PASTE_ENTER_MS);
+      pendingSendRef.current = timer;
       return;
     }
     if (key.ctrl && ch === "j") return setEditor(ed.newline);

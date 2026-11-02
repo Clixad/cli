@@ -70,6 +70,20 @@ function stubClient(turns: Pick<ChatTurn, "message" | "finishReason">[] = []): G
 const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
 /** Let Ink process a keystroke and re-render. */
 const tick = (ms = 40) => new Promise((r) => setTimeout(r, ms));
+/**
+ * The last frame once it shows `text`, else the last frame after `ms`. For an
+ * assertion that waits on an async chain (a request, a refusal, a notice): a
+ * fixed tick that is enough on a laptop is not on a loaded CI runner, and the
+ * test then fails without the CLI doing anything wrong. A bound, not a sleep.
+ */
+async function frameWith(lastFrame: () => string | undefined, text: string, ms = 3000): Promise<string> {
+  const end = Date.now() + ms;
+  for (;;) {
+    const out = strip(lastFrame() ?? "");
+    if (out.includes(text) || Date.now() > end) return out;
+    await tick(20);
+  }
+}
 const ARROW_DOWN = "\x1b[B";
 const ESC = "\x1b";
 
@@ -518,9 +532,8 @@ describe("TUI /login", () => {
     stdin.write("/wallet");
     await tick();
     stdin.write("\r");
-    await tick(120);
 
-    const out = strip(lastFrame() ?? "");
+    const out = await frameWith(lastFrame, "/login");
     expect(out).toContain("/login");
     expect(out).not.toContain("clixad login"); // the instruction that cannot be run here
   });
@@ -866,6 +879,18 @@ describe("TUI paste without brackets", () => {
   ].join("\n");
   /** What the terminal sends: every newline is a carriage return. */
   const RAW = PROMPT.replace(/\n/g, "\r");
+  /**
+   * The paste as the pieces a terminal can deliver: each line's text, then its
+   * carriage return. A blank line is two carriage returns in a row, never an
+   * empty read, and the prompt's last line has no carriage return after it.
+   * Writing "" for a blank line gave the window an extra turn of the loop with
+   * no input in it, and a trailing "\r" was an Enter the paste never had; on a
+   * slow runner either one failed the test without the CLI doing anything wrong.
+   */
+  const PIECES = RAW.split("\r").flatMap((line, i, all) => [
+    ...(line ? [line] : []),
+    ...(i < all.length - 1 ? ["\r"] : []),
+  ]);
 
   function recordingClient(sent: string[]): GatewayClient {
     return {
@@ -909,10 +934,7 @@ describe("TUI paste without brackets", () => {
 
   it("does not send a line at every carriage return in one read", async () => {
     const { beforeEnter, sent } = await pasteThenEnter((stdin) => {
-      for (const line of RAW.split("\r")) {
-        stdin.write(line);
-        stdin.write("\r");
-      }
+      for (const piece of PIECES) stdin.write(piece);
     });
     expect(beforeEnter).toBe(0);
     expect(sent).toEqual([PROMPT]);
@@ -924,15 +946,43 @@ describe("TUI paste without brackets", () => {
     // stale. Not a timed sleep, which a loaded machine stretches past the window.
     const nextRead = () => new Promise((resolve) => setImmediate(resolve));
     const { beforeEnter, sent } = await pasteThenEnter(async (stdin) => {
-      for (const line of RAW.split("\r")) {
-        stdin.write(line);
-        await nextRead();
-        stdin.write("\r");
+      for (const piece of PIECES) {
+        stdin.write(piece);
         await nextRead();
       }
     });
     expect(beforeEnter).toBe(0);
     expect(sent).toEqual([PROMPT]);
+  });
+
+  it("does not send ahead of input that was already waiting when the window ran out", async () => {
+    // Node runs expired timers before it reads input. When handling one read
+    // takes longer than the window (a slow machine laying out a long buffer,
+    // which is what a CI runner is), the gap before a lone carriage return and
+    // the work after it both outlast it, and the send used to fire ahead of the
+    // rest of the paste, which was already waiting to be read. The loop is
+    // blocked here on both sides of the carriage return to stand in for that,
+    // so this fails the same way on every machine rather than on a slow one.
+    const block = (ms: number) => {
+      const end = Date.now() + ms;
+      while (Date.now() < end) {
+        /* the loop is busy, as it is during a long render */
+      }
+    };
+    const PAST_THE_WINDOW = 45;
+    const nextRead = () => new Promise((resolve) => setImmediate(resolve));
+    const { beforeEnter, sent } = await pasteThenEnter(async (stdin) => {
+      stdin.write("first line");
+      await nextRead();
+      block(PAST_THE_WINDOW);
+      stdin.write("\r");
+      block(PAST_THE_WINDOW);
+      await nextRead();
+      stdin.write("second line");
+      await nextRead();
+    });
+    expect(beforeEnter).toBe(0);
+    expect(sent).toEqual(["first line\nsecond line"]);
   });
 
   it("still sends on an Enter typed after the last key", async () => {

@@ -73,6 +73,8 @@ interface Script {
   calls: { model: string; prompt: string }[];
   /** One of our own surveys open to the account, as the refusal reports it. */
   own?: { credits: number; leftToday: number } | null;
+  /** A short ad the gateway would credit now, as the refusal reports it. */
+  ad?: { credits: number; leftToday: number } | null;
 }
 
 /**
@@ -96,7 +98,15 @@ function stubClient(script: Script): GatewayClient {
       const prompt = typeof last?.content === "string" ? last.content : "";
       script.calls.push({ model, prompt });
       if (model === PAID) {
-        throw new PaywallError(12, 1190, 51_000, script.free ?? [], script.pack ?? null, script.own ?? null);
+        throw new PaywallError(
+          12,
+          1190,
+          51_000,
+          script.free ?? [],
+          script.pack ?? null,
+          script.own ?? null,
+          script.ad ?? null,
+        );
       }
       opts.onDelta?.("done");
       return {
@@ -232,6 +242,22 @@ describe("the paywall names our own survey first when one is open (2026-10-19)",
   it("says nothing about them when the gateway offers none", async () => {
     const { lastFrame } = await runIntoThePaywall({ free: [], calls: [] });
     expect(strip(lastFrame() ?? "")).not.toContain("Our own surveys");
+  });
+});
+
+describe("the paywall names a short ad when the gateway offers one (2026-11-02)", () => {
+  it("says what one pays and where it is, on both notices", async () => {
+    for (const free of [FREE_MODELS, []]) {
+      const { lastFrame } = await runIntoThePaywall({ free, ad: { credits: 240, leftToday: 10 }, calls: [] });
+      expect(strip(lastFrame() ?? "").replace(/\s+/g, " ")).toContain(
+        "Or watch a short ad on the earn page (/earn): 240 credits for watching one to the end, 10 left today.",
+      );
+    }
+  });
+
+  it("says nothing about ads when the gateway offers none", async () => {
+    const { lastFrame } = await runIntoThePaywall({ free: [], calls: [] });
+    expect(strip(lastFrame() ?? "")).not.toContain("short ad");
   });
 });
 

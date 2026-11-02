@@ -164,6 +164,19 @@ export function packsFromClause(cheapestUsd: number | null | undefined): string 
 }
 
 /**
+ * The line a refusal adds when the gateway would credit a short ad right now.
+ * The ad itself is on the earn page, where it says what it pays before it
+ * plays and can be closed; this only says it is there. Empty without an offer.
+ */
+export function rewardedAdLine(offer: { credits: number; leftToday: number } | null | undefined): string {
+  if (!offer) return "";
+  return (
+    `  Or watch a short ad on the earn page (/earn): ${offer.credits.toLocaleString("en-US")} credits ` +
+    `for watching one to the end, ${offer.leftToday} left today.\n`
+  );
+}
+
+/**
  * What one call may spend right now, per kind of model, as the gateway worked
  * it out (2026-10-12): its earned credits plus what is left of today's limit on
  * bonus credits on a budget model, its earned credits plus what is left of the
@@ -396,6 +409,7 @@ export const LEDGER_REASONS: Record<string, string> = {
   own_survey_reward: "Clixad survey",
   ad_screenout_bonus: "screenout bonus (didn't qualify)",
   ad_sponsor_impression: "sponsored line shown",
+  ad_rewarded_view: "ad watched",
   ad_reversal: "offer reward reversed by the provider",
   purchase: "credits purchased",
   usage: "model usage",
@@ -1025,6 +1039,12 @@ export class PaywallError extends Error {
      * when none is open.
      */
     readonly ownSurvey: { credits: number; leftToday: number } | null = null,
+    /**
+     * A short ad on the earn page that the gateway would credit right now:
+     * what one pays and how many are left today. Null from an older gateway,
+     * or when none is on offer.
+     */
+    readonly rewardedAd: { credits: number; leftToday: number } | null = null,
   ) {
     super("Out of credits");
     this.name = "PaywallError";
@@ -1057,6 +1077,8 @@ export class PremiumLockedError extends Error {
     readonly freeModels: FreeAlternative[],
     /** What may be spent per kind of model, with the balance it was worked out from. */
     readonly spendable?: { figures: Spendable; balance: number },
+    /** A short ad the gateway would credit now, `PaywallError.rewardedAd`'s shape. */
+    readonly rewardedAd: { credits: number; leftToday: number } | null = null,
   ) {
     super(message);
     this.name = "PremiumLockedError";
@@ -1133,6 +1155,7 @@ interface PremiumBody {
   unlock_usd?: unknown;
   grant_per_ad?: unknown;
   free_models?: unknown;
+  rewarded_ad?: unknown;
 }
 
 function premiumLockedError(
@@ -1153,6 +1176,7 @@ function premiumLockedError(
     num(body?.grant_per_ad),
     freeAlternatives(body?.free_models),
     spendable,
+    ownSurveyOffer(body?.rewarded_ad),
   );
 }
 
@@ -1184,6 +1208,7 @@ interface PaywallBody {
   free_models?: { id: string; turns_left: number }[];
   cheapest_pack_usd?: unknown;
   own_survey?: unknown;
+  rewarded_ad?: unknown;
 }
 
 function paywallError(body: PaywallBody): PaywallError {
@@ -1195,10 +1220,12 @@ function paywallError(body: PaywallBody): PaywallError {
     freeAlternatives(body.free_models),
     typeof pack === "number" && Number.isFinite(pack) && pack > 0 ? pack : null,
     ownSurveyOffer(body.own_survey),
+    // The same shape, `{ credits, left_today }`, and the same defensive read.
+    ownSurveyOffer(body.rewarded_ad),
   );
 }
 
-/** A 402's `own_survey`, read defensively: anything unusable is no offer. */
+/** A 402's `own_survey` (or `rewarded_ad`), read defensively: anything unusable is no offer. */
 function ownSurveyOffer(raw: unknown): { credits: number; leftToday: number } | null {
   if (typeof raw !== "object" || raw === null) return null;
   const o = raw as { credits?: unknown; left_today?: unknown };

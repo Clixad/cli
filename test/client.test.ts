@@ -21,6 +21,7 @@ import {
   grantLabel,
   ledgerReasonLabel,
   packsFromClause,
+  rewardedAdLine,
   premiumHeadline,
   premiumLocked,
   premiumUnlockHint,
@@ -213,6 +214,29 @@ describe("pre-completion earn figures", () => {
       )) as PaywallError;
       expect(err.ownSurvey, JSON.stringify(extra)).toEqual(expected);
     }
+  });
+
+  it("carries the short ad a 402 offers, read like the own survey (2026-11-02)", async () => {
+    const cases: [Record<string, unknown>, { credits: number; leftToday: number } | null][] = [
+      [{ rewarded_ad: { credits: 240, left_today: 10 } }, { credits: 240, leftToday: 10 }],
+      [{}, null], // an older gateway, or nothing on offer
+      [{ rewarded_ad: { credits: 240, left_today: 0 } }, null],
+      [{ rewarded_ad: "yes" }, null],
+    ];
+    for (const [extra, expected] of cases) {
+      respond(
+        JSON.stringify({ error: "insufficient_credits", balance: 12, estimated_cost: 1190, grant_per_ad: 1, ...extra }),
+        { status: 402, headers: { "content-type": "application/json" } },
+      );
+      const err = (await failure(
+        new GatewayClient(config).chatStream([{ role: "user", content: "hi" }], "kimi-k2.5"),
+      )) as PaywallError;
+      expect(err.rewardedAd, JSON.stringify(extra)).toEqual(expected);
+    }
+    expect(rewardedAdLine({ credits: 240, leftToday: 10 })).toBe(
+      "  Or watch a short ad on the earn page (/earn): 240 credits for watching one to the end, 10 left today.\n",
+    );
+    expect(rewardedAdLine(null)).toBe("");
   });
 
   it("offers nothing when the gateway says nothing, and treats the three silences alike", async () => {
