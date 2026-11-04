@@ -230,11 +230,12 @@ describe("auto mode in the REPL", () => {
     stdin.write("clean the machine");
     await tick();
     stdin.write("\r");
-    await frameIn(lastFrame, { has: ["auto mode blocked this: it runs with administrator rights", "I will not do that."], hasNot: ["[y/⏎] once"] });
+    await frameIn(lastFrame, { has: ["Auto mode blocked this: it runs with administrator rights", "I will not do that."], hasNot: ["1. Yes", "[y/⏎] once"] });
 
     const out = strip(lastFrame() ?? "");
-    expect(out).toContain("auto mode blocked this: it runs with administrator rights");
+    expect(out).toContain("Auto mode blocked this: it runs with administrator rights");
     expect(out).not.toContain("[y/⏎] once");
+    expect(out).not.toContain("1. Yes");
     expect(out).toContain("I will not do that.");
     expect(sent.some((m) => isReview({ messages: m }))).toBe(false);
   });

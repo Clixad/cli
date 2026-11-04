@@ -153,9 +153,16 @@ afterEach(async () => {
   restoreProcessStdout();
 });
 
-/** The input box's bottom border — the row everything under the box hangs off. */
+/**
+ * The rule under the input — the row everything under the box hangs off. The
+ * input is a prompt between two rules, so it is the rule that follows the
+ * last prompt row with a rule above it.
+ */
 function boxBottom(screen: Screen): number {
-  for (let r = screen.rows.length - 1; r >= 0; r--) if (screen.rows[r]!.startsWith("╰")) return r;
+  const rule = (r: number) => /^─{3,}$/.test(screen.rows[r] ?? "");
+  for (let r = screen.rows.length - 2; r >= 1; r--) {
+    if (screen.rows[r]!.startsWith("❯") && rule(r - 1) && rule(r + 1)) return r + 1;
+  }
   return -1;
 }
 

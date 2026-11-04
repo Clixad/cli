@@ -13,7 +13,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, type Dirent } from "node:fs";
 import { isAbsolute, relative, resolve, dirname, join, sep } from "node:path";
-import { renderDiff } from "./diff.ts";
+import { diffView, renderDiff, type DiffView } from "./diff.ts";
 import { extractPdfText, looksLikePdf } from "./pdf.ts";
 import { killTree, shells, ShellError, type ShellRegistry, type ShellSnapshot } from "./shells.ts";
 import { parseTodos, todoResult, TodoError, type TodoList } from "./todos.ts";
@@ -113,6 +113,12 @@ export interface ToolContext {
    * this model run, and `read_file` says so rather than returning bytes.
    */
   attach?: (image: ImageAttachment) => void;
+  /**
+   * Show the person watching what a tool did, beside its result: today the
+   * lines a write changed. Never sent to the model, which is told what it is
+   * always told. Absent (a sub-agent, `clixad -p`) means nobody is drawing it.
+   */
+  present?: (view: DiffView) => void;
   /** Background command registry. Defaults to the process-wide one. */
   shells?: ShellRegistry;
 }
@@ -603,13 +609,16 @@ export const TOOLS = {
     const abs = safeResolve(ctx.root, requireString(args.path, "write_file", "path"));
     const content = requireString(args.content, "write_file", "content");
     const name = rel(ctx.root, abs);
-    const before = existsSync(abs) ? fsCall(`cannot write ${name}`, () => readFileSync(abs, "utf8")) : "";
+    const existed = existsSync(abs);
+    const before = existed ? fsCall(`cannot write ${name}`, () => readFileSync(abs, "utf8")) : "";
     const preview = renderDiff(before, content) || "(no change)";
+    const view = diffView(name, before, content, { created: !existed });
     await gate(ctx, {
       tool: "write_file",
       signature: `write:${name}`,
       summary: `${before ? "overwrite" : "create"} ${name}`,
       preview,
+      view,
       path: name,
       root: ctx.root,
     });
@@ -617,6 +626,7 @@ export const TOOLS = {
       mkdirSync(dirname(abs), { recursive: true });
       writeFileSync(abs, content, "utf8");
     });
+    ctx.present?.(view);
     return `wrote ${content.length} bytes to ${name}`;
   },
 
@@ -661,15 +671,18 @@ export const TOOLS = {
     // rejected above.
     const after = before.split(oldString).join(newString);
     const preview = renderDiff(before, after) || "(no change)";
+    const view = diffView(name, before, after);
     await gate(ctx, {
       tool: "edit_file",
       signature: `write:${name}`,
       summary: `edit ${name}`,
       preview,
+      view,
       path: name,
       root: ctx.root,
     });
     fsCall(`cannot edit ${name}`, () => writeFileSync(abs, after, "utf8"));
+    ctx.present?.(view);
     return `edited ${name} (${count > 1 ? `${count} occurrences` : "1 occurrence"})`;
   },
 

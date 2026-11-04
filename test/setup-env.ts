@@ -29,6 +29,7 @@ export const CLI_ENV = [
   "FORCE_COLOR",
   "FORCE_HYPERLINK",
   "TERM",
+  "COLORTERM",
   // Which terminal this is, for links and emoji.
   "TERM_PROGRAM",
   "TERM_PROGRAM_VERSION",

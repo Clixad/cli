@@ -135,7 +135,8 @@ describe("a web search on a free model", () => {
 
     await send(view, "how do fake timers work in vitest");
     const frame = strip(view.lastFrame()!);
-    expect(frame).toContain("vitest fake timers · 1,069 credits");
+    expect(frame).toContain('Web Search("vitest fake timers")');
+    expect(frame).toContain("⎿  No results · 1,069 credits");
     expect(frame).toContain("[free · 410 credits waived · 59,590 free credits left · web search 1,069 credits · balance 3,919]");
     // The balance and the session's spend moved for a turn whose model calls were free.
     expect(statusRow(frame)).toContain("3,919 cr");
@@ -164,12 +165,13 @@ describe("a web search on a paid model", () => {
     await send(view, "look something up");
     let frame = strip(view.lastFrame()!);
     expect(frame).toContain("Web searches cost about 1,050 credits each from your balance, on top of the model's tokens.");
-    expect(frame).toContain("first · 1,069 credits");
+    expect(frame).toContain('Web Search("first")');
+    expect(frame).toContain("⎿  No results · 1,069 credits");
     expect(frame).toContain("[300 credits · web search 1,069 credits · balance 7,631]");
 
     await send(view, "and again");
     frame = strip(view.lastFrame()!);
-    expect(frame).toContain("first · cached, no charge");
+    expect(frame).toContain("⎿  No results · cached, no charge");
     expect(frame).toContain("[300 credits · balance 7,331]");
     expect(frame.split("Web searches cost").length - 1).toBe(1);
     view.unmount();

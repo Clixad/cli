@@ -122,6 +122,139 @@ export interface RenderDiffOptions {
   maxWidth?: number;
 }
 
+/** One row of a diff as the TUI draws it: a line, or the unchanged lines between two hunks. */
+export type DiffRow = { kind: "add" | "del" | "ctx"; line: number; text: string } | { kind: "gap"; count: number };
+
+/**
+ * What a write did to a file, for the transcript. It travels beside the tool
+ * result rather than inside it: the model is told what it is always told, and
+ * the person watching sees the lines that changed, in accept-edits and auto
+ * mode too, where no dialog ever showed them.
+ */
+export interface DiffView {
+  kind: "diff";
+  path: string;
+  /** The file did not exist before: `rows` are its lines, all added. */
+  created: boolean;
+  added: number;
+  removed: number;
+  rows: DiffRow[];
+}
+
+/** Rows a view keeps at most, so a generated file does not sit in memory twice. */
+const MAX_VIEW_ROWS = 2_000;
+
+export function diffView(path: string, before: string, after: string, opts: { context?: number; created?: boolean } = {}): DiffView {
+  const context = opts.context ?? 3;
+  if (opts.created) {
+    const lines = splitLines(after);
+    const rows: DiffRow[] = lines.slice(0, MAX_VIEW_ROWS).map((text, i) => ({ kind: "add", line: i + 1, text }));
+    if (lines.length > MAX_VIEW_ROWS) rows.push({ kind: "gap", count: lines.length - MAX_VIEW_ROWS });
+    return { kind: "diff", path, created: true, added: after === "" ? 0 : lines.length, removed: 0, rows };
+  }
+  const lines = diffLines(splitLines(before), splitLines(after));
+  const { added, removed } = diffStat(lines);
+  const keep = new Array<boolean>(lines.length).fill(false);
+  lines.forEach((l, i) => {
+    if (l.kind === "ctx") return;
+    for (let k = Math.max(0, i - context); k <= Math.min(lines.length - 1, i + context); k++) keep[k] = true;
+  });
+  const rows: DiffRow[] = [];
+  let skipped = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (!keep[i]) {
+      skipped++;
+      continue;
+    }
+    // A gap before the first hunk says nothing the line numbers do not.
+    if (skipped > 0 && rows.length > 0) rows.push({ kind: "gap", count: skipped });
+    skipped = 0;
+    if (rows.length >= MAX_VIEW_ROWS) {
+      rows.push({ kind: "gap", count: lines.length - i });
+      break;
+    }
+    rows.push({ ...lines[i]! });
+  }
+  return { kind: "diff", path, created: false, added, removed, rows };
+}
+
+/**
+ * How a diff row may be coloured. A full-row background is what makes a diff
+ * readable at a glance, but only a terminal that says it has 24-bit colour gets
+ * the exact tints; anything that says 256 colours gets the nearest palette
+ * entries, and `NO_COLOR` gets the `+` and `-` alone.
+ */
+export type DiffTint = "truecolor" | "256" | "basic" | "none";
+
+export function diffTint(env: { NO_COLOR?: string; COLORTERM?: string; TERM?: string } = process.env): DiffTint {
+  if (env.NO_COLOR) return "none";
+  if (env.COLORTERM === "truecolor" || env.COLORTERM === "24bit") return "truecolor";
+  if (/256/.test(env.TERM ?? "")) return "256";
+  if (env.TERM === "dumb") return "none";
+  return "basic";
+}
+
+const TINTS: Record<DiffTint, { add: string; del: string; addSign: string; delSign: string; off: string }> = {
+  truecolor: {
+    add: "\x1b[48;2;28;62;38m",
+    del: "\x1b[48;2;78;32;36m",
+    addSign: "\x1b[38;2;126;231;135m",
+    delSign: "\x1b[38;2;255;123;114m",
+    off: R,
+  },
+  "256": { add: "\x1b[48;5;22m", del: "\x1b[48;5;52m", addSign: "\x1b[92m", delSign: "\x1b[91m", off: R },
+  basic: { add: GREEN, del: RED, addSign: "", delSign: "", off: R },
+  none: { add: "", del: "", addSign: "", delSign: "", off: "" },
+};
+
+/**
+ * A diff drawn as terminal rows: a line-number gutter, the sign, the text,
+ * each row exactly `width` columns (cut, never wrapped, and padded so a
+ * background reaches the edge). Measured with the same functions ink lays out
+ * with, so a row the caller counts as one is one.
+ */
+export function renderDiffRows(
+  view: DiffView,
+  width: number,
+  opts: { maxRows?: number; tint?: DiffTint; measure: (s: string) => number; cut: (s: string, cols: number) => string },
+): { rows: string[]; more: number } {
+  const tint = TINTS[opts.tint ?? "basic"];
+  const max = opts.maxRows ?? Number.POSITIVE_INFINITY;
+  const numbers = view.rows.filter((r) => r.kind !== "gap") as Array<{ line: number }>;
+  const gutter = Math.max(3, ...numbers.map((r) => String(r.line).length));
+  const fit = (text: string) => {
+    const cut = opts.measure(text) > width ? opts.cut(text, width) : text;
+    return cut + " ".repeat(Math.max(0, width - opts.measure(cut)));
+  };
+  const rows: string[] = [];
+  let more = 0;
+  for (const row of view.rows) {
+    if (rows.length >= max) {
+      if (row.kind !== "gap") more++;
+      continue;
+    }
+    if (row.kind === "gap") {
+      const dim = tint === TINTS.none ? "" : DIM;
+      rows.push(`${dim}${opts.cut(`${" ".repeat(gutter)}   ⋯ ${row.count} unchanged line${row.count === 1 ? "" : "s"}`, width)}${tint.off}`);
+      continue;
+    }
+    const text = row.text.replace(/\t/g, "  ");
+    const no = String(row.line).padStart(gutter);
+    if (row.kind === "ctx") {
+      rows.push(`${tint === TINTS.none ? "" : DIM}${opts.cut(`${no}   ${text}`, width)}${tint.off}`);
+      continue;
+    }
+    const sign = row.kind === "add" ? "+" : "-";
+    const bg = row.kind === "add" ? tint.add : tint.del;
+    const signColor = row.kind === "add" ? tint.addSign : tint.delSign;
+    const body = fit(`${no} ${sign} ${text}`);
+    // The sign keeps its own colour on top of the row's tint.
+    const at = gutter + 1;
+    rows.push(`${bg}${body.slice(0, at)}${signColor}${sign}${signColor ? "\x1b[39m" : ""}${body.slice(at + 1)}${tint.off}`);
+  }
+  return { rows, more };
+}
+
 /**
  * Render old→new as a coloured, hunked diff. Returns "" when nothing changed,
  * so callers can treat a no-op edit as such.

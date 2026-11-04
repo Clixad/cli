@@ -28,6 +28,7 @@ import {
 import { isMcpToolName, type McpHub } from "./mcp.ts";
 import type { ShellRegistry } from "./shells.ts";
 import type { TodoList } from "./todos.ts";
+import type { DiffView } from "./diff.ts";
 import type { PermissionRequest, PlanDecision, Permit, ReviewVerdict } from "./permissions.ts";
 import { parseReview, reviewFailure, reviewMessages, userTexts } from "./auto-mode.ts";
 import {
@@ -62,7 +63,16 @@ export type AgentEvent =
    * shorter thing to show the user instead. Only a permission refusal sets it,
    * because only there do the two audiences need different sentences.
    */
-  | { type: "tool_result"; id: string; name: string; result: string; ok: boolean; display?: string }
+  | {
+      type: "tool_result";
+      id: string;
+      name: string;
+      result: string;
+      ok: boolean;
+      display?: string;
+      /** What the tool showed the person watching (a write's diff); never part of `result`. */
+      view?: DiffView;
+    }
   /** Images a tool put into the conversation, for a notice in the transcript. */
   | { type: "attachment"; labels: string[] }
   /**
@@ -382,6 +392,9 @@ export async function runAgent(
     mcp: opts.mcp,
     shells: opts.shells,
     attach: (image) => pendingImages.push(image),
+    // A placeholder that says writes are shown at this depth; each call gets
+    // its own (`executeToolCall`), which puts the view on its result event.
+    ...(depth === 0 ? { present: () => undefined } : {}),
     // The recursion guard, and the whole of it: a sub-agent runs at depth 1 and
     // is handed no way to start another.
     ...(depth === 0 ? { spawn: runSubAgent } : {}),
@@ -660,9 +673,13 @@ async function executeToolCall(
   emit({ type: "tool_call", id, name, args });
 
   const search = ctx.webSearch;
+  let view: DiffView | undefined;
   const scoped: ToolContext = {
     ...ctx,
     onOutput: (chunk) => emit({ type: "tool_output", id, chunk }),
+    // Only where something draws it: a sub-agent's writes are not shown, and
+    // `ctx.present` is how this run says whether anybody is watching.
+    ...(ctx.present ? { present: (v: DiffView) => (view = v) } : {}),
     // Reported against this call the moment it is charged, so the row says
     // what it cost and the balance on screen moves with it.
     ...(search
@@ -684,7 +701,7 @@ async function executeToolCall(
   };
   try {
     const result = await dispatch(scoped, name, args);
-    emit({ type: "tool_result", id, name, result, ok: true });
+    emit({ type: "tool_result", id, name, result, ok: true, ...(view ? { view } : {}) });
     return result;
   } catch (err) {
     if (err instanceof ToolError) {

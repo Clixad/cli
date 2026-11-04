@@ -16,6 +16,7 @@
  * the most permissive mode is never one accidental press away from the default.
  */
 import { classifyCommand, sensitiveEdit } from "./auto-mode.ts";
+import type { DiffView } from "./diff.ts";
 
 export type PermissionMode = "plan" | "normal" | "acceptEdits" | "auto";
 
@@ -92,6 +93,8 @@ export interface PermissionRequest {
   summary: string;
   /** Rendered diff or the command line — what the user actually approves. */
   preview?: string;
+  /** The same diff as data, which the TUI draws at the dialog's own width. */
+  view?: DiffView;
   /**
    * What auto mode judges, carried as data rather than parsed back out of the
    * summary: the whole command line, the workspace-relative path of an edit,

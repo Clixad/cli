@@ -127,11 +127,17 @@ import {
 import { helpText } from "./commands.ts";
 import * as ed from "./editor.ts";
 import { applySuggestion, findToken, suggest, type Suggestion } from "./suggest.ts";
-import { renderMarkdown } from "./markdown.ts";
+import { renderMarkdown, renderMarkdownState, type MdState } from "./markdown.ts";
+import { splitStable, trimLeadingBlankLines } from "./stream.ts";
+import { diffTint, renderDiffRows, type DiffView } from "../diff.ts";
+import { askWords, headText, presentResult, toolHead, type Presented } from "./present.ts";
 import {
+  assistantBlock,
   dialogInner,
   EntryView,
   entryHeight,
+  liveToolBlock,
+  TOOL_BODY_INDENT,
   errorNotice,
   fitRow,
   headRows,
@@ -141,6 +147,7 @@ import {
   AD_MARK,
   AD_TEXT,
   MODE_STYLE,
+  SLATE,
   padColumns,
   pickHint,
   tailRows,
@@ -207,8 +214,6 @@ const NOT_SIGNED_IN =
   "  Not signed in, or the stored token isn't valid for this gateway.\n  Run /login to sign in.";
 /** Lines of a running command's output kept on screen while it runs. */
 const LIVE_OUTPUT_LINES = 5;
-/** Lines of a finished tool's output committed to the scrollback. */
-const COMMITTED_OUTPUT_LINES = 4;
 /**
  * How long streamed text is allowed to pool before it is painted.
  *
@@ -265,6 +270,10 @@ const PICKER_CHROME = 8;
 const PICKER_CHROME_COMPACT = 5;
 // marginTop + border (2) + the hint row.
 const ASK_CHROME = 4;
+// The numbered form: marginTop + border (2) + title + question + three answers + the esc row.
+const ASK_MENU_CHROME = 9;
+/** The three answers, in the order the numbered dialog lists them. */
+const ASK_ANSWERS: readonly PermissionAnswer[] = ["once", "always", "deny"];
 // marginTop + border (2) + title + spacer + hint.
 const PLAN_CHROME = 6;
 // marginTop + border (2) + title + spacer + the typed field + hint. One row more
@@ -286,6 +295,11 @@ const BUY_CHROME_COMPACT = 5;
  * so a truncated tail loses precisely the key somebody stuck there needs.
  * `pickHint` takes the widest form that fits instead.
  */
+export const ASK_MENU_HINT = [
+  "↑↓ choose · ⏎ confirm · y/a/n · esc stops the turn",
+  "⏎ confirm · esc stops the turn",
+  "⏎ · esc stops",
+] as const;
 export const ASK_HINT = [
   "[y/⏎] once · [a] always · [n] no · esc stops the turn",
   "y once · a always · n no · esc stops",
@@ -541,9 +555,30 @@ const INIT_HINT_AFTER_TURNS = 3;
 
 /** What the current turn is showing below the committed scrollback. */
 interface Live {
+  /** The part of the answer still being written: its last line, and anything held back with it. */
   text: string;
-  tool?: { name: string; summary: string; output: string };
+  /** What the committed lines before it left open (a code fence). */
+  md?: MdState;
+  /** Some of this answer is already in the scrollback, so the tail carries no marker. */
+  cont?: boolean;
+  /** The tool call running now, with its newest output. */
+  tool?: { verb: string; target: string; output: string };
 }
+
+/**
+ * The answer being streamed: what has not been committed yet, what the
+ * committed part left open, and whether any of it has been committed (the
+ * first piece carries the marker) or streamed at all (a round that streamed
+ * nothing is committed whole when it ends, as it always was).
+ */
+interface StreamState {
+  text: string;
+  md: MdState;
+  committed: boolean;
+  streamed: boolean;
+}
+
+const freshStream = (): StreamState => ({ text: "", md: {}, committed: false, streamed: false });
 
 /** One row of a modal picker (today: `/model`). */
 interface PickerItem {
@@ -915,10 +950,15 @@ export function App({
   const pickerWindowRef = useRef({ from: 0, count: 0 });
   /** Whether the purchase dialog got its declarations on screen. Written during render. */
   const buyFitsRef = useRef(false);
+  // The permission dialog's highlighted answer, and whether the numbered form
+  // is the one on screen (only then do the arrows and ⏎ mean the highlight).
+  const [askSel, setAskSel] = useState(0);
+  const askSelRef = useRef(0);
+  const askMenuRef = useRef(false);
   // Resolved once: TERM does not change under a running process, and asking
   // per frame would be two string comparisons eight times a second.
   const spinnerRef = useRef(spinnerFrames());
-  const runningToolRef = useRef<{ name: string; summary: string } | null>(null);
+  const runningToolRef = useRef<{ name: string; args: Record<string, unknown> } | null>(null);
   // The task the paywall interrupted, with whatever was attached to it. The
   // images travel with it because a retry that silently dropped the screenshot
   // the question was about would answer a different question.
@@ -1090,6 +1130,12 @@ export function App({
   // See DELTA_FLUSH_MS: a render per token is what made the output lurch.
   const deltaBufRef = useRef("");
   const deltaTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The answer being written, between the pool above and the scrollback.
+  const streamRef = useRef<StreamState>(freshStream());
+  // Characters the model has produced this turn (text and tool arguments), for
+  // the token count on the working line. A ref: the line is redrawn on the
+  // spinner's tick anyway, and a render per delta is what the pool avoids.
+  const turnCharsRef = useRef(0);
   // Sponsored line state. The counter is the rotation — one step per model call,
   // never per render — and `prev` is the only rule it obeys.
   const sponsorRef = useRef(sponsorSource());
@@ -1265,6 +1311,47 @@ export function App({
     return next;
   }, [syncQueue]);
 
+  /**
+   * Move what is finished of the answer into the scrollback.
+   *
+   * Every complete line goes (`splitStable`), except blank lines at the end and
+   * a table that has not ended yet; `final` takes everything, at the end of the
+   * message. A piece that draws nothing (the line that opens a code fence)
+   * moves the state on without an entry. Pushed here and never from inside a
+   * state updater, for `push`'s reason.
+   */
+  const advanceStream = useCallback(
+    (final: boolean) => {
+      const s = streamRef.current;
+      const text = s.committed ? s.text : trimLeadingBlankLines(s.text);
+      let stable: string;
+      let lines: number;
+      let rest: string;
+      if (final) {
+        stable = text.replace(/\s+$/, "");
+        lines = stable ? 1 : 0;
+        rest = "";
+      } else {
+        ({ stable, lines, rest } = splitStable(text, s.md));
+      }
+      if (lines > 0) {
+        const rendered = renderMarkdownState(stable, Number.POSITIVE_INFINITY, s.md);
+        if (rendered.text !== "") {
+          push({
+            kind: "assistant",
+            text: stable,
+            ...(s.committed ? { cont: true } : {}),
+            ...(s.md.fence ? { md: s.md } : {}),
+          });
+          s.committed = true;
+        }
+        s.md = rendered.state;
+      }
+      s.text = rest;
+    },
+    [push],
+  );
+
   /** Paint whatever text has pooled since the last frame, and cancel the timer. */
   const flushDelta = useCallback(() => {
     if (deltaTimerRef.current) {
@@ -1274,8 +1361,27 @@ export function App({
     const buffered = deltaBufRef.current;
     if (!buffered) return;
     deltaBufRef.current = "";
-    setLive((l) => ({ ...(l ?? { text: "" }), text: (l?.text ?? "") + buffered }));
-  }, []);
+    const s = streamRef.current;
+    s.text += buffered;
+    s.streamed = true;
+    advanceStream(false);
+    setLive((l) => ({ ...(l ?? { text: "" }), text: s.text, md: s.md, cont: s.committed }));
+  }, [advanceStream]);
+
+  /**
+   * End the answer being streamed: commit what is left of it, or `whole` when
+   * this round streamed nothing at all (a provider that answered in one piece).
+   * Then start the next answer fresh.
+   */
+  const finishStream = useCallback(
+    (whole?: string) => {
+      const s = streamRef.current;
+      if (!s.streamed && whole) s.text = whole;
+      advanceStream(true);
+      streamRef.current = freshStream();
+    },
+    [advanceStream],
+  );
 
   /** Drop pooled text without painting it — a turn that ended owns none of it. */
   const dropDelta = useCallback(() => {
@@ -1729,6 +1835,8 @@ export function App({
     (req: PermissionRequest, note?: string) =>
       new Promise<PermissionAnswer>((resolve) => {
         if (note) push({ kind: "notice", tone: "warn", text: `  auto mode ${note}` });
+        askSelRef.current = 0;
+        setAskSel(0);
         setAsk({ req, resolve });
       }),
     [push],
@@ -1803,12 +1911,44 @@ export function App({
     [push],
   );
 
+  /**
+   * A finished tool call, into the scrollback as it reads to a person
+   * (`present.ts`): what was done to what, how it went, and the body only
+   * where the body is the point. What the model was told is kept for ctrl+o
+   * whenever the row says there is more, and only then, so every label on
+   * screen can be opened.
+   */
+  const commitTool = useCallback(
+    (
+      name: string,
+      args: Record<string, unknown>,
+      r: { result: string; ok: boolean; display?: string | undefined; view?: DiffView | undefined; charge?: string | undefined },
+    ) => {
+      const head = headText(toolHead(name, args), Math.max(1, cols - 2));
+      const shown: Presented = presentResult({ name, args, ...r }, Math.max(10, cols - TOOL_BODY_INDENT));
+      const id = push({
+        kind: "tool",
+        verb: head.verb,
+        target: head.target,
+        status: shown.status,
+        line: shown.line,
+        ...(shown.body.length ? { body: shown.body.join("\n") } : {}),
+        ...(shown.plain ? { plain: true } : {}),
+        ...(shown.more ? { more: shown.more } : {}),
+        ...(shown.expand !== undefined && !shown.more ? { expandable: true } : {}),
+      });
+      if (shown.expand !== undefined) keepOutput({ id, label: `${head.verb}${head.target}`, output: shown.expand });
+    },
+    [cols, keepOutput, push],
+  );
+
   // ---- one agent turn -----------------------------------------------------
   const handleEvent = useCallback(
     (event: AgentEvent) => {
       // Text pools for one frame; everything else drains the pool first, so a
       // sentence can never be painted after the tool call it preceded.
       if (event.type === "delta") {
+        turnCharsRef.current += event.text.length;
         deltaBufRef.current += event.text;
         if (!deltaTimerRef.current) deltaTimerRef.current = setTimeout(flushDelta, DELTA_FLUSH_MS);
         return;
@@ -1816,8 +1956,8 @@ export function App({
       flushDelta();
       switch (event.type) {
         case "message":
-          push({ kind: "assistant", text: event.content });
-          setLive((l) => ({ ...(l ?? { text: "" }), text: "" }));
+          finishStream(event.content);
+          setLive((l) => ({ ...(l ?? { text: "" }), text: "", md: {}, cont: false }));
           return;
         case "tool_call": {
           // The first search of a session says, before it is charged, that it
@@ -1830,9 +1970,11 @@ export function App({
               push({ kind: "notice", text: `  ${line}` });
             }
           }
-          const summary = toolSummary(event.name, event.args);
-          runningToolRef.current = { name: event.name, summary };
-          setLive((l) => ({ text: l?.text ?? "", tool: { name: event.name, summary, output: "" } }));
+          const head = toolHead(event.name, event.args);
+          turnCharsRef.current += JSON.stringify(event.args).length;
+          runningToolRef.current = { name: event.name, args: event.args };
+          const title = headText(head, Math.max(1, cols - 2));
+          setLive((l) => ({ ...(l ?? { text: "" }), tool: { ...title, output: "" } }));
           return;
         }
         case "tool_output":
@@ -1843,40 +1985,19 @@ export function App({
         case "tool_result": {
           const charge = event.name === "web_search" ? searchChargesRef.current.get(event.id) : undefined;
           searchChargesRef.current.delete(event.id);
-          const summary = (runningToolRef.current?.summary ?? "") + (charge ? searchChargeLabel(charge) : "");
-          setLive((l) => (l ? { text: l.text, tool: undefined } : l));
-          // A permission refusal says one thing to the model and a shorter one
-          // to the user; when it does, that short line is the whole entry and
-          // there is nothing further to expand.
-          if (event.display) {
-            push({ kind: "tool", name: event.name, summary, output: `  ${event.display}`, ok: event.ok });
-            runningToolRef.current = null;
-            return;
-          }
-          const lines = event.result.split("\n").filter((l) => l.trim() !== "");
-          // Cut to the width the entry is actually drawn at — `EntryView` indents
-          // committed output by four columns and `entryHeight` measures it at
-          // `cols - 4`, so anything else is a row the layout did not count. In
-          // columns, and with the ellipsis `fitRow` adds: this was `slice` on
-          // code units at `cols - 8`, which cut a line of CJK at half the width
-          // it had and said nothing about having cut it.
-          const shown = lines
-            .slice(0, COMMITTED_OUTPUT_LINES)
-            .map((l) => fitRow(l, Math.max(20, cols - 4)));
-          const more = Math.max(0, lines.length - shown.length);
-          const id = push({
-            kind: "tool",
-            name: event.name,
-            summary,
-            output: shown.join("\n"),
-            outputMore: more,
-            ok: event.ok,
-          });
-          // Recorded exactly when the label is drawn, so the two can't diverge.
-          if (more > 0) {
-            keepOutput({ id, label: `${event.name} ${summary}`.trim(), output: event.result });
-          }
+          const args = runningToolRef.current?.args ?? {};
           runningToolRef.current = null;
+          setLive((l) => (l ? { ...l, tool: undefined } : l));
+          // A refusal that arrives after esc is the turn being stopped, not a
+          // decision about this call, and is said that way.
+          const interrupted = event.display !== undefined && abortRef.current?.signal.aborted === true;
+          commitTool(event.name, args, {
+            result: event.result,
+            ok: event.ok,
+            display: interrupted ? "interrupted · esc stopped the turn" : event.display,
+            view: event.view,
+            charge: charge ? searchChargeLabel(charge) : undefined,
+          });
           return;
         }
         case "attachment":
@@ -1936,7 +2057,7 @@ export function App({
           return;
       }
     },
-    [client, cols, flushDelta, push, setPremium, takeSpendable],
+    [client, cols, commitTool, finishStream, flushDelta, push, setPremium, takeSpendable],
   );
 
   // Figures that no longer belong to the balance on screen, or to today, are
@@ -1970,6 +2091,8 @@ export function App({
       abortRef.current = ac;
       setBusy(true);
       setStartedAt(Date.now());
+      streamRef.current = freshStream();
+      turnCharsRef.current = 0;
       setLive({ text: "" });
       // One step per model call, and only here: `busy` is also set by the /earn
       // wait and the model picker, and rotating on those would spend the
@@ -2065,17 +2188,19 @@ export function App({
         });
 
         if (result.stopped === "aborted") {
+          // What was already on screen of the answer stays readable.
+          if (streamRef.current.streamed) finishStream();
           push({ kind: "notice", tone: "warn", text: "  (stopped)" });
           const w = await client.wallet().catch(() => undefined);
           if (w) setBalance(w.balance);
         } else if (result.stopped === "max_steps") {
           push({ kind: "notice", tone: "warn", text: "  (stopped: reached the step limit — ask me to continue)" });
         } else if (result.content) {
-          push({
-            kind: "assistant",
-            text: result.content,
-            meta: turnMeta(result),
-          });
+          // What is left of the answer, then the line that says what it cost.
+          // An answer streamed into the scrollback is already there but for
+          // its last lines; one that arrived in one piece goes in whole.
+          finishStream(result.content);
+          push({ kind: "assistant", text: "", meta: turnMeta(result), cont: true });
           // Said once per session, and only when it is news: the free allowance
           // ran out and turns now cost credits. The gateway records the same
           // transition in `free_tier_blocks`; this is the half the person at the
@@ -2197,6 +2322,9 @@ export function App({
           }
         }
       } catch (err) {
+        // An answer cut off by the failure stays as far as it got, above the
+        // notice that says what happened.
+        if (streamRef.current.streamed) finishStream();
         // A refusal carries what may be spent and the balance it was worked
         // out from, so the status line says what is usable as the refusal is
         // printed rather than one read later.
@@ -2293,6 +2421,7 @@ export function App({
         // Pooled text belongs to a call that is over; painting it now would put
         // a fragment under a turn that has already been committed whole.
         dropDelta();
+        streamRef.current = freshStream();
         setLive(null);
         setBusy(false);
         // The impression, now that the model calls behind this turn have been
@@ -2317,6 +2446,7 @@ export function App({
       client,
       contextWindow,
       dropDelta,
+      finishStream,
       handleEvent,
       model,
       reportSponsor,
@@ -3399,26 +3529,15 @@ export function App({
             onOutput: (chunk) =>
               setLive((l) => ({
                 text: l?.text ?? "",
-                tool: { name: "!", summary: command, output: tailLines((l?.tool?.output ?? "") + chunk, LIVE_OUTPUT_LINES) },
+                tool: {
+                  ...headText(toolHead("!", { command }), Math.max(1, cols - 2)),
+                  output: tailLines((l?.tool?.output ?? "") + chunk, LIVE_OUTPUT_LINES),
+                },
               })),
           },
           { command },
         );
-        const lines = output.split("\n").filter((l) => l.trim() !== "");
-        // The width the layout measures this entry at — see the tool_result path.
-        const shown = lines
-          .slice(0, COMMITTED_OUTPUT_LINES)
-          .map((l) => fitRow(l, Math.max(20, cols - 4)));
-        const more = Math.max(0, lines.length - shown.length);
-        const id = push({
-          kind: "tool",
-          name: "!",
-          summary: command,
-          output: shown.join("\n"),
-          outputMore: more,
-          ok: true,
-        });
-        if (more > 0) keepOutput({ id, label: `! ${command}`, output });
+        commitTool("!", { command }, { result: output, ok: true });
       });
       setLive(null);
       // Only once it actually ran: a command the user aborted told the model
@@ -3430,7 +3549,7 @@ export function App({
         ]);
       }
     },
-    [cols, push, root, runBusy],
+    [cols, commitTool, push, root, runBusy],
   );
 
   /** Actually carry out one line of input. Assumes nothing else is running. */
@@ -3789,22 +3908,31 @@ export function App({
         stopCurrent(); // runTurn reports the "(stopped)" itself
         return;
       }
+      if (askMenuRef.current && (key.upArrow || key.downArrow)) {
+        const next = (askSelRef.current + (key.downArrow ? 1 : ASK_ANSWERS.length - 1)) % ASK_ANSWERS.length;
+        askSelRef.current = next;
+        setAskSel(next);
+        return;
+      }
       const answer: PermissionAnswer | undefined =
-        ch === "y" || ch === "j" || key.return
+        ch === "y" || ch === "j"
           ? "once"
           : ch === "a"
             ? "always"
             : ch === "n"
               ? "deny"
-              : undefined;
+              : askMenuRef.current && /^[1-3]$/.test(ch)
+                ? ASK_ANSWERS[Number(ch) - 1]
+                : key.return
+                  ? askMenuRef.current
+                    ? ASK_ANSWERS[askSelRef.current]
+                    : "once"
+                  : undefined;
       if (!answer) return;
       setAsk(null);
+      // Nothing is printed for the answer itself: the tool's own row follows
+      // at once and says it ran, or that it was denied.
       ask.resolve(answer);
-      push({
-        kind: "notice",
-        tone: answer === "deny" ? "warn" : undefined,
-        text: `  ${answer === "deny" ? "denied" : answer === "always" ? "allowed (always)" : "allowed"}: ${ask.req.summary}`,
-      });
       return;
     }
 
@@ -4262,14 +4390,50 @@ export function App({
   // src/components/very/deeply/nested/thing.tsx` — so on a narrow terminal it
   // wraps to three or four rows on its own, and `modalFloor` only reserves one.
   // Its head survives for the preview's reason: which file, not which suffix.
-  const askSummary = ask ? headRows(ask.req.summary, inner, Math.max(1, budget - ASK_CHROME)) : "";
-  const askSummaryRows = ask ? lineCount(askSummary, inner) : 0;
-  // `Math.max(0, …)`, not `1`: where the summary has taken the room, there is
-  // no preview rather than a forced row the budget cannot pay for.
-  const askPreview = ask?.req.preview
-    ? headRows(ask.req.preview, inner, Math.max(0, budget - ASK_CHROME - askSummaryRows))
-    : "";
-  const askHeight = ask ? askSummaryRows + (askPreview ? lineCount(askPreview, inner) : 0) + ASK_CHROME : 0;
+  // Two forms. The numbered one says what is asked in words and lists the
+  // answers (Claude Code's); it needs five rows more than the one-line form,
+  // which is what a short terminal gets instead, with the same keys.
+  const askInfo = ask ? askWords(ask.req) : undefined;
+  const askView = ask?.req.view;
+  const askHasPreview = Boolean(askView?.rows.length || ask?.req.preview);
+  const askMenu = Boolean(ask) && budget >= ASK_MENU_CHROME + (askHasPreview ? 4 : 1);
+  askMenuRef.current = askMenu;
+  let askSummary = "";
+  let askPreview = "";
+  let askHeight = 0;
+  if (ask && askMenu && askInfo) {
+    // The file, and what the edit does to it in two figures.
+    const stat = askView && !askView.created ? `  \x1b[32m+${askView.added}\x1b[39m \x1b[31m−${askView.removed}\x1b[39m` : "";
+    askSummary = askInfo.target ? fitRow(`${askInfo.target}${stat}`, inner) : "";
+    const room = Math.max(0, budget - ASK_MENU_CHROME - (askSummary ? 1 : 0));
+    if (askView && askView.rows.length > 0) {
+      const drawn = renderDiffRows(askView, inner, {
+        maxRows: room,
+        tint: diffTint(),
+        measure: visibleLength,
+        cut: (t, c) => fitRow(t, c),
+      });
+      const rows =
+        drawn.more > 0 && drawn.rows.length > 0
+          ? [...drawn.rows.slice(0, -1), `\x1b[2m${fitRow(`   … +${drawn.more + 1} more lines`, inner)}\x1b[22m`]
+          : drawn.rows;
+      askPreview = rows.join("\n");
+    } else if (ask.req.preview && ask.req.preview !== ask.req.summary) {
+      askPreview = headRows(ask.req.preview, inner, room);
+    }
+    askHeight = ASK_MENU_CHROME + (askSummary ? 1 : 0) + (askPreview ? lineCount(askPreview, inner) : 0);
+  } else if (ask) {
+    // The summary is clipped too, and has to be. It is a path — `overwrite
+    // src/components/very/deeply/nested/thing.tsx` — so on a narrow terminal it
+    // wraps to three or four rows on its own, and `modalFloor` only reserves one.
+    // Its head survives for the preview's reason: which file, not which suffix.
+    askSummary = headRows(ask.req.summary, inner, Math.max(1, budget - ASK_CHROME));
+    const askSummaryRows = lineCount(askSummary, inner);
+    // `Math.max(0, …)`, not `1`: where the summary has taken the room, there is
+    // no preview rather than a forced row the budget cannot pay for.
+    askPreview = ask.req.preview ? headRows(ask.req.preview, inner, Math.max(0, budget - ASK_CHROME - askSummaryRows)) : "";
+    askHeight = askSummaryRows + (askPreview ? lineCount(askPreview, inner) : 0) + ASK_CHROME;
+  }
   budget -= askHeight;
 
   // The plan awaiting approval. Its head survives the clip for the diff's
@@ -4278,7 +4442,7 @@ export function App({
   // loses its `##` and a bullet gains a glyph, so the marked-up source and the
   // rendered block are not the same number of columns.
   const planBlock = plan
-    ? headRows(renderMarkdown(plan.plan), inner, Math.max(1, budget - PLAN_CHROME))
+    ? headRows(renderMarkdown(plan.plan, inner), inner, Math.max(1, budget - PLAN_CHROME))
     : "";
   const planHeight = plan ? lineCount(planBlock, inner) + PLAN_CHROME : 0;
   budget -= planHeight;
@@ -4302,12 +4466,18 @@ export function App({
   // the same reason — only the render knows what ended up on screen.
   buyFitsRef.current = buyFits;
 
+  // The answer's unfinished tail, rendered like the lines already committed
+  // above it, and the tool call running now. Everything before the tail is in
+  // the scrollback already (`advanceStream`), so this stays a few rows tall.
   const liveRaw = [
-    // Trailing blank lines are rows the clamp would spend on nothing, and a
-    // streamed answer ends on one more often than not.
-    (live?.text ?? "").replace(/\n+$/, ""),
-    live?.tool ? `⏺ ${live.tool.name} ${live.tool.summary}` : "",
-    live?.tool?.output ?? "",
+    live?.text ? assistantBlock(live.text, cols, { marker: !live.cont, state: live.md }) : "",
+    live?.tool
+      ? liveToolBlock(live.tool, live.tool.output, cols, {
+          // The dot blinks while the call runs: on for four ticks, off for four.
+          dotOn: Math.floor(tick / 4) % 2 === 0,
+          maxRows: LIVE_OUTPUT_LINES,
+        })
+      : "",
   ]
     .filter(Boolean)
     .join("\n");
@@ -4557,15 +4727,28 @@ export function App({
   // duck is two columns wide, so it is fitted like every other counted row.
   // Beside the card it has the columns the card leaves, and no more.
   const busyCols = showCard ? cols - SIDEBAR_CARD_COLS : cols;
+  // What the turn is doing, where that is known here: waiting on the person,
+  // or running a command. While the model itself works it is `working…`, since
+  // the gateway sends its reasoning and its tool calls only once they are done.
+  const turnLabel =
+    busyLabel !== WORKING
+      ? busyLabel
+      : ask || plan || picker
+        ? "waiting for your answer…"
+        : live?.tool?.verb === "Bash"
+          ? RUNNING
+          : WORKING;
+  // About four characters a token: a progress figure, not a meter.
+  const tokens = busyLabel === WORKING && turnCharsRef.current >= 40 ? ` · ↓ ${shortCount(turnCharsRef.current / 4)} tokens` : "";
   const busyText = fitRow(
-    `${busyLabel} ${elapsed}s · esc to stop`,
+    `${turnLabel} ${elapsed}s${tokens} · esc to stop`,
     Math.max(1, busyCols - visibleLength(`${spinner} `)),
   );
 
   return (
     <Box flexDirection="column">
       <Static key={staticEpoch} items={entries}>
-        {(entry) => <EntryView key={entry.id} entry={entry} />}
+        {(entry) => <EntryView key={entry.id} entry={entry} cols={cols} />}
       </Static>
 
       {spacer > 0 ? <Box height={spacer} /> : null}
@@ -4633,7 +4816,22 @@ export function App({
         </Box>
       ) : null}
 
-      {ask ? (
+      {ask && askMenu && askInfo ? (
+        <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor="yellow" paddingX={1}>
+          <Text bold color="yellow" wrap="truncate-end">
+            {fitRow(askInfo.title, inner)}
+          </Text>
+          {askSummary ? <Text wrap="truncate-end">{askSummary}</Text> : null}
+          {askPreview ? <Text>{askPreview}</Text> : null}
+          <Text wrap="truncate-end">{fitRow(askInfo.question, inner)}</Text>
+          {["Yes", askInfo.always, "No"].map((label, i) => (
+            <Text key={label} color={i === askSel ? MANGO_BRIGHT : undefined} bold={i === askSel} wrap="truncate-end">
+              {fitRow(`${i === askSel ? "❯" : " "} ${i + 1}. ${label}`, inner)}
+            </Text>
+          ))}
+          <Text dimColor wrap="truncate-end">{pickHint(ASK_MENU_HINT, inner)}</Text>
+        </Box>
+      ) : ask ? (
         <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor="yellow" paddingX={1}>
           <Text bold color="yellow">
             {askSummary}
@@ -4747,7 +4945,9 @@ export function App({
           is a dead-looking box that is listening.
         */}
         {inputBorder ? (
-          <Box borderStyle="round" borderColor={busy ? MANGO : MANGO_BRIGHT} paddingX={1}>
+          // A rule above and below rather than a box around it, Claude Code's
+          // shape: the same two rows, four more columns to type in.
+          <Box borderStyle="single" borderColor={SLATE} borderLeft={false} borderRight={false}>
             <Text color={MANGO_BRIGHT}>❯ </Text>
             <Text>{renderInput(editor, inputFrom, inputRows)}</Text>
           </Box>
@@ -5224,41 +5424,11 @@ function toEditorKey(ch: string, key: InkKey): ed.EditorKey {
   };
 }
 
-/** One-line description of what a tool call is about to do. */
-function toolSummary(name: string, args: Record<string, unknown>): string {
-  const str = (v: unknown) => (typeof v === "string" ? v : "");
-  switch (name) {
-    case "read_file":
-    case "write_file":
-    case "edit_file":
-      return str(args.path);
-    case "list_dir":
-      return str(args.path) || ".";
-    case "glob":
-      return str(args.pattern);
-    case "grep":
-      return str(args.pattern) + (args.path ? ` in ${str(args.path)}` : "");
-    case "run_command":
-      return str(args.command) + (args.background === true ? "  (background)" : "");
-    case "read_output":
-    case "kill_shell":
-      return str(args.shell_id);
-    case "web_search":
-      return str(args.query);
-    case "web_fetch":
-      return str(args.url);
-    case "task":
-      return str(args.description);
-    case "todo_write":
-      return Array.isArray(args.todos) ? `${args.todos.length} items` : "";
-    case "ask_user":
-      return str(args.question);
-    default:
-      // An MCP tool names its server, which is the part the user needs: two
-      // servers can both offer `search`, and only one of them is reading their
-      // private issue tracker.
-      return name.startsWith("mcp__") ? name.split("__").slice(1).join(" · ") : "";
-  }
+/** `840`, `1.2k`, `36k`: a count short enough for the working line. */
+function shortCount(n: number): string {
+  if (n < 1000) return String(Math.round(n));
+  if (n < 10_000) return `${(n / 1000).toFixed(1)}k`;
+  return `${Math.round(n / 1000)}k`;
 }
 
 function tailLines(text: string, max: number): string {

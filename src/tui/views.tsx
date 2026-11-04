@@ -8,7 +8,9 @@ import React from "react";
 import { Box, Text } from "ink";
 import wrapAnsi from "wrap-ansi";
 import { sliceColumns, visibleLength } from "../banner.ts";
-import { renderMarkdown } from "./markdown.ts";
+import { renderMarkdown, type MdState } from "./markdown.ts";
+import { trimLeadingBlankLines } from "./stream.ts";
+import type { ToolStatus } from "./present.ts";
 import type { PermissionMode } from "../permissions.ts";
 
 export const MANGO = "#f5b841";
@@ -68,19 +70,35 @@ export const MODE_STYLE: Record<PermissionMode, { color: string; glyph: string }
 export type Entry =
   | { id: number; kind: "banner"; text: string }
   | { id: number; kind: "user"; text: string }
-  | { id: number; kind: "assistant"; text: string; meta?: string }
+  | {
+      id: number;
+      kind: "assistant";
+      /** Markdown source. A streamed answer arrives as several of these, a few lines each. */
+      text: string;
+      meta?: string;
+      /** A later piece of the same answer: no gap above it and no marker. */
+      cont?: boolean;
+      /** What the lines before this piece left open (a code fence). */
+      md?: MdState;
+    }
   | {
       id: number;
       kind: "tool";
-      /** e.g. "edit_file" */
-      name: string;
-      /** e.g. "src/tui/app.tsx" */
-      summary: string;
-      /** Already-truncated preview of the result. */
-      output?: string;
-      /** How many further lines were dropped from `output`. */
-      outputMore?: number;
-      ok?: boolean;
+      /** e.g. "Update" */
+      verb: string;
+      /** e.g. "(src/tui/app.tsx)", already fitted, parentheses included; may be empty. */
+      target: string;
+      status: ToolStatus;
+      /** The row after `⎿`, fitted to one row. */
+      line?: string;
+      /** Rows under it, each fitted to one row. */
+      body?: string;
+      /** The body brings its own colours (a diff, the task list) and is not dimmed. */
+      plain?: boolean;
+      /** Rows not shown; said as "… +N lines (ctrl+o to expand)". */
+      more?: number;
+      /** The detail is one ctrl+o away though no row was cut (a search's matches). */
+      expandable?: boolean;
     }
   | { id: number; kind: "notice"; text: string; tone?: "warn" | "error" | "good" };
 
@@ -283,24 +301,94 @@ export function errorNotice(message: string, rows = ERROR_NOTICE_ROWS, indent = 
   return kept.join(`\n${indent}`);
 }
 
+/** Where a tool row's result and body start: under the verb, after `  ⎿  `. */
+export const TOOL_BODY_INDENT = 5;
+const RESULT_LEAD = "  ⎿  ";
+const BODY_LEAD = " ".repeat(TOOL_BODY_INDENT);
+/** The marker on the first row of an answer, Claude Code's. */
+export const ANSWER_MARKER = "⏺ ";
+
+/**
+ * An answer, or a piece of one, as it is drawn: markdown set two columns in,
+ * the first piece with the marker in that margin.
+ */
+export function assistantBlock(text: string, cols: number, opts: { marker: boolean; state?: MdState | undefined }): string {
+  const body = renderMarkdown(opts.marker ? trimLeadingBlankLines(text) : text, Math.max(1, cols - 2), opts.state ?? {});
+  if (!body) return "";
+  return body
+    .split("\n")
+    .map((row, i) => (i === 0 && opts.marker ? ANSWER_MARKER : "  ") + row)
+    .join("\n");
+}
+
+function toolResultRow(entry: Extract<Entry, { kind: "tool" }>): string {
+  const hint = entry.expandable && !entry.more ? " (ctrl+o to expand)" : "";
+  return `${RESULT_LEAD}${entry.line ?? ""}${hint}`;
+}
+
+function toolBody(entry: Extract<Entry, { kind: "tool" }>): string {
+  return (entry.body ?? "")
+    .split("\n")
+    .map((row) => `${BODY_LEAD}${row}`)
+    .join("\n");
+}
+
+function moreRow(more: number): string {
+  return `${BODY_LEAD}… +${more} line${more === 1 ? "" : "s"} (ctrl+o to expand)`;
+}
+
+/**
+ * A tool call while it runs, as one block of text for the bottom of the
+ * screen: the dot (blinking, grey), the title, and the command's newest output
+ * under `⎿`. Everything is fitted to one row a line, like the finished row.
+ */
+export function liveToolBlock(
+  head: { verb: string; target: string },
+  output: string,
+  cols: number,
+  opts: { dotOn: boolean; maxRows: number },
+): string {
+  const dot = opts.dotOn ? "\x1b[2m⏺\x1b[22m " : "  ";
+  const title = `${dot}\x1b[1m${head.verb}\x1b[22m${head.target}`;
+  const lines = output.split("\n").filter((l) => l.trim() !== "");
+  const shown = lines.slice(-opts.maxRows).map((l, i) => {
+    const lead = i === 0 ? RESULT_LEAD : BODY_LEAD;
+    return `\x1b[2m${lead}${fitRow(l.replace(/\t/g, "  "), Math.max(1, cols - TOOL_BODY_INDENT))}\x1b[22m`;
+  });
+  return [title, ...shown].join("\n");
+}
+
 export function entryHeight(entry: Entry, cols: number): number {
-  const margin = entry.kind === "banner" ? 0 : 1; // the banner has no marginTop
   switch (entry.kind) {
-    case "assistant":
-      return margin + lineCount(renderMarkdown(entry.text), cols) + (entry.meta ? 1 : 0);
+    case "banner":
+      return lineCount(entry.text, cols);
+    case "assistant": {
+      const block = assistantBlock(entry.text, cols, { marker: !entry.cont, state: entry.md });
+      return (
+        (entry.cont ? 0 : 1) +
+        (block ? lineCount(block, cols) : 0) +
+        (entry.meta ? lineCount(`  ${entry.meta}`, cols) : 0)
+      );
+    }
     case "tool":
       return (
-        margin +
         1 +
-        (entry.output ? lineCount(entry.output, cols - 4) : 0) +
-        (entry.outputMore ? 1 : 0)
+        lineCount(`⏺ ${entry.verb}${entry.target}`, cols) +
+        (entry.line !== undefined ? lineCount(toolResultRow(entry), cols) : 0) +
+        (entry.body ? lineCount(toolBody(entry), cols) : 0) +
+        (entry.more ? lineCount(moreRow(entry.more), cols) : 0)
       );
+    case "user":
+      // The text sits beside the two-column prompt and wraps inside what is left.
+      return 1 + lineCount(entry.text, Math.max(1, cols - 2));
     default:
-      return margin + lineCount(entry.text, cols);
+      return 1 + lineCount(entry.text, cols);
   }
 }
 
-export function EntryView({ entry }: { entry: Entry }) {
+const DOT: Record<ToolStatus, string> = { ok: "green", error: "red", denied: "yellow" };
+
+export function EntryView({ entry, cols }: { entry: Entry; cols: number }) {
   switch (entry.kind) {
     case "banner":
       return <Text>{entry.text}</Text>;
@@ -313,33 +401,37 @@ export function EntryView({ entry }: { entry: Entry }) {
         </Box>
       );
 
-    case "assistant":
+    case "assistant": {
+      const block = assistantBlock(entry.text, cols, { marker: !entry.cont, state: entry.md });
       return (
-        <Box flexDirection="column" marginTop={1}>
-          <Text>{renderMarkdown(entry.text)}</Text>
+        <Box flexDirection="column" marginTop={entry.cont ? 0 : 1}>
+          {block ? <Text>{block}</Text> : null}
           {entry.meta ? <Text dimColor>{`  ${entry.meta}`}</Text> : null}
         </Box>
       );
+    }
 
     case "tool":
       return (
         <Box flexDirection="column" marginTop={1}>
-          <Box>
-            <Text color={entry.ok === false ? "red" : MANGO}>⏺ </Text>
-            <Text bold>{entry.name}</Text>
-            {entry.summary ? <Text dimColor>{` ${entry.summary}`}</Text> : null}
-          </Box>
-          {entry.output ? (
-            <Text dimColor>
-              {entry.output
-                .split("\n")
-                .map((l) => `    ${l}`)
-                .join("\n")}
+          <Text>
+            <Text color={DOT[entry.status]}>⏺ </Text>
+            <Text bold>{entry.verb}</Text>
+            {entry.target}
+          </Text>
+          {entry.line !== undefined ? (
+            <Text>
+              <Text dimColor>{RESULT_LEAD}</Text>
+              {entry.status === "ok" ? (
+                <Text dimColor>{entry.line}</Text>
+              ) : (
+                <Text color={entry.status === "error" ? "red" : "yellow"}>{entry.line}</Text>
+              )}
+              {entry.expandable && !entry.more ? <Text dimColor>{" (ctrl+o to expand)"}</Text> : null}
             </Text>
           ) : null}
-          {entry.outputMore ? (
-            <Text dimColor>{`    … +${entry.outputMore} lines (ctrl+o)`}</Text>
-          ) : null}
+          {entry.body ? <Text dimColor={!entry.plain}>{toolBody(entry)}</Text> : null}
+          {entry.more ? <Text dimColor>{moreRow(entry.more)}</Text> : null}
         </Box>
       );
 

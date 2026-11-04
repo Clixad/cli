@@ -286,8 +286,9 @@ describe("TUI working line", () => {
 
     const lines = strip(lastFrame() ?? "").split("\n");
     const working = lines.findIndex((l) => l.includes("working…"));
-    // The *input* box, i.e. the last one drawn — the banner is a box too.
-    const boxTop = lines.map((l) => l.trimStart().startsWith("╭")).lastIndexOf(true);
+    // The rule over the input: the row above the last prompt drawn.
+    const boxTop = lines.map((l) => l.startsWith("❯")).lastIndexOf(true) - 1;
+    expect(lines[boxTop]).toMatch(/^─{10,}$/);
     expect(working).toBeGreaterThanOrEqual(0);
     expect(boxTop).toBeGreaterThanOrEqual(0);
     // Above the box, and below the streamed text it belongs to.
@@ -589,17 +590,18 @@ describe("TUI esc at the permission dialog", () => {
     stdin.write("write nope.txt");
     await tick();
     stdin.write("\r");
-    await frameIn(lastFrame, { has: ["[y/⏎] once", "esc stops the turn"] });
-    expect(strip(lastFrame() ?? "")).toContain("[y/⏎] once"); // the dialog is up
+    await frameIn(lastFrame, { has: ["1. Yes", "esc stops the turn"] });
+    expect(strip(lastFrame() ?? "")).toContain("1. Yes"); // the dialog is up
     expect(strip(lastFrame() ?? "")).toContain("esc stops the turn"); // and says so
 
     stdin.write(ESC);
-    await frameIn(lastFrame, { has: ["(stopped)"], hasNot: ["denied: create nope.txt"] });
+    await frameIn(lastFrame, { has: ["(stopped)"], hasNot: ["Denied by you"] });
 
     const out = strip(lastFrame() ?? "");
     expect(out).toContain("(stopped)");
     // Not the wording of a refusal: nothing was denied, the turn was stopped.
-    expect(out).not.toContain("denied: create nope.txt");
+    expect(out).not.toContain("Denied by you");
+    expect(out).toContain("⎿  Interrupted · esc stopped the turn");
     expect(() => readFileSync(join(root, "nope.txt"), "utf8")).toThrow();
     // And no second model call was paid for to be told about it.
     expect(calls).toBe(1);
@@ -626,10 +628,11 @@ describe("TUI esc at the permission dialog", () => {
     stdin.write("\r");
     await tick(200);
     stdin.write("n");
-    await frameIn(lastFrame, { has: ["denied: create nope.txt", "Understood."] });
+    await frameIn(lastFrame, { has: ["Write(nope.txt)", "Denied by you", "Understood."] });
 
     const out = strip(lastFrame() ?? "");
-    expect(out).toContain("denied: create nope.txt");
+    expect(out).toContain("Write(nope.txt)");
+    expect(out).toContain("⎿  Denied by you");
     expect(out).toContain("Understood."); // the turn ran on and answered
     expect(calls).toBe(2);
   });
@@ -656,10 +659,10 @@ describe("TUI esc at the permission dialog", () => {
     stdin.write("write nope.txt");
     await tick();
     stdin.write("\r");
-    await frameIn(lastFrame, { has: ["plan mode — create nope.txt was not run"], hasNot: ["Do not attempt further writes"] });
+    await frameIn(lastFrame, { has: ["Plan mode — create nope.txt was not run"], hasNot: ["Do not attempt further writes"] });
 
     const out = strip(lastFrame() ?? "");
-    expect(out).toContain("plan mode — create nope.txt was not run");
+    expect(out).toContain("Plan mode — create nope.txt was not run");
     expect(out).not.toContain("Do not attempt further writes");
   });
 });
@@ -714,7 +717,7 @@ describe("TUI ctrl+o", () => {
 
     // Both entries are collapsed, and both advertise the shortcut.
     const committed = strip(lastFrame() ?? "");
-    expect(committed.split("(ctrl+o)").length - 1).toBe(2);
+    expect(committed.split("(ctrl+o to expand)").length - 1).toBe(2);
 
     const seen = () => frames.map(strip).join("\n");
     stdin.write("\x0f"); // ctrl+o
@@ -777,8 +780,8 @@ describe("TUI ctrl+o", () => {
       await tick(120);
       notices.push(strip(lastFrame() ?? ""));
     }
-    expect(notices[0]).toContain("read_file f7.txt");
-    expect(notices[4]).toContain("read_file f3.txt");
+    expect(notices[0]).toContain("Read(f7.txt)");
+    expect(notices[4]).toContain("Read(f3.txt)");
     expect(notices[5]).toContain("nothing left to expand — older output is not kept this far back");
   });
 });
@@ -1039,13 +1042,18 @@ describe("TUI agent turn", () => {
     stdin.write("create hello.txt");
     await tick();
     stdin.write("\r");
-    await frameIn(lastFrame, { has: ["create hello.txt", "hi there", "[y/⏎] once"] });
+    await frameIn(lastFrame, { has: ["Create file", "hi there", "1. Yes"] });
 
-    // The permission dialog shows what is about to happen, with the diff.
+    // The permission dialog shows what is about to happen, with the diff, and
+    // says what each answer does.
     const asking = strip(lastFrame() ?? "");
-    expect(asking).toContain("create hello.txt");
+    expect(asking).toContain("Create file");
+    expect(asking).toContain("hello.txt");
     expect(asking).toContain("hi there");
-    expect(asking).toContain("[y/⏎] once"); // Enter is accepted too, not just y
+    expect(asking).toContain("Do you want to create hello.txt?");
+    expect(asking).toContain("❯ 1. Yes");
+    expect(asking).toContain("2. Yes, and don't ask again for hello.txt this session");
+    expect(asking).toContain("3. No");
 
     stdin.write("y");
     await tick(200);
