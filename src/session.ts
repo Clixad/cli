@@ -22,14 +22,21 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { withoutImages, type ChatMessage } from "./client.ts";
 
 const ROOT = join(homedir(), ".clixad");
 const SESSION_DIR = join(ROOT, "sessions");
 const HISTORY_FILE = join(ROOT, "history");
 const MAX_HISTORY = 200;
-const MAX_SESSIONS = 50;
+/**
+ * How many conversations are kept, across every directory; the oldest go first.
+ * It was 50 until 0.0.1-beta.45, which somebody working in a few projects
+ * reached in a couple of weeks, and the conversations that fell off were gone
+ * with nothing said. A session file is text (`withoutImages`), tens of
+ * kilobytes for most, and `/resume` can now delete one by hand.
+ */
+export const MAX_SESSIONS = 200;
 
 export interface StoredSession {
   id: string;
@@ -43,7 +50,36 @@ export interface StoredSession {
   messages: ChatMessage[];
 }
 
-export type SessionMeta = Omit<StoredSession, "messages">;
+export type SessionMeta = Omit<StoredSession, "messages"> & {
+  /** How many messages it holds, for the resume picker. */
+  messageCount: number;
+};
+
+/**
+ * What a session id may look like before it is turned into a path:
+ * `newSessionId`'s shape, and anything else made only of filename-safe
+ * characters. `/resume <id>` and `clixad --resume <id>` take it as typed, and
+ * `../config` must not reach the config file through the session directory.
+ */
+const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
+export function isSessionId(id: string): boolean {
+  return SESSION_ID.test(id);
+}
+
+/**
+ * Whether two paths name the same directory, the way the sessions are filed.
+ *
+ * Compared after `resolve`, so a trailing separator does not count. On Windows
+ * also without regard to case: the same directory comes back from
+ * `process.cwd()` as `C:\work` in one terminal and `c:\work` in another (the
+ * drive letter follows how the shell was started), and a strict comparison
+ * files them as two directories, so `/resume` in one cannot see the other's.
+ */
+export function sameDirectory(a: string, b: string): boolean {
+  const norm = (p: string) => (process.platform === "win32" ? resolve(p).toLowerCase() : resolve(p));
+  return norm(a) === norm(b);
+}
 
 export function sessionDir(): string {
   return SESSION_DIR;
@@ -70,10 +106,32 @@ export function saveSession(session: StoredSession): void {
 }
 
 export function loadSession(id: string): StoredSession | undefined {
+  if (!isSessionId(id)) return undefined;
   try {
-    return JSON.parse(readFileSync(join(SESSION_DIR, `${id}.json`), "utf8")) as StoredSession;
+    const s = JSON.parse(readFileSync(join(SESSION_DIR, `${id}.json`), "utf8")) as StoredSession;
+    // A file that parses but is not a conversation (cut short by a full disk,
+    // or not ours) would hand the REPL `undefined` for its messages.
+    return s && Array.isArray(s.messages) && typeof s.id === "string" ? s : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Delete one saved session. True when a file was removed.
+ *
+ * Only a file in the session directory named by a well-formed id: the id
+ * arrives as typed, and this is the one function here that removes things.
+ */
+export function deleteSession(id: string): boolean {
+  if (!isSessionId(id)) return false;
+  const path = join(SESSION_DIR, `${id}.json`);
+  try {
+    if (!existsSync(path)) return false;
+    rmSync(path);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -85,9 +143,9 @@ export function listSessions(cwd?: string, limit = 20): SessionMeta[] {
     if (!name.endsWith(".json")) continue;
     const s = loadSession(name.slice(0, -5));
     if (!s) continue;
-    if (cwd && s.cwd !== cwd) continue;
-    const { messages: _messages, ...meta } = s;
-    metas.push(meta);
+    if (cwd && !sameDirectory(s.cwd ?? "", cwd)) continue;
+    const { messages, ...meta } = s;
+    metas.push({ ...meta, title: meta.title ?? "", updated: meta.updated ?? "", messageCount: messages.length });
   }
   metas.sort((a, b) => b.updated.localeCompare(a.updated));
   return metas.slice(0, limit);
@@ -106,7 +164,6 @@ export function listSessions(cwd?: string, limit = 20): SessionMeta[] {
  */
 export function hasSessionIn(cwd: string): boolean {
   if (!existsSync(SESSION_DIR)) return false;
-  const needle = `"cwd":${JSON.stringify(cwd)}`;
   try {
     for (const name of readdirSync(SESSION_DIR)) {
       if (!name.endsWith(".json")) continue;
@@ -119,8 +176,16 @@ export function hasSessionIn(cwd: string): boolean {
       } finally {
         closeSync(fd);
       }
-      if (head.includes(needle)) return true;
-      if (!head.includes('"cwd":') && loadSession(name.slice(0, -5))?.cwd === cwd) return true;
+      // The first `"cwd":` is the field: every key ahead of it is a date or
+      // an id, and a quote inside the title further on is escaped.
+      const field = /"cwd":("(?:[^"\\]|\\.)*")/.exec(head)?.[1];
+      let stored: string | undefined;
+      try {
+        stored = field ? (JSON.parse(field) as string) : loadSession(name.slice(0, -5))?.cwd;
+      } catch {
+        stored = undefined;
+      }
+      if (stored && sameDirectory(stored, cwd)) return true;
     }
   } catch {
     // A directory we cannot read is not a reason to say anything at startup.

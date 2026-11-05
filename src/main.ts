@@ -60,7 +60,7 @@ import { collectContext, shouldSuggestInit } from "./context.ts";
 import { denyAll } from "./permissions.ts";
 import { TodoList } from "./todos.ts";
 import { shells } from "./shells.ts";
-import { hasSessionIn, latestSession, listSessions, loadSession, type StoredSession } from "./session.ts";
+import { hasSessionIn, latestSession, listSessions, loadSession, sameDirectory, type StoredSession } from "./session.ts";
 import { runKimiCode } from "./kimi.ts";
 import { clearScreen } from "./banner.ts";
 import { loadTui } from "./tui/load.ts";
@@ -772,13 +772,20 @@ async function repl(
   // either: the files are on this machine. Checked before the sign-in below so
   // `clixad --resume` never asks for a login it does not need.
   if (opts.resume === "pick") {
-    const sessions = listSessions(undefined, 10);
+    const sessions = listSessions(undefined, 20);
     if (!sessions.length) return console.log(c.yellow("no saved sessions yet"));
-    console.log(c.bold("Sessions:"));
+    // Every directory, each said, with this one marked: a session is filed
+    // under the directory it was started in, and `/resume` lists only this one.
+    const here = process.cwd();
+    console.log(c.bold("Sessions (newest first, * = this directory):"));
     for (const s of sessions) {
-      console.log(`  ${c.cyan(s.id)}  ${s.updated.slice(0, 16).replace("T", " ")}  ${s.title}`);
+      const mark = sameDirectory(s.cwd, here) ? "*" : " ";
+      console.log(
+        `${mark} ${c.cyan(s.id)}  ${s.updated.slice(0, 16).replace("T", " ")}  ${String(s.messageCount).padStart(4)} msgs  ${s.title}`,
+      );
+      if (mark === " ") console.log(c.dim(`    in ${s.cwd}`));
     }
-    console.log(c.dim("\n  resume one with: clixad --resume <id>"));
+    console.log(c.dim("\n  resume one with: clixad --resume <id>   ·   delete one in the REPL: /resume, then d twice"));
     return;
   }
 
@@ -808,9 +815,12 @@ async function repl(
   }
 
   let session: StoredSession | undefined;
+  const notices = [...(opts.notices ?? [])];
   if (opts.resume === "latest") {
     session = latestSession(process.cwd());
-    if (!session) console.log(c.dim("  no previous session here — starting a new one"));
+    // A notice in the REPL rather than a line here: the screen is cleared on
+    // the way in, which took this sentence with it.
+    if (!session) notices.push("no saved session in this directory, so this is a new one (/resume all lists every directory's)");
   } else if (opts.resume) {
     session = loadSession(opts.resume);
     if (!session) return console.log(c.red(`no such session: ${opts.resume}`));
@@ -843,7 +853,7 @@ async function repl(
     newAccount,
     preferences,
     initialTask: opts.task,
-    ...(opts.notices?.length ? { notices: opts.notices } : {}),
+    ...(notices.length ? { notices } : {}),
     ...(initHint ? { initHint } : {}),
   });
 }

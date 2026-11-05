@@ -99,10 +99,12 @@ import {
 import { toolSchemaFor } from "../tools.ts";
 import { autoModeOffered, autoModeUnavailable, pickReviewModel } from "../auto-mode.ts";
 import {
+  deleteSession,
   latestSession,
   listSessions,
   loadHistory,
   loadSession,
+  MAX_SESSIONS,
   newSessionId,
   saveHistory,
   saveSession,
@@ -131,6 +133,7 @@ import { renderMarkdown, renderMarkdownState, type MdState } from "./markdown.ts
 import { splitStable, trimLeadingBlankLines } from "./stream.ts";
 import { diffTint, renderDiffRows, type DiffView } from "../diff.ts";
 import { askWords, headText, presentResult, toolHead, type Presented } from "./present.ts";
+import { replayItems, shellNote } from "./replay.ts";
 import {
   assistantBlock,
   dialogInner,
@@ -627,7 +630,16 @@ interface Picker {
    * would leave the agent waiting on something nobody will ever resolve.
    */
   onCancel?: () => void;
+  /**
+   * `d` on a row, pressed twice, deletes what it names (`/resume` only). The
+   * first press only asks; any other key takes the question back. Returns a
+   * sentence when it refused, which takes the subtitle's place.
+   */
+  onDelete?: (item: PickerItem) => string | undefined;
 }
+
+/** What the picker's subtitle says between the two presses of `d`. */
+const PICKER_DELETE_CONFIRM = "Press d again to delete it for good · any other key keeps it";
 
 export function App({
   client,
@@ -806,6 +818,10 @@ export function App({
   const [plan, setPlan] = useState<{ plan: string; resolve: (d: PlanDecision) => void } | null>(null);
   const [picker, setPicker] = useState<Picker | null>(null);
   const [pickerSel, setPickerSel] = useState(0);
+  /** The row `d` was pressed on once, waiting for the second press. */
+  const [pickerArmed, setPickerArmed] = useState<string | null>(null);
+  /** Why a delete was refused, shown in the subtitle until the next key. */
+  const [pickerNote, setPickerNote] = useState<string | null>(null);
   /**
    * A credit pack waiting to be confirmed, and what has been typed at it.
    *
@@ -1474,9 +1490,6 @@ export function App({
     if (freeLine) {
       push({ kind: "notice", tone: (wallet?.balance ?? 0) <= 0 ? "warn" : "good", text: `  ${freeLine}` });
     }
-    if (session?.messages.length) {
-      push({ kind: "notice", text: `  resumed session ${session.id} (${session.messages.length} messages)` });
-    }
     // Somebody coming back to a project with no instruction file: this is the
     // session that pays to rediscover the layout, and the next one need not.
     if (initHint?.returning) {
@@ -1949,6 +1962,37 @@ export function App({
     },
     [cols, keepOutput, push],
   );
+
+  /**
+   * Draw a saved conversation the way it was drawn when it happened: what was
+   * typed, each answer and each tool call (`replay.ts`). Resuming used to print
+   * one line with an id, a count and the first message, so a conversation the
+   * model had in full looked like an empty one to the person resuming it.
+   */
+  const replayConversation = useCallback(
+    (stored: StoredSession) => {
+      const title = stored.title ? ` · ${stored.title}` : "";
+      push({
+        kind: "notice",
+        tone: "good",
+        text: `  resumed session ${stored.id} (${stored.messages.length} messages)${title}`,
+      });
+      for (const item of replayItems(stored.messages)) {
+        if (item.kind === "tool") commitTool(item.name, item.args, { result: item.result, ok: item.ok });
+        else if (item.kind === "notice") push({ kind: "notice", text: `  ${item.text}` });
+        else push(item);
+      }
+      push({ kind: "notice", text: "  the agent has all of this conversation; carry on below" });
+    },
+    [commitTool, push],
+  );
+
+  // `clixad --continue` and `clixad --resume <id>`: the conversation the REPL
+  // opened with, drawn under the startup notices so it ends just above the box.
+  useEffect(() => {
+    if (session?.messages.length) replayConversation(session);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- run once
+  }, []);
 
   // ---- one agent turn -----------------------------------------------------
   const handleEvent = useCallback(
@@ -3392,11 +3436,27 @@ export function App({
         // earlier conversation was to quit the one you were in.
         case "resume":
         case "sessions": {
-          const metas = listSessions(root, 10);
-          if (!metas.length) {
-            push({ kind: "notice", tone: "warn", text: "  no saved sessions in this directory yet" });
+          const [verb, target] = arg.split(/\s+/);
+          // `/resume delete <id>`: the id `clixad --resume` prints, deleted
+          // without opening the picker.
+          if (verb === "delete" || verb === "rm") {
+            if (!target) {
+              push({ kind: "notice", tone: "warn", text: "  /resume delete <id>, or press d twice on a row in /resume" });
+              return;
+            }
+            if (target === sessionRef.current.id) {
+              push({ kind: "notice", tone: "warn", text: `  ${target} is the conversation you are in. /clear starts a new one first.` });
+              return;
+            }
+            push(
+              deleteSession(target)
+                ? { kind: "notice", tone: "good", text: `  deleted session ${target}` }
+                : { kind: "notice", tone: "error", text: `  no such session: ${target}` },
+            );
             return;
           }
+          const everywhere = verb === "all";
+          const metas = listSessions(everywhere ? undefined : root, MAX_SESSIONS);
           const load = (id: string) => {
             const found = loadSession(id);
             if (!found) {
@@ -3407,27 +3467,48 @@ export function App({
             // The title travels with the id: without it the next turn would
             // rename the conversation just resumed after whatever was typed into it.
             sessionRef.current = { id: found.id, started: found.started, title: found.title };
-            push({
-              kind: "notice",
-              tone: "good",
-              text: `  resumed ${found.id} — ${found.messages.length} messages\n  ${found.title}`,
-            });
+            // The task list and the rating belong to the conversation that was
+            // on screen, as `/clear` has it.
+            todosRef.current = new TodoList();
+            lastTurnRef.current = null;
+            replayConversation(found);
           };
           // A typed id skips the picker: `/resume <id>` is what the notices and
           // `clixad --resume` both print, so it has to work as written.
-          if (arg) return load(arg);
+          if (arg && !everywhere) return load(arg);
+          if (!metas.length) {
+            const elsewhere = everywhere ? 0 : listSessions(undefined, MAX_SESSIONS).length;
+            push({
+              kind: "notice",
+              tone: "warn",
+              text: elsewhere
+                ? `  no saved sessions in this directory yet. ${elsewhere} in other directories: /resume all lists them.`
+                : "  no saved sessions yet",
+            });
+            return;
+          }
           const items: PickerItem[] = metas.map((m) => ({
             value: m.id,
             label: m.updated.slice(0, 16).replace("T", " "),
-            hint: m.title.slice(0, 60),
+            hint: `${m.title.slice(0, 60)} · ${m.messageCount} messages${everywhere ? ` · ${m.cwd}` : ""}`,
             current: m.id === sessionRef.current.id,
           }));
           setPickerSel(0);
+          setPickerArmed(null);
+          setPickerNote(null);
           setPicker({
-            title: "Resume a session",
-            subtitle: "Replaces the current conversation; nothing on screen is lost.",
+            title: everywhere ? "Resume a session from any directory" : "Resume a session",
+            subtitle: "Replaces the current conversation; nothing on screen is lost. d twice deletes one.",
             items,
             onPick: (choice) => load(choice.value),
+            onDelete: (choice) => {
+              if (choice.value === sessionRef.current.id) {
+                return "That is the conversation you are in. /clear starts a new one first.";
+              }
+              if (!deleteSession(choice.value)) return "It could not be deleted.";
+              push({ kind: "notice", tone: "good", text: `  deleted session ${choice.value}` });
+              return undefined;
+            },
           });
           return;
         }
@@ -3538,7 +3619,7 @@ export function App({
           push({ kind: "notice", tone: "warn", text: `  unknown command: /${cmd} — try /help` });
       }
     },
-    [client, cols, config, cycleMode, exit, model, modelTaskHints, premium, push, root, runAdWall, runBusy, runBuy, runLogin, runTurn, setPremium, writeToStdout],
+    [client, cols, config, cycleMode, exit, model, modelTaskHints, premium, push, replayConversation, root, runAdWall, runBusy, runBuy, runLogin, runTurn, setPremium, writeToStdout],
   );
 
   /**
@@ -3578,7 +3659,7 @@ export function App({
       if (output) {
         setMessages((prev) => [
           ...prev,
-          { role: "user", content: `I ran \`${command}\` in the workspace myself. Its output:\n\n${output}` },
+          { role: "user", content: shellNote(command, output) },
         ]);
       }
     },
@@ -3972,6 +4053,24 @@ export function App({
     // The picker is modal: arrows or a row number, Enter confirms, Esc cancels.
     if (picker) {
       const n = picker.items.length;
+      // `d` twice deletes the highlighted row, where the picker allows it. The
+      // first press only asks, so a stray key never deletes anything.
+      if (picker.onDelete && (ch === "d" || ch === "D") && !key.ctrl && !key.meta) {
+        const item = picker.items[Math.min(pickerSel, n - 1)];
+        if (!item) return;
+        setPickerNote(null);
+        if (pickerArmed !== item.value) return setPickerArmed(item.value);
+        setPickerArmed(null);
+        const refused = picker.onDelete(item);
+        if (refused) return setPickerNote(refused);
+        const rest = picker.items.filter((i) => i !== item);
+        if (!rest.length) return setPicker(null);
+        setPicker({ ...picker, items: rest });
+        setPickerSel((sel) => Math.min(sel, rest.length - 1));
+        return;
+      }
+      if (pickerArmed !== null) setPickerArmed(null);
+      if (pickerNote !== null) setPickerNote(null);
       if (key.escape) {
         // Closed before the choice was made. `onCancel` is how a *tool* waiting
         // on this picker is released: `/model` and `/resume` have nothing to
@@ -4394,21 +4493,24 @@ export function App({
     };
   });
   const pickerTitle = picker ? fitRow(picker.title, inner) : "";
-  const pickerSubtitle = picker ? fitRow(picker.subtitle, inner) : "";
+  const pickerSubtitle = picker
+    ? fitRow(pickerArmed !== null ? PICKER_DELETE_CONFIRM : (pickerNote ?? picker.subtitle), inner)
+    : "";
+  const pickerDelete = picker?.onDelete ? " · d delete" : "";
   // Widest phrasing that fits: the tail is `esc cancel`, and a picker whose
   // hint has been truncated past it is a modal with no visible way out.
   const pickerHint = picker
     ? pickHint(
         picker.items.length > pickerItems.length
           ? [
-              `↑↓ choose (${pickerFrom + 1}-${pickerFrom + pickerItems.length} of ${picker.items.length}) · 1-${pickerItems.length} jump · ⏎ confirm · esc cancel`,
-              `↑↓ ${pickerFrom + 1}-${pickerFrom + pickerItems.length}/${picker.items.length} · ⏎ confirm · esc cancel`,
-              "↑↓ · ⏎ · esc",
+              `↑↓ choose (${pickerFrom + 1}-${pickerFrom + pickerItems.length} of ${picker.items.length}) · 1-${pickerItems.length} jump · ⏎ confirm${pickerDelete} · esc cancel`,
+              `↑↓ ${pickerFrom + 1}-${pickerFrom + pickerItems.length}/${picker.items.length} · ⏎ confirm${pickerDelete} · esc cancel`,
+              picker.onDelete ? "↑↓ · ⏎ · d · esc" : "↑↓ · ⏎ · esc",
             ]
           : [
-              `↑↓ choose · 1-${Math.min(9, pickerItems.length)} jump straight to a row · ⏎ confirm · esc cancel`,
-              `↑↓ choose · 1-${Math.min(9, pickerItems.length)} jump · ⏎ confirm · esc cancel`,
-              "↑↓ · ⏎ · esc",
+              `↑↓ choose · 1-${Math.min(9, pickerItems.length)} jump straight to a row · ⏎ confirm${pickerDelete} · esc cancel`,
+              `↑↓ choose · 1-${Math.min(9, pickerItems.length)} jump · ⏎ confirm${pickerDelete} · esc cancel`,
+              picker.onDelete ? "↑↓ · ⏎ · d · esc" : "↑↓ · ⏎ · esc",
             ],
         inner,
       )

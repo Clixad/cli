@@ -67,6 +67,11 @@ export function cutPoint(messages: ChatMessage[], keepTurns = 2): number {
   return 0;
 }
 
+/** How the summary opens, so a resumed transcript can tell it from a message somebody typed. */
+export const SUMMARY_LEAD = "Summary of the earlier conversation:\n\n";
+/** The answer the summary is paired with, which a resumed transcript does not draw. */
+export const SUMMARY_ACK = "Understood — continuing from that summary.";
+
 const SUMMARY_PROMPT =
   "Summarise the conversation above for your future self, which will continue " +
   "the work without seeing it. Cover: what the user asked for, what was already " +
@@ -111,8 +116,8 @@ export async function compact(
 
   const compacted: ChatMessage[] = [
     messages[0]!,
-    { role: "user", content: `Summary of the earlier conversation:\n\n${summary}` },
-    { role: "assistant", content: "Understood — continuing from that summary." },
+    { role: "user", content: `${SUMMARY_LEAD}${summary}` },
+    { role: "assistant", content: SUMMARY_ACK },
     ...messages.slice(cut),
   ];
 

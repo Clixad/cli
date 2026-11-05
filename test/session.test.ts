@@ -106,3 +106,55 @@ describe("images in a saved session", () => {
     expect(back.messages[0]!.content).toContain("image not kept in the saved session: image/png");
   });
 });
+
+describe("finding and deleting sessions (0.0.1-beta.45)", () => {
+  const base = { started: "2026-11-05T10:00:00.000Z", model: "m", title: "t", messages };
+
+  it("deletes one session by id, and nothing else", () => {
+    session.saveSession({ ...base, id: "del-keep", updated: "2026-11-05T10:00:00.000Z", cwd: "/work/del" });
+    session.saveSession({ ...base, id: "del-go", updated: "2026-11-05T11:00:00.000Z", cwd: "/work/del" });
+    expect(session.deleteSession("del-go")).toBe(true);
+    expect(session.loadSession("del-go")).toBeUndefined();
+    expect(session.listSessions("/work/del").map((s) => s.id)).toEqual(["del-keep"]);
+    // Gone is gone: a second delete says so rather than pretending.
+    expect(session.deleteSession("del-go")).toBe(false);
+  });
+
+  it("never turns a typed id into a path outside the session directory", () => {
+    // `/resume <id>` and `/resume delete <id>` take the id as typed.
+    for (const id of ["../config", "..", "a/b", "a\\b", "", ".hidden", "x".repeat(65)]) {
+      expect(session.isSessionId(id), id).toBe(false);
+      expect(session.loadSession(id), id).toBeUndefined();
+      expect(session.deleteSession(id), id).toBe(false);
+    }
+    expect(session.isSessionId(session.newSessionId())).toBe(true);
+  });
+
+  it("says how many messages each one holds", () => {
+    session.saveSession({ ...base, id: "count-me", updated: "2026-11-05T12:00:00.000Z", cwd: "/work/count" });
+    expect(session.listSessions("/work/count")[0]?.messageCount).toBe(messages.length);
+  });
+
+  it("files a directory written with a trailing separator under the same directory", () => {
+    session.saveSession({ ...base, id: "slash", updated: "2026-11-05T13:00:00.000Z", cwd: "/work/slash/" });
+    expect(session.listSessions("/work/slash").map((s) => s.id)).toEqual(["slash"]);
+    expect(session.hasSessionIn("/work/slash")).toBe(true);
+    expect(session.hasSessionIn("/work/slash-not")).toBe(false);
+  });
+
+  it("compares directories without case on Windows, where the drive letter's case varies", () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    try {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      expect(session.sameDirectory("C:\\work\\app", "c:\\work\\app")).toBe(true);
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
+    // Everywhere else case is part of the name.
+    expect(session.sameDirectory("/work/App", "/work/app")).toBe(process.platform === "win32");
+  });
+
+  it("keeps far more than fifty conversations", () => {
+    expect(session.MAX_SESSIONS).toBeGreaterThanOrEqual(200);
+  });
+});

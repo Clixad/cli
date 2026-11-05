@@ -55,8 +55,8 @@ export const COMMANDS: SlashCommand[] = [
   { name: "clear", desc: "clear the screen and start a new session" },
   // Deliberately *no* `args` on /resume, for /login's reason: an arg hint makes
   // enter complete the command instead of running it, and the picker is the
-  // point. `/resume <id>` still works when typed in full.
-  { name: "resume", desc: "pick up an earlier session in this directory" },
+  // point. `/resume <id>`, `/resume all` and `/resume delete <id>` work typed in full.
+  { name: "resume", desc: "pick up or delete an earlier session (all: every directory)" },
   { name: "init", desc: "write a CLIXAD.md for this project" },
   // Deliberately *no* `args` on either, for /login's reason: an arg hint makes
   // enter complete the command instead of running it, and listing is what both

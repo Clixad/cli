@@ -27,6 +27,12 @@ const TRAILING = /[),;:]+$/;
 export const MAX_MENTION_CHARS = 120_000;
 
 /**
+ * Where the attached files start in a message, after what was typed. A
+ * resumed transcript shows the message up to here, as it was on screen.
+ */
+export const MENTIONS_HEADING = "\n\n# Files the user referenced\n";
+
+/**
  * The `@path` tokens in `text`, in order, without duplicates.
  *
  * `@` counts at the start of a word only, which is the same rule the completion
@@ -95,8 +101,7 @@ export function expandMentions(text: string, root: string, limit = MAX_MENTION_C
   if (blocks.length === 0) return { text, attached: [], images: [] };
   return {
     text:
-      `${text}\n\n` +
-      "# Files the user referenced\n" +
+      `${text}${MENTIONS_HEADING}` +
       "Their contents are below, already read for you — do not call read_file on them again.\n\n" +
       blocks.join("\n\n"),
     attached,

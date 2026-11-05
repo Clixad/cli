@@ -36,6 +36,7 @@ export const CONTEXT_TOKENS: Record<string, number> = {
   "claude-haiku-5.5": 24_000,
   "deepseek-v4-flash": 1_048_576,
   "gemini-3.5-flash-lite": 1_048_576,
+  "glm-5.3-flash": 1_048_576,
   "kimi-k2.5": 262_144,
   "gemini-3.8-flash": 1_048_576,
   "kimi-k2.7-code": 262_144,
