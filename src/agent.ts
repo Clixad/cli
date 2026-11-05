@@ -148,6 +148,13 @@ export interface RunAgentOptions {
   /** Cancels the run (Esc in the REPL) — kills the request and any child process. */
   signal?: AbortSignal;
   onEvent?: (event: AgentEvent) => void;
+  /**
+   * Called with the whole conversation (system prompt first) after every round
+   * that ends with each tool call answered, which is the shape a request can
+   * be sent in. The REPL saves the session there, so the work of a turn the
+   * process never finishes (a closed terminal, a crash) can still be resumed.
+   */
+  onCheckpoint?: (messages: ChatMessage[]) => void;
   /** Loop guard: max model round-trips before giving up. */
   maxSteps?: number;
   /** Backs `web_search`; absent = the tool says so rather than returning nothing. */
@@ -506,103 +513,124 @@ export async function runAgent(
     });
   }
 
-  let retriedEmpty = false;
-  for (let step = 0; step < maxSteps; step++) {
-    if (opts.signal?.aborted) return stop("aborted");
-
-    let turn: ChatTurn;
-    try {
-      turn = await client.chatStream(messages, opts.model, {
-        effort: opts.effort,
-        tools: opts.tools ? opts.tools() : TOOL_SCHEMA,
-        signal: opts.signal,
-        onDelta: (text) => emit({ type: "delta", text }),
-      });
-    } catch (err) {
-      if (isAbort(err) || opts.signal?.aborted) return stop("aborted");
-      throw err;
+  // Everything from here on is this run's own work. An error that ends the run
+  // after some of it was done hands it to the caller (`interruptedConversation`):
+  // the files were edited and the commands were run whatever the gateway said
+  // next, and a conversation that forgot them would be one the model can no
+  // longer continue. One that ends before any of it is left as it was.
+  const base = messages.length;
+  try {
+    return await loop();
+  } catch (err) {
+    if (typeof err === "object" && err !== null) {
+      // Set or cleared on every level, so a sub-agent's conversation recorded
+      // on the same error is never handed to the caller as this one.
+      if (messages.length > base) interrupted.set(err, closeOpenCalls(withoutReasoning(messages)));
+      else interrupted.delete(err);
     }
-
-    creditsCharged += turn.creditsCharged;
-    creditsWaived += turn.creditsWaived ?? 0;
-    if (turn.freeCreditsLeft !== undefined) freeCreditsLeft = turn.freeCreditsLeft;
-    balance = turn.balance;
-    emitUsage(turn);
-
-    const content = messageText(turn.message);
-    const calls = turn.message.tool_calls ?? [];
-
-    // An answer with nothing in it — no text and no tool call — is never what
-    // was asked for, and it is a thing models do: Gemini 2.5 Flash-Lite spends
-    // its tokens thinking and emits nothing on roughly one call in twenty with
-    // this prompt, and a thinking model can leave its whole reply in the
-    // reasoning. The TUI then commits nothing and the turn simply ends in
-    // silence. Asked again, unchanged, the same model answers; so it is asked
-    // once more, and the empty reply is not kept. Once, not in a loop: the call
-    // is billed like any other (it was, by the provider), and a model that is
-    // empty twice running is not going to be rescued by a third.
-    if (calls.length === 0 && !content.trim() && !retriedEmpty) {
-      retriedEmpty = true;
-      continue;
-    }
-    retriedEmpty = false;
-    messages.push(turn.message);
-    if (content) lastText = content;
-
-    if (calls.length === 0) {
-      emit({ type: "final", content, creditsCharged, balance });
-      return {
-        content,
-        messages: withoutReasoning(messages),
-        creditsCharged,
-        balance,
-        creditsWaived,
-        freeCreditsLeft,
-        searchCredits,
-        steps: step + 1,
-      };
-    }
-
-    // A round can carry both a sentence and tool calls; show the sentence first.
-    if (content) emit({ type: "message", content });
-
-    pendingImages = [];
-    for (const [i, call] of calls.entries()) {
-      if (opts.signal?.aborted) {
-        // Every announced tool_call needs a matching tool message, or the next
-        // request is malformed — fill the rest in as cancelled.
-        for (const rest of calls.slice(i)) messages.push(toolMessage(rest, "cancelled by the user"));
-        return stop("aborted");
-      }
-      const result = await executeToolCall(ctx, call, emit);
-      messages.push(toolMessage(call, result));
-    }
-
-    // Images last, once every tool_call has its answer: a user message in
-    // between an assistant's tool_calls and their results is malformed, and
-    // providers reject the whole request rather than the one message.
-    if (pendingImages.length) {
-      messages.push(imageMessage(pendingImages));
-      emit({
-        type: "attachment",
-        labels: pendingImages.map((image) => image.label),
-      });
-      pendingImages = [];
-    }
+    throw err;
   }
 
-  emit({ type: "max_steps" });
-  return {
-    content: lastText || "(stopped: reached max steps)",
-    messages: withoutReasoning(messages),
-    creditsCharged,
-    balance,
-    creditsWaived,
-    freeCreditsLeft,
-    searchCredits,
-    steps: maxSteps,
-    stopped: "max_steps",
-  };
+  async function loop(): Promise<AgentResult> {
+    let retriedEmpty = false;
+    for (let step = 0; step < maxSteps; step++) {
+      if (opts.signal?.aborted) return stop("aborted");
+
+      let turn: ChatTurn;
+      try {
+        turn = await client.chatStream(messages, opts.model, {
+          effort: opts.effort,
+          tools: opts.tools ? opts.tools() : TOOL_SCHEMA,
+          signal: opts.signal,
+          onDelta: (text) => emit({ type: "delta", text }),
+        });
+      } catch (err) {
+        if (isAbort(err) || opts.signal?.aborted) return stop("aborted");
+        throw err;
+      }
+
+      creditsCharged += turn.creditsCharged;
+      creditsWaived += turn.creditsWaived ?? 0;
+      if (turn.freeCreditsLeft !== undefined) freeCreditsLeft = turn.freeCreditsLeft;
+      balance = turn.balance;
+      emitUsage(turn);
+
+      const content = messageText(turn.message);
+      const calls = turn.message.tool_calls ?? [];
+
+      // An answer with nothing in it — no text and no tool call — is never what
+      // was asked for, and it is a thing models do: Gemini 2.5 Flash-Lite spends
+      // its tokens thinking and emits nothing on roughly one call in twenty with
+      // this prompt, and a thinking model can leave its whole reply in the
+      // reasoning. The TUI then commits nothing and the turn simply ends in
+      // silence. Asked again, unchanged, the same model answers; so it is asked
+      // once more, and the empty reply is not kept. Once, not in a loop: the call
+      // is billed like any other (it was, by the provider), and a model that is
+      // empty twice running is not going to be rescued by a third.
+      if (calls.length === 0 && !content.trim() && !retriedEmpty) {
+        retriedEmpty = true;
+        continue;
+      }
+      retriedEmpty = false;
+      messages.push(turn.message);
+      if (content) lastText = content;
+
+      if (calls.length === 0) {
+        emit({ type: "final", content, creditsCharged, balance });
+        return {
+          content,
+          messages: withoutReasoning(messages),
+          creditsCharged,
+          balance,
+          creditsWaived,
+          freeCreditsLeft,
+          searchCredits,
+          steps: step + 1,
+        };
+      }
+
+      // A round can carry both a sentence and tool calls; show the sentence first.
+      if (content) emit({ type: "message", content });
+
+      pendingImages = [];
+      for (const [i, call] of calls.entries()) {
+        if (opts.signal?.aborted) {
+          // Every announced tool_call needs a matching tool message, or the next
+          // request is malformed — fill the rest in as cancelled.
+          for (const rest of calls.slice(i)) messages.push(toolMessage(rest, "cancelled by the user"));
+          return stop("aborted");
+        }
+        const result = await executeToolCall(ctx, call, emit);
+        messages.push(toolMessage(call, result));
+      }
+
+      // Images last, once every tool_call has its answer: a user message in
+      // between an assistant's tool_calls and their results is malformed, and
+      // providers reject the whole request rather than the one message.
+      if (pendingImages.length) {
+        messages.push(imageMessage(pendingImages));
+        emit({
+          type: "attachment",
+          labels: pendingImages.map((image) => image.label),
+        });
+        pendingImages = [];
+      }
+      opts.onCheckpoint?.(withoutReasoning(messages));
+    }
+
+    emit({ type: "max_steps" });
+    return {
+      content: lastText || "(stopped: reached max steps)",
+      messages: withoutReasoning(messages),
+      creditsCharged,
+      balance,
+      creditsWaived,
+      freeCreditsLeft,
+      searchCredits,
+      steps: maxSteps,
+      stopped: "max_steps",
+    };
+  }
 
   function stop(reason: "aborted"): AgentResult {
     emit({ type: reason });
@@ -618,6 +646,42 @@ export async function runAgent(
       stopped: reason,
     };
   }
+}
+
+/** The conversations `runAgent` hands over with the error that ended them. */
+const interrupted = new WeakMap<object, ChatMessage[]>();
+
+/**
+ * The conversation a run had built when `err` ended it, system prompt first,
+ * in a shape that can be sent again; undefined when the run had done nothing
+ * yet, or when `err` did not come out of `runAgent`.
+ *
+ * Kept beside the error rather than in a wrapper around it, because every
+ * caller tells the gateway's refusals apart with `instanceof`.
+ */
+export function interruptedConversation(err: unknown): ChatMessage[] | undefined {
+  return typeof err === "object" && err !== null ? interrupted.get(err) : undefined;
+}
+
+/** What an interrupted conversation says for a tool call the error left unanswered. */
+export const INTERRUPTED_CALL = "not completed: the turn stopped with an error before this call finished";
+
+/**
+ * Every announced tool call answered, or the next request is malformed and
+ * the provider rejects the whole conversation. An error raised by a tool (a
+ * sub-agent's model call, for one) leaves the calls after it in the round
+ * without a result; they get one saying so, as esc's are filled in as
+ * cancelled.
+ */
+function closeOpenCalls(messages: ChatMessage[]): ChatMessage[] {
+  const out = [...messages];
+  const last = out.findLastIndex((m) => m.role === "assistant");
+  const calls = last >= 0 ? (out[last]!.tool_calls ?? []) : [];
+  const answered = new Set(out.slice(last + 1).map((m) => m.tool_call_id));
+  for (const call of calls) {
+    if (!answered.has(call.id)) out.push(toolMessage(call, INTERRUPTED_CALL));
+  }
+  return out;
 }
 
 function toolMessage(call: ToolCall, content: string): ChatMessage {

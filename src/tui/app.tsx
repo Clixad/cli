@@ -63,7 +63,7 @@ import {
   visibleLength,
   welcomeBanner,
 } from "../banner.ts";
-import { NO_SEARCH_INSTRUCTION, runAgent, type AgentEvent } from "../agent.ts";
+import { interruptedConversation, NO_SEARCH_INSTRUCTION, runAgent, type AgentEvent } from "../agent.ts";
 import { collectContext, INIT_HINT, INIT_PROMPT, shouldSuggestInit } from "../context.ts";
 import { expandMentions } from "../mentions.ts";
 import { compact, conversationTokens, estimateTokens, shouldCompact } from "../compact.ts";
@@ -212,6 +212,14 @@ const FEEDBACK_TURN_INTERVAL = 50;
  */
 const NOT_SIGNED_IN =
   "  Not signed in, or the stored token isn't valid for this gateway.\n  Run /login to sign in.";
+/**
+ * Said under an error that ended a turn after it had done some work. Without
+ * it somebody whose task stopped on a server error has no reason to think the
+ * steps already taken survived, and quits to start over.
+ */
+export const KEPT_AFTER_ERROR =
+  "  The work done before this error is kept. Send a message to carry on from there,\n" +
+  "  now or after a restart with clixad --continue.";
 /** Lines of a running command's output kept on screen while it runs. */
 const LIVE_OUTPUT_LINES = 5;
 /**
@@ -2100,6 +2108,28 @@ export function App({
       nextSponsor(model);
 
       let history = messagesRef.current;
+      // The session file, written at every round the agent finishes and again
+      // when the turn ends however it ends. Saved per round so the work of a
+      // turn is on disk before the turn is over: a server error, a closed
+      // terminal or a crash part way through a task must not leave the
+      // directory with nothing to resume.
+      const persist = (conversation: ChatMessage[]) => {
+        // Named once, by the message that opened it, and then left alone —
+        // which is what `StoredSession.title` has always promised the resume
+        // picker. The first line only: an `@path` message carries the whole
+        // file after a blank line, and a session titled with a file's contents
+        // is not a title. What the user typed is always the first line.
+        sessionRef.current.title ??= (task.split("\n")[0] || task).slice(0, 80);
+        saveSession({
+          id: sessionRef.current.id,
+          started: sessionRef.current.started,
+          updated: new Date().toISOString(),
+          cwd: root,
+          model,
+          title: sessionRef.current.title,
+          messages: conversation,
+        });
+      };
       try {
         // Compact before the call, so a long session never dies on context.
         const window = contextWindow(model);
@@ -2166,26 +2196,14 @@ export function App({
             }),
           signal: ac.signal,
           onEvent: handleEvent,
+          // Without the system prompt, which is rebuilt per run.
+          onCheckpoint: (conversation) => persist(conversation.slice(1)),
         });
 
         // Drop the system prompt: it is rebuilt per run and may change.
         const next = result.messages.slice(1);
         setMessages(next);
-        // Named once, by the message that opened it, and then left alone —
-        // which is what `StoredSession.title` has always promised the resume
-        // picker. The first line only: an `@path` message carries the whole
-        // file after a blank line, and a session titled with a file's contents
-        // is not a title. What the user typed is always the first line.
-        sessionRef.current.title ??= (task.split("\n")[0] || task).slice(0, 80);
-        saveSession({
-          id: sessionRef.current.id,
-          started: sessionRef.current.started,
-          updated: new Date().toISOString(),
-          cwd: root,
-          model,
-          title: sessionRef.current.title,
-          messages: next,
-        });
+        persist(next);
 
         if (result.stopped === "aborted") {
           // What was already on screen of the answer stays readable.
@@ -2325,6 +2343,16 @@ export function App({
         // An answer cut off by the failure stays as far as it got, above the
         // notice that says what happened.
         if (streamRef.current.streamed) finishStream();
+        // What the turn did before it failed stays in the conversation and in
+        // the session file: the files it edited are edited, and the next
+        // message, now or after `--continue`, has to know that. A turn that
+        // failed before doing anything leaves both as they were, which is also
+        // what lets a refused request be sent again without being said twice.
+        const kept = interruptedConversation(err)?.slice(1);
+        if (kept) {
+          setMessages(kept);
+          persist(kept);
+        }
         // A refusal carries what may be spent and the balance it was worked
         // out from, so the status line says what is usable as the refusal is
         // printed rather than one read later.
@@ -2415,6 +2443,11 @@ export function App({
           push({ kind: "notice", tone: "warn", text: `  ${errorNotice(err.message, undefined, "  ")}` });
         } else {
           push({ kind: "notice", tone: "error", text: `  error: ${errorNotice((err as Error).message, undefined, "  ")}` });
+        }
+        // The two refusals that keep the request say so in their own notice,
+        // and enter sends it again.
+        if (kept && !(err instanceof PaywallError) && !(err instanceof PremiumLockedError)) {
+          push({ kind: "notice", text: KEPT_AFTER_ERROR });
         }
       } finally {
         abortRef.current = null;
