@@ -114,11 +114,13 @@ import { createTally, recordImpression } from "../sponsor/counter.ts";
 import { adtentionSource, sponsorSource, type RemotePick, type SponsorFacts } from "../sponsor/provider.ts";
 import { createSponsorSlot, type ServedLine } from "../sponsor/network.ts";
 import { AD_FORMATS, EXTRA_AD_FORMATS, type AdFormat, type ExtraAdFormat } from "../sponsor/formats.ts";
-import { DIRECT_ASK_TIMEOUT_MS, type DirectAnswer, type DirectLine } from "../sponsor/direct.ts";
+import { DIRECT_ASK_TIMEOUT_MS, shortLinkText, type DirectAnswer, type DirectLine, type LinkMode, type ServedDirectLine } from "../sponsor/direct.ts";
+import { placeKey, VisibilityClock } from "../sponsor/visibility.ts";
 import { hyperlinksEnabled, osc8 } from "../sponsor/hyperlink.ts";
 import {
   adColorEnabled,
   adFitsFormat,
+  LINK_SEPARATOR,
   SIDEBAR_CARD_COLS,
   sidebarCard,
   sponsorEnabled,
@@ -850,15 +852,25 @@ export function App({
   // A network line also carries its impression id, which is how the render
   // says it was actually drawn (`drawnRef`) — the only thing that makes it
   // reportable.
-  const [sponsor, setSponsor] = useState<{ text: string; origin: SponsorOrigin; impressionId?: string; link?: string } | null>(
-    null,
-  );
+  // `link` is the address a click goes to, drawn as an OSC 8 link where the
+  // terminal understands one; `linkText` is the short address printed after
+  // the line, for every terminal, where the gateway's address is short enough.
+  // `linkRequired` marks a booked line whose printed address is the only way
+  // to open it (a terminal without links): the copy gives way to the address.
+  const [sponsor, setSponsor] = useState<{
+    text: string;
+    origin: SponsorOrigin;
+    impressionId?: string;
+    link?: string;
+    linkText?: string;
+    linkRequired?: boolean;
+  } | null>(null);
   // The other two formats. Network only — there is no house card and no house
   // status bar, so an empty slot is simply not drawn — and, like the top bar,
   // only for the model call they were fetched for.
-  const [adSlots, setAdSlots] = useState<Partial<Record<ExtraAdFormat, { text: string; impressionId: string; link?: string }>>>(
-    {},
-  );
+  const [adSlots, setAdSlots] = useState<
+    Partial<Record<ExtraAdFormat, { text: string; impressionId: string; link?: string; linkText?: string; linkRequired?: boolean }>>
+  >({});
 
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
@@ -1179,6 +1191,9 @@ export function App({
   // network line: held when painted, reported when the turn is over, and only
   // if `drawnRef` saw it. `drawnId` is what the frame records it under.
   const pendingDirectRef = useRef(new Map<AdFormat, { call: number; serveToken: string; drawnId: string }>());
+  // The same for a fallback line, drawn where ADtention had nothing. Reported
+  // to a route of its own, only to be counted: it earns nothing.
+  const pendingFallbackRef = useRef(new Map<AdFormat, { call: number; serveToken: string; drawnId: string }>());
   // False once a gateway has answered 404 to the ask: an older gateway that
   // will not know the route for the rest of this session either.
   const directSupportedRef = useRef(true);
@@ -1196,6 +1211,18 @@ export function App({
   // check was close enough; with three, each with its own conditions, the only
   // honest witness is the frame.
   const drawnRef = useRef(new Set<string>());
+  // How long each drawn line and each place stayed on screen without a break
+  // this turn (`sponsor/visibility.ts`), fed by the same effect as `drawnRef`.
+  // A booked line counts only after ten seconds of it, and the places are
+  // what a booked week is forecast on.
+  const visibilityRef = useRef(new VisibilityClock());
+  // How each booked line on screen could be opened, written by the render that
+  // drew it (a link, the printed address, or neither) and reported with it.
+  const linkModeRef = useRef(new Map<string, LinkMode>());
+  // This turn's measure token from the gateway, when its answer arrived, and
+  // the places it asked about: reported after the turn with how long each
+  // place stayed on screen, measured from that answer on.
+  const measureRef = useRef<{ call: number; token: string; answeredAt: number; formats: AdFormat[] } | null>(null);
   // The network provider. Held in a ref for the reason the house source is:
   // `nextSponsor` is a callback with its own dependency list, and a source
   // rebuilt on every render would be a new object in it every time.
@@ -1646,6 +1673,10 @@ export function App({
   const nextSponsor = useCallback(
     (modelId: string) => {
       const call = ++sponsorCallRef.current;
+      // A new turn measures from nothing.
+      visibilityRef.current.reset();
+      linkModeRef.current = new Map();
+      measureRef.current = null;
       // `stdout.isTTY`, not `process.stdout.isTTY`: the row is drawn on the
       // stream ink was handed, so that is the stream the gate has to ask about.
       // They are the same object in production, which is why the old reading
@@ -1684,11 +1715,18 @@ export function App({
       // saves the round trip and the gateway's config call, and the guarantee
       // that nothing is billed lives in `network.ts`. The same holds per format:
       // each is asked only where it could be drawn.
-      const fetchNetwork = (format: AdFormat) => {
+      const fetchNetwork = (format: AdFormat, fallback?: ServedDirectLine) => {
         void remoteSponsorRef.current[format].fetch().then((line) => {
           // The counter has moved: this line was asked for on a call that has
           // since ended or been superseded. Dropped, not painted.
-          if (!line || call !== sponsorCallRef.current) return;
+          if (call !== sponsorCallRef.current) return;
+          // ADtention has nothing for this place: the fallback, if the gateway
+          // sent one, is drawn instead. Last in the order, after a booked line
+          // and after ADtention, so it never takes a place either could fill.
+          if (!line) {
+            if (fallback) paintFallback(fallback);
+            return;
+          }
           // The terminal may have narrowed while the request was in flight. A
           // row that cannot be drawn was not seen, so it is not recorded and
           // never reported — an advertiser is already charged for the serve,
@@ -1738,19 +1776,45 @@ export function App({
         if (format !== "top_bar" && modalOpenRef.current) return;
         const drawnId = `direct:${call}:${format}`;
         // The gateway's click address, drawn as a link where the terminal
-        // understands one (`hyperlink.ts`); the text alone everywhere else.
+        // understands one (`hyperlink.ts`). Everywhere else the short address
+        // is printed after the line, and it keeps its place even where the
+        // copy has to be cut for it: it is the only way to the page there.
         const link = line.clickUrl;
+        const linkable = hyperlinksEnabled({ isTTY: stdout.isTTY, env: process.env });
+        const linkText = !linkable && line.shortUrl ? shortLinkText(line.shortUrl) : undefined;
+        const extra = linkText ? { link, linkText, linkRequired: true } : { link };
         if (format === "top_bar") {
-          if (!sponsorRow(line.text, colsRef.current, "network")) return;
-          setSponsor({ text: line.text, origin: "network", impressionId: drawnId, link });
+          if (!sponsorRow(line.text, colsRef.current, "network", linkText, true)) return;
+          setSponsor({ text: line.text, origin: "network", impressionId: drawnId, ...extra });
         } else {
-          setAdSlots((slots) => ({ ...slots, [format]: { text: line.text, impressionId: drawnId, link } }));
+          setAdSlots((slots) => ({ ...slots, [format]: { text: line.text, impressionId: drawnId, ...extra } }));
         }
         pendingDirectRef.current.set(format, { call, serveToken: line.serveToken, drawnId });
       };
 
+      // A fallback line, drawn where neither a booked line nor ADtention
+      // filled the place. The same fences as a booked line, the same `Ad`
+      // mark, and the short address printed after the line where it fits.
+      const paintFallback = (line: ServedDirectLine) => {
+        const { format } = line;
+        if (call !== sponsorCallRef.current) return;
+        if (!adFitsFormat(format, colsRef.current)) return;
+        if (format !== "top_bar" && modalOpenRef.current) return;
+        const drawnId = `fallback:${call}:${format}`;
+        const link = line.clickUrl;
+        const linkText = shortLinkText(link);
+        const extra = linkText ? { link, linkText } : { link };
+        if (format === "top_bar") {
+          if (!sponsorRow(line.text, colsRef.current, "network", linkText)) return;
+          setSponsor({ text: line.text, origin: "network", impressionId: drawnId, ...extra });
+        } else {
+          setAdSlots((slots) => ({ ...slots, [format]: { text: line.text, impressionId: drawnId, ...extra } }));
+        }
+        pendingFallbackRef.current.set(format, { call, serveToken: line.serveToken, drawnId });
+      };
+
       // Booked lines first, then ADtention for every slot nothing is booked
-      // in. The ask waits at most `DIRECT_ASK_TIMEOUT_MS`, and the house line is
+      // in, then a fallback where ADtention had nothing. The ask waits at most `DIRECT_ASK_TIMEOUT_MS`, and the house line is
       // already on screen while it does, so the cost of asking is that a
       // network line arrives one round trip later. A slot answered with `hold`
       // gets no network line at all: it is booked, and this account has seen
@@ -1758,6 +1822,7 @@ export function App({
       const fitting = AD_FORMATS.filter((format) => adFitsFormat(format, colsRef.current));
       void (async () => {
         let direct: DirectLine[] = [];
+        let fallbacks: ServedDirectLine[] = [];
         let failed = false;
         if (directSupportedRef.current && fitting.length > 0) {
           const ask = sponsorDirect ?? ((formats, cols, signal) => client.directSponsor(formats, cols, signal));
@@ -1773,6 +1838,12 @@ export function App({
           if (!answer.supported) directSupportedRef.current = false;
           failed = answer.failed === true;
           direct = answer.lines;
+          fallbacks = answer.fallbacks ?? [];
+          // The places are measured from this moment: it is when a booked
+          // line would have been painted.
+          if (answer.measure && call === sponsorCallRef.current) {
+            measureRef.current = { call, token: answer.measure, answeredAt: Date.now(), formats: [...fitting] };
+          }
           if (!failed) knownBookedRef.current = new Set(direct.map((line) => line.format));
         }
         if (call !== sponsorCallRef.current) return;
@@ -1784,7 +1855,7 @@ export function App({
           // An ask that failed is "nothing booked" except where the last
           // answer said there was a booking: that slot stays empty this turn.
           else if (failed && knownBookedRef.current.has(format)) continue;
-          else fetchNetwork(format);
+          else fetchNetwork(format, fallbacks.find((line) => line.format === format));
         }
       })();
     },
@@ -1816,16 +1887,46 @@ export function App({
   const reportSponsor = useCallback(() => {
     const pending = [...pendingImpressionRef.current.values()];
     const pendingDirect = [...pendingDirectRef.current.entries()];
+    const pendingFallback = [...pendingFallbackRef.current.entries()];
     const drawn = drawnRef.current;
+    const clock = visibilityRef.current;
+    const linkModes = linkModeRef.current;
+    const measure = measureRef.current;
+    const at = Date.now();
     pendingImpressionRef.current = new Map();
     pendingDirectRef.current = new Map();
+    pendingFallbackRef.current = new Map();
     drawnRef.current = new Set();
+    measureRef.current = null;
     // Booked lines go in one call to their own route, under the same two
-    // filters as a network line: this turn's call, and actually drawn.
+    // filters as a network line: this turn's call, and actually drawn. Each
+    // says how long it stayed on screen in one stretch and how it could be
+    // opened; the gateway counts none under ten seconds.
     const directReports = pendingDirect
       .filter(([, p]) => p.call === sponsorCallRef.current && drawn.has(p.drawnId))
-      .map(([format, p]) => ({ format, serveToken: p.serveToken }));
+      .map(([format, p]) => ({
+        format,
+        serveToken: p.serveToken,
+        visibleMs: clock.longest(p.drawnId, at),
+        link: linkModes.get(p.drawnId) ?? ("none" as const),
+      }));
     if (directReports.length > 0) void client.reportDirectImpressions(directReports);
+    // How long each place this turn asked about stayed on screen with a line
+    // in it, from the moment the answer arrived: what a booked week is
+    // forecast on. Every place asked about is reported, the ones never drawn
+    // at zero, so the gateway sees the turn as it was.
+    if (measure && measure.call === sponsorCallRef.current) {
+      const places = measure.formats.map((format) => ({
+        format,
+        visibleMs: clock.longest(placeKey(format), at, measure.answeredAt),
+      }));
+      void client.reportSponsorViews(measure.token, places);
+    }
+    // Fallback lines, the same way, to their own route.
+    const fallbackReports = pendingFallback
+      .filter(([, p]) => p.call === sponsorCallRef.current && drawn.has(p.drawnId))
+      .map(([format, p]) => ({ format, serveToken: p.serveToken }));
+    if (fallbackReports.length > 0) void client.reportAffiliateImpressions(fallbackReports);
     const reports = pending
       // A line for a superseded call was dropped rather than painted, so there
       // is no impression to report — the counter is bumped in the same
@@ -4301,7 +4402,8 @@ export function App({
   // null rather than wrap, and the budget below subtracts the same 0-or-1 it
   // draws. The `Ad ·` mark on a network line costs five of those columns and
   // takes them out of the ad copy's share, never out of the row's height.
-  const sponsorLine = busy && sponsor ? sponsorRow(sponsor.text, cols, sponsor.origin) : null;
+  const sponsorLine =
+    busy && sponsor ? sponsorRow(sponsor.text, cols, sponsor.origin, sponsor.linkText, sponsor.linkRequired === true) : null;
   // Whether the accent may be painted. Refusing it does not refuse the mark:
   // the row still says `Ad ·`, in the same dim as everything else.
   const adColor = adColorEnabled({ isTTY: stdout.isTTY, env: process.env });
@@ -4320,10 +4422,15 @@ export function App({
   // own — its second row takes the blank row under the working line, which is
   // why the bottom block drops its margin while it is up — and it is drawn only
   // where the working line was granted, since that is what it sits beside.
-  const card = busy && !modalOpen && adSlots.sidebar_card ? sidebarCard(adSlots.sidebar_card.text, cols) : null;
+  const card =
+    busy && !modalOpen && adSlots.sidebar_card
+      ? sidebarCard(adSlots.sidebar_card.text, cols, adSlots.sidebar_card.linkText)
+      : null;
   // The status bar: one row, `sponsorRow`'s rules, under the status line.
   const statusBarLine =
-    busy && !modalOpen && adSlots.status_bar ? sponsorRow(adSlots.status_bar.text, cols, "network") : null;
+    busy && !modalOpen && adSlots.status_bar
+      ? sponsorRow(adSlots.status_bar.text, cols, "network", adSlots.status_bar.linkText, adSlots.status_bar.linkRequired === true)
+      : null;
 
   // One row is left free at the bottom: ink appends a newline to a frame that
   // does not fill the viewport, and a frame that exactly fills it is already
@@ -4429,9 +4536,31 @@ export function App({
   ]
     .filter(Boolean)
     .join(" ");
+  // The places on screen, whatever fills them: a booked week is forecast on
+  // how long each one stays up. The top bar's own tips count, since a booked
+  // line would have stood where they did.
+  const placesKey = [
+    showSponsor && sponsorLine ? placeKey("top_bar") : undefined,
+    showCard ? placeKey("sidebar_card") : undefined,
+    showStatusBar ? placeKey("status_bar") : undefined,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  // How each booked line on screen could be opened, as this render drew it:
+  // the whole line as a link, the printed address, or neither.
+  if (showSponsor && sponsorLine && sponsor?.impressionId?.startsWith("direct:")) {
+    linkModeRef.current.set(sponsor.impressionId, linkable ? "link" : sponsorLine.link ? "address" : "none");
+  }
+  if (showCard && card && adSlots.sidebar_card?.impressionId.startsWith("direct:")) {
+    linkModeRef.current.set(adSlots.sidebar_card.impressionId, linkable ? "link" : card.link ? "address" : "none");
+  }
+  if (showStatusBar && statusBarLine && adSlots.status_bar?.impressionId.startsWith("direct:")) {
+    linkModeRef.current.set(adSlots.status_bar.impressionId, linkable ? "link" : statusBarLine.link ? "address" : "none");
+  }
   useEffect(() => {
     for (const id of drawnKey.split(" ")) if (id) drawnRef.current.add(id);
-  }, [drawnKey]);
+    visibilityRef.current.observe([...drawnKey.split(" "), ...placesKey.split(" ")].filter(Boolean), Date.now());
+  }, [drawnKey, placesKey]);
   // The completion menu is chrome too, and each of its rows is fitted below so
   // that `menu.length` is a row count rather than an item count.
   let budget = Math.max(0, viewport - chromeHeight - menu.length - busyHeight);
@@ -4933,6 +5062,14 @@ export function App({
               <Text {...(adColor ? { color: AD_MARK } : { dimColor: true })} wrap="truncate-end">
                 {card.label}
               </Text>
+              {card.link ? (
+                <Text {...(adColor ? { color: AD_TEXT } : { dimColor: true })} wrap="truncate-end">
+                  {LINK_SEPARATOR}
+                  <Text underline={adColor}>
+                    {linkable && adSlots.sidebar_card?.link ? osc8(card.link, adSlots.sidebar_card.link) : card.link}
+                  </Text>
+                </Text>
+              ) : null}
             </Box>
             <Box>
               <Text dimColor>{card.rule}</Text>
@@ -5175,6 +5312,12 @@ function SponsorRowView({ row, adColor, link }: { row: SponsorRow; adColor: bool
       ) : null}
       <Text {...(adColor && row.origin === "network" ? { color: AD_TEXT } : { dimColor: true })} wrap="truncate-end">
         {link && row.origin === "network" ? osc8(row.body, link) : row.body}
+        {row.link ? (
+          <>
+            {LINK_SEPARATOR}
+            <Text underline={adColor}>{link ? osc8(row.link, link) : row.link}</Text>
+          </>
+        ) : null}
       </Text>
     </Box>
   );

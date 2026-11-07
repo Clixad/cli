@@ -7,7 +7,7 @@ import { gzipSync } from "node:zlib";
 import type { CliConfig } from "./config.ts";
 import { parseTaskShape, type TaskShape } from "./estimate.ts";
 import { EXTRA_AD_FORMATS, type AdFormat, type ExtraAdFormat } from "./sponsor/formats.ts";
-import { parseDirectLines, type DirectAnswer } from "./sponsor/direct.ts";
+import { parseDirectLines, parseFallbackLines, parseMeasure, type DirectAnswer, type LinkMode } from "./sponsor/direct.ts";
 import {
   EdgeBlockedError,
   EdgeOutageError,
@@ -2041,7 +2041,15 @@ export class GatewayClient {
       });
       if (res.status === 404) return { supported: false, lines: [] };
       if (!res.ok) return { supported: true, lines: [], failed: true };
-      return { supported: true, lines: parseDirectLines(await res.json()) };
+      const body = await res.json();
+      const fallbacks = parseFallbackLines(body);
+      const measure = parseMeasure(body);
+      return {
+        supported: true,
+        lines: parseDirectLines(body),
+        ...(fallbacks.length > 0 ? { fallbacks } : {}),
+        ...(measure ? { measure } : {}),
+      };
     } catch {
       return { supported: true, lines: [], failed: true };
     }
@@ -2053,7 +2061,7 @@ export class GatewayClient {
    * Never throws; answers what was credited, for the tally and for tests.
    */
   async reportDirectImpressions(
-    impressions: ReadonlyArray<{ format: AdFormat; serveToken: string }>,
+    impressions: ReadonlyArray<{ format: AdFormat; serveToken: string; visibleMs?: number; link?: LinkMode }>,
     signal?: AbortSignal,
   ): Promise<number> {
     if (impressions.length === 0) return 0;
@@ -2062,11 +2070,69 @@ export class GatewayClient {
         method: "POST",
         headers: this.headers(),
         ...(signal ? { signal } : {}),
-        body: JSON.stringify({ impressions: impressions.map((i) => ({ format: i.format, serve_token: i.serveToken })) }),
+        body: JSON.stringify({
+          impressions: impressions.map((i) => ({
+            format: i.format,
+            serve_token: i.serveToken,
+            ...(i.visibleMs !== undefined ? { visible_ms: Math.round(i.visibleMs) } : {}),
+            ...(i.link ? { link: i.link } : {}),
+          })),
+        }),
       });
       if (!res.ok) return 0;
       const body = (await res.json()) as { credited?: unknown };
       return typeof body.credited === "number" ? body.credited : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Report how long each place a turn asked about stayed on screen with a
+   * line in it, with the turn's measure token: what a booked week is
+   * forecast on. Never throws; answers how many places counted.
+   */
+  async reportSponsorViews(
+    measure: string,
+    places: ReadonlyArray<{ format: AdFormat; visibleMs: number }>,
+    signal?: AbortSignal,
+  ): Promise<number> {
+    if (places.length === 0) return 0;
+    try {
+      const res = await gatewayFetch(`${this.config.gatewayUrl}/v1/sponsor/direct/views`, {
+        method: "POST",
+        headers: this.headers(),
+        ...(signal ? { signal } : {}),
+        body: JSON.stringify({ measure, places: places.map((p) => ({ format: p.format, visible_ms: Math.round(p.visibleMs) })) }),
+      });
+      if (!res.ok) return 0;
+      const body = (await res.json()) as { counted?: unknown };
+      return typeof body.counted === "number" ? body.counted : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Report the fallback lines a turn drew, in one call, after the turn is
+   * over. They are counted and earn nothing, because nobody pays for them being
+   * shown, so this answers how many were counted. Never throws.
+   */
+  async reportAffiliateImpressions(
+    impressions: ReadonlyArray<{ format: AdFormat; serveToken: string }>,
+    signal?: AbortSignal,
+  ): Promise<number> {
+    if (impressions.length === 0) return 0;
+    try {
+      const res = await gatewayFetch(`${this.config.gatewayUrl}/v1/sponsor/affiliate/impression`, {
+        method: "POST",
+        headers: this.headers(),
+        ...(signal ? { signal } : {}),
+        body: JSON.stringify({ impressions: impressions.map((i) => ({ format: i.format, serve_token: i.serveToken })) }),
+      });
+      if (!res.ok) return 0;
+      const body = (await res.json()) as { counted?: unknown };
+      return typeof body.counted === "number" ? body.counted : 0;
     } catch {
       return 0;
     }

@@ -112,6 +112,11 @@ export interface SponsorRow {
   label: string | null;
   /** The line itself, cut to whatever the two above left. */
   body: string;
+  /**
+   * The short address printed after the line, `LINK_SEPARATOR` not included,
+   * or null. Only ever beside a line shown whole: see `sponsorRow`.
+   */
+  link: string | null;
   /** Which of the two this is, so the renderer knows what to colour. */
   origin: SponsorOrigin;
 }
@@ -235,11 +240,22 @@ export function adFitsFormat(format: AdFormat, cols: number): boolean {
 export interface SidebarCard {
   /** `"│ "`, at the start of both rows. */
   rule: string;
-  /** `"✦ Ad"` — the whole of the first row after the rule. Never cut. */
+  /** `"✦ Ad"` — the start of the first row after the rule. Never cut. */
   label: string;
+  /**
+   * The short address to print after the label, `" · "` not included, or
+   * null: where it would not fit beside the label, or the line has none.
+   */
+  link: string | null;
   /** The copy, cut to the card's width — the whole of the second row. */
   body: string;
 }
+
+/**
+ * What separates a line from the short address printed after it. Charged to
+ * the row like every other piece, so a row with a link is still one row.
+ */
+export const LINK_SEPARATOR = " · ";
 
 /**
  * The card for a served line, or `null` where there is no room for one.
@@ -253,13 +269,21 @@ export interface SidebarCard {
  * Exactly two rows, whatever the copy: the layout puts them beside two rows it
  * has already counted, and a third would be a row nobody counted.
  */
-export function sidebarCard(line: string, cols: number): SidebarCard | null {
+export function sidebarCard(line: string, cols: number, linkText?: string): SidebarCard | null {
   if (!adFitsFormat("sidebar_card", cols)) return null;
   const text = line.trim();
   if (!text) return null;
   const body =
     visibleLength(text) <= SIDEBAR_BODY_COLS ? text : `${sliceColumns(text, SIDEBAR_BODY_COLS - 1).trimEnd()}…`;
-  return { rule: SIDEBAR_RULE, label: `${SPONSOR_SIGIL} ${AD_LABEL}`, body };
+  const label = `${SPONSOR_SIGIL} ${AD_LABEL}`;
+  // The address goes on the label's row, which is otherwise four columns of
+  // thirty-eight: the copy keeps its whole row, and the address is printed
+  // whole or not at all, since half an address opens the wrong page.
+  const link =
+    linkText && visibleLength(label) + visibleLength(LINK_SEPARATOR) + visibleLength(linkText) <= SIDEBAR_BODY_COLS
+      ? linkText
+      : null;
+  return { rule: SIDEBAR_RULE, label, link, body };
 }
 
 /**
@@ -286,7 +310,13 @@ export function sidebarCard(line: string, cols: number): SidebarCard | null {
  * terminal is too narrow to say anything useful; for an advertisement, at the
  * much earlier point where it would stop being worth an impression.
  */
-export function sponsorRow(line: string, cols: number, origin: SponsorOrigin): SponsorRow | null {
+export function sponsorRow(
+  line: string,
+  cols: number,
+  origin: SponsorOrigin,
+  linkText?: string,
+  linkRequired = false,
+): SponsorRow | null {
   const marker =
     origin === "house" || cols >= AD_FULL_PREFIX_MIN_COLS ? HOUSE_MARKER_ROW : AD_MARKER_ROW;
   const label = origin === "network" ? LABEL_ROW : null;
@@ -304,13 +334,40 @@ export function sponsorRow(line: string, cols: number, origin: SponsorOrigin): S
   // inventory is ASCII, but a served line is somebody else's copy: a line of
   // CJK measured that way came back at 141 columns for an 80-column terminal,
   // wrapped onto a second row, and broke the one promise this function makes.
+  //
+  // The short address, where there is one, is printed only when the whole line
+  // fits beside it. A line cut to make room for its address would be the ad
+  // with its offer missing; an address cut to make room for the line would open
+  // the wrong page. So with too little room the address goes and the line is
+  // cut as it always was, and a terminal that understands links still has the
+  // line itself to click.
+  if (origin === "network" && linkText) {
+    const linkCols = visibleLength(LINK_SEPARATOR) + visibleLength(linkText);
+    const whole = visibleLength(line) + linkCols;
+    if (whole <= room) return { marker, label, body: line, link: linkText, origin };
+    // A booked line in a terminal that cannot make it a link (2026-11-07):
+    // the address is the one way to the business's page, so it keeps its
+    // place and the copy is cut to make room, as long as enough copy is left
+    // to say whose it is. Below that the address goes, and the impression is
+    // reported as one nobody could open.
+    if (linkRequired && room - linkCols >= MIN_LINKED_COPY_COLS) {
+      const copy = room - linkCols;
+      return { marker, label, body: `${sliceColumns(line, copy - 1).trimEnd()}…`, link: linkText, origin };
+    }
+  }
   const body = visibleLength(line) <= room ? line : `${sliceColumns(line, room - 1).trimEnd()}…`;
-  return { marker, label, body, origin };
+  return { marker, label, body, link: null, origin };
 }
+
+/**
+ * The least copy a booked line keeps beside its required address: enough for
+ * a brand and a word. A row with less is the address alone and reads as noise.
+ */
+export const MIN_LINKED_COPY_COLS = 12;
 
 /** The same row as one plain string — no colour, for measuring and for tests. */
 export function joinSponsorRow(row: SponsorRow): string {
-  return `${row.marker}${row.label ?? ""}${row.body}`;
+  return `${row.marker}${row.label ?? ""}${row.body}${row.link ? `${LINK_SEPARATOR}${row.link}` : ""}`;
 }
 
 /**
@@ -320,8 +377,14 @@ export function joinSponsorRow(row: SponsorRow): string {
  * "one row in, one row out" is asserted against the thing that is drawn rather
  * than against a second implementation of it.
  */
-export function sponsorText(line: string, cols: number, origin: SponsorOrigin): string | null {
-  const row = sponsorRow(line, cols, origin);
+export function sponsorText(
+  line: string,
+  cols: number,
+  origin: SponsorOrigin,
+  linkText?: string,
+  linkRequired = false,
+): string | null {
+  const row = sponsorRow(line, cols, origin, linkText, linkRequired);
   return row && joinSponsorRow(row);
 }
 

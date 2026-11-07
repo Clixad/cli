@@ -34,6 +34,9 @@ import {
   adColorEnabled,
   adFitsWidth,
   joinSponsorRow,
+  LINK_SEPARATOR,
+  sidebarCard,
+  SIDEBAR_MIN_COLS,
   sponsorEnabled,
   sponsorRow,
   sponsorText,
@@ -685,5 +688,42 @@ describe("the serve is refused, not the render", () => {
     expect(served?.text).toBe("Globex: plan sprints in 5 min");
     expect(calls).toHaveLength(1);
     expect(calls[0]).toContain("/v1/serve");
+  });
+});
+
+describe("a line with a short address after it", () => {
+  const LINE = "Railway: $20 in credits at signup";
+  const LINK = "app.clixad.io/r/railway/t";
+
+  it("prints the whole line, then the address, and is still one row of the terminal's width", () => {
+    for (const cols of [79, 80, 120]) {
+      const row = sponsorRow(LINE, cols, "network", LINK);
+      expect(row?.link, String(cols)).toBe(LINK);
+      expect(row?.body).toBe(LINE);
+      const text = joinSponsorRow(row!);
+      expect(text.endsWith(`${LINE}${LINK_SEPARATOR}${LINK}`)).toBe(true);
+      expect(visibleLength(text)).toBeLessThanOrEqual(cols);
+    }
+  });
+
+  it("drops the address rather than cut the line or the address, and keeps the mark", () => {
+    for (const cols of [AD_MIN_COLS, 50, 78]) {
+      const row = sponsorRow(LINE, cols, "network", LINK);
+      expect(row?.link, String(cols)).toBeNull();
+      expect(row?.label).toBe(`${AD_LABEL} · `);
+      expect(visibleLength(joinSponsorRow(row!))).toBeLessThanOrEqual(cols);
+    }
+  });
+
+  it("is never put on our own line", () => {
+    expect(sponsorRow("a usage tip", 120, "house", LINK)?.link).toBeNull();
+  });
+
+  it("goes on the card's label row, whole, and the copy keeps its own row", () => {
+    const card = sidebarCard("Railway: $20 credits when you sign up", SIDEBAR_MIN_COLS, "app.clixad.io/r/railway/c");
+    expect(card?.link).toBe("app.clixad.io/r/railway/c");
+    expect(card?.body).toBe("Railway: $20 credits when you sign up");
+    // Too long for the label's row: left out, never cut.
+    expect(sidebarCard("x".repeat(20), SIDEBAR_MIN_COLS, `app.clixad.io/r/${"y".repeat(20)}/c`)?.link).toBeNull();
   });
 });

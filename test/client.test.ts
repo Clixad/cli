@@ -573,6 +573,53 @@ describe("asking for booked lines", () => {
     }));
     expect(await new GatewayClient(config).reportDirectImpressions([{ format: "top_bar", serveToken: "t" }])).toBe(0);
   });
+
+  it("says how long a booked line was on screen and how it could be opened (2026-11-07)", async () => {
+    const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ credited: 5 }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchSpy);
+    await new GatewayClient(config).reportDirectImpressions([{ format: "top_bar", serveToken: "tok", visibleMs: 12_345.6, link: "address" }]);
+    const [, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({
+      impressions: [{ format: "top_bar", serve_token: "tok", visible_ms: 12_346, link: "address" }],
+    });
+  });
+
+  it("reads the turn's measure and the short address, and drops a short address it could not print as it opens", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              lines: [
+                { format: "top_bar", text: "Acme: ship", serve_token: "t1", click_url: "https://app.clixad.io/go?c=x", short_url: "https://app.clixad.io/a/k3p9xq" },
+                { format: "status_bar", text: "Acme: ship", serve_token: "t2", click_url: "https://app.clixad.io/go?c=y", short_url: "https://app.clixad.io/a?x=1" },
+              ],
+              measure: "m.1",
+            }),
+            { status: 200 },
+          ),
+      ),
+    );
+    const answer = await new GatewayClient(config).directSponsor(["top_bar", "status_bar"], 120);
+    expect(answer.measure).toBe("m.1");
+    expect(answer.lines[0]).toMatchObject({ format: "top_bar", shortUrl: "https://app.clixad.io/a/k3p9xq" });
+    expect(answer.lines[1]).not.toHaveProperty("shortUrl");
+  });
+
+  it("reports the turn's places with their times on screen to their own route, and never throws", async () => {
+    const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ counted: 1 }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchSpy);
+    expect(await new GatewayClient(config).reportSponsorViews("m.1", [{ format: "top_bar", visibleMs: 12_000.4 }])).toBe(1);
+    const [url, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe(`${config.gatewayUrl}/v1/sponsor/direct/views`);
+    expect(JSON.parse(String(init.body))).toEqual({ measure: "m.1", places: [{ format: "top_bar", visible_ms: 12_000 }] });
+    expect(await new GatewayClient(config).reportSponsorViews("m.1", [])).toBe(0);
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new TypeError("fetch failed");
+    }));
+    expect(await new GatewayClient(config).reportSponsorViews("m.1", [{ format: "top_bar", visibleMs: 1 }])).toBe(0);
+  });
 });
 
 /**
