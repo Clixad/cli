@@ -1122,6 +1122,23 @@ export class MaintenanceError extends Error {
 const MAINTENANCE = "maintenance";
 
 /**
+ * The gateway would not send a request because the conversation is too long
+ * for the model at the price it is sold for. The message is the gateway's,
+ * and it names no way to compact: whether `/compact` can help depends on what
+ * this program would do with the conversation, which the REPL works out
+ * before it says so.
+ */
+export class PromptTooLongError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PromptTooLongError";
+  }
+}
+
+/** The `error` that refusal carries, in a 400 body or a stream frame. */
+const PROMPT_TOO_LONG = "prompt_too_long";
+
+/**
  * A 503 the gateway itself answered (an edge's never reaches here, `postChat`
  * resends or reports those): the maintenance switch, or anything else as the
  * message `httpFailure` makes of it.
@@ -1276,7 +1293,7 @@ async function refusal400(res: Response, what: string): Promise<Error> {
   const text = await res.text().catch(() => "");
   try {
     const body = JSON.parse(text) as { error?: unknown; message?: unknown };
-    if (body.error === "prompt_too_long" && typeof body.message === "string") return new Error(body.message);
+    if (body.error === PROMPT_TOO_LONG && typeof body.message === "string") return new PromptTooLongError(body.message);
   } catch {
     // not ours, or not JSON: the generic message below
   }
@@ -2474,6 +2491,7 @@ export class GatewayClient {
     // Noted after `[DONE]` so the credits frame is still read and reported.
     if (premiumRefusal) throw premiumRefusal;
     if (streamError && streamErrorType === MAINTENANCE) throw new MaintenanceError(streamError);
+    if (streamError && streamErrorType === PROMPT_TOO_LONG) throw new PromptTooLongError(streamError);
     if (streamError && streamErrorType && LIMIT_REFUSALS.has(streamErrorType)) {
       throw new LimitRefusalError(streamError, streamErrorType, spendable ? { figures: spendable, balance } : undefined);
     }

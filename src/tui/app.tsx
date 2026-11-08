@@ -19,6 +19,7 @@ import {
   MaintenanceError,
   PaywallError,
   PremiumLockedError,
+  PromptTooLongError,
   accessColumn,
   parseSpendable,
   adsPerTaskLabel,
@@ -66,7 +67,14 @@ import {
 import { interruptedConversation, NO_SEARCH_INSTRUCTION, runAgent, type AgentEvent } from "../agent.ts";
 import { collectContext, INIT_HINT, INIT_PROMPT, shouldSuggestInit } from "../context.ts";
 import { expandMentions } from "../mentions.ts";
-import { compact, conversationTokens, estimateTokens, shouldCompact } from "../compact.ts";
+import {
+  compact,
+  compactionHelps,
+  conversationTokens,
+  estimateTokens,
+  shouldCompact,
+  withCompactAdvice,
+} from "../compact.ts";
 import {
   estimateClause,
   estimateTask,
@@ -2349,10 +2357,13 @@ export function App({
         // Compact before the call, so a long session never dies on context.
         const window = contextWindow(model);
         if (shouldCompact([{ role: "system", content: contextRef.current.systemPrompt }, ...history], window)) {
-          const res = await compact(client, model, [
-            { role: "system", content: contextRef.current.systemPrompt },
-            ...history,
-          ], { signal: ac.signal, effort: savedEffort(config, model) });
+          const res = await compact(
+            client,
+            model,
+            [{ role: "system", content: contextRef.current.systemPrompt }, ...history],
+            window,
+            { signal: ac.signal, effort: savedEffort(config, model) },
+          );
           if (res) {
             history = res.messages.slice(1);
             setMessages(history);
@@ -2568,6 +2579,16 @@ export function App({
           setMessages(kept);
           persist(kept);
         }
+        // A conversation the gateway refused as too long for the model. It is
+        // told to run /compact only when that is sure to bring it under the
+        // line: this turn did work (one that failed on its first call kept
+        // nothing, and the message itself is what was too long), and the
+        // compaction planned for what was kept fits. Otherwise the gateway's
+        // own sentence, which names no compaction.
+        const compactAdvised =
+          err instanceof PromptTooLongError &&
+          kept !== undefined &&
+          compactionHelps([{ role: "system", content: contextRef.current.systemPrompt }, ...kept], contextWindow(model));
         // A refusal carries what may be spent and the balance it was worked
         // out from, so the status line says what is usable as the refusal is
         // printed rather than one read later.
@@ -2656,12 +2677,16 @@ export function App({
           // The gateway's one sentence, alone: the agent is switched off on
           // the other side, nothing here went wrong and nothing was charged.
           push({ kind: "notice", tone: "warn", text: `  ${errorNotice(err.message, undefined, "  ")}` });
+        } else if (compactAdvised) {
+          push({ kind: "notice", tone: "error", text: `  error: ${errorNotice(withCompactAdvice((err as Error).message), undefined, "  ")}` });
         } else {
           push({ kind: "notice", tone: "error", text: `  error: ${errorNotice((err as Error).message, undefined, "  ")}` });
         }
         // The two refusals that keep the request say so in their own notice,
-        // and enter sends it again.
-        if (kept && !(err instanceof PaywallError) && !(err instanceof PremiumLockedError)) {
+        // and enter sends it again. The advice to compact says the work is
+        // kept in the same breath, and that sending a message right away is
+        // not the next step.
+        if (kept && !(err instanceof PaywallError) && !(err instanceof PremiumLockedError) && !compactAdvised) {
           push({ kind: "notice", text: KEPT_AFTER_ERROR });
         }
       } finally {
@@ -3339,15 +3364,17 @@ export function App({
           push({ kind: "notice", text: `  mode → ${MODE_LABEL[permRef.current.mode]}` });
           return;
         }
-        // A model call like any other, so esc has to stop it like any other —
-        // and stopping it costs nothing, since the summary only replaces the
-        // conversation once the call has come back whole.
+        // Model calls like any other, so esc has to stop them like any other.
+        // Stopping leaves the conversation as it was, since the summary only
+        // replaces it once every call has come back whole; a summary that took
+        // several calls has been charged for the ones already finished.
         case "compact":
           await runBusy(COMPACTING, async (signal) => {
             const res = await compact(
               client,
               model,
               [{ role: "system", content: contextRef.current.systemPrompt }, ...messagesRef.current],
+              contextWindow(model),
               { signal, effort: savedEffort(config, model) },
             );
             if (!res) return void push({ kind: "notice", text: "  nothing to compact yet" });

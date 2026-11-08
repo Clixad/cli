@@ -14,6 +14,7 @@ import {
   GatewayClient,
   LEDGER_REASONS,
   MaintenanceError,
+  PromptTooLongError,
   PaywallError,
   PremiumLockedError,
   accessColumn,
@@ -405,6 +406,47 @@ describe("the maintenance refusal", () => {
     expect(err).toBeInstanceOf(MaintenanceError);
     respond(JSON.stringify({ error: "search_not_configured", message: "…" }), JSON_503);
     expect((await failure(client.webSearch("vitest"))).message).toContain("isn't enabled");
+  });
+});
+
+describe("the refusal of a conversation too long for its model", () => {
+  const MESSAGE =
+    "This conversation is too long for Claude Haiku 5.5. From 100,000 tokens its providers charge more than Clixad sells it for, so the request was not sent.\n" +
+    "Run /clear to start over, or /model to switch to a model that takes longer conversations.\n" +
+    "Nothing was charged for this request.";
+
+  it("is a PromptTooLongError carrying the gateway's sentence, from a stream frame", async () => {
+    globalThis.fetch = (async () =>
+      sse(
+        `data: ${JSON.stringify({
+          choices: [{ delta: {}, finish_reason: "error" }],
+          error: { type: "prompt_too_long", message: MESSAGE },
+        })}\n\n` + `data: [DONE]\n\n`,
+      )) as typeof fetch;
+    const err = await failure(new GatewayClient({ ...config }).chatStream([{ role: "user", content: "hi" }], "claude-haiku-5.5"));
+    expect(err).toBeInstanceOf(PromptTooLongError);
+    expect(err.message).toBe(MESSAGE);
+  });
+
+  it("is a PromptTooLongError from a non-streamed 400 of the gateway's", async () => {
+    respond(JSON.stringify({ error: "prompt_too_long", message: MESSAGE }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+    const err = await failure(new GatewayClient({ ...config }).chat([{ role: "user", content: "hi" }], "claude-haiku-5.5"));
+    expect(err).toBeInstanceOf(PromptTooLongError);
+    expect(err.message).toBe(MESSAGE);
+  });
+
+  it("leaves a provider failure mid-stream as the plain error it was", async () => {
+    globalThis.fetch = (async () =>
+      sse(
+        `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "error" }], error: { message: "provider down" } })}\n\n` +
+          `data: [DONE]\n\n`,
+      )) as typeof fetch;
+    const err = await failure(new GatewayClient({ ...config }).chatStream([{ role: "user", content: "hi" }], "claude-haiku-5.5"));
+    expect(err).not.toBeInstanceOf(PromptTooLongError);
+    expect(err.message).toBe("provider down");
   });
 });
 
