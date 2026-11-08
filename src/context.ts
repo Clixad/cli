@@ -16,6 +16,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join, parse, resolve } from "node:path";
 import { SYSTEM_PROMPT } from "./agent.ts";
+import { safeResolve } from "./tools.ts";
 
 const MAX_CONTEXT_FILE_CHARS = 20_000;
 
@@ -32,11 +33,17 @@ export function contextFileCandidates(root: string): string[] {
 export function collectContext(root: string, base: string = SYSTEM_PROMPT): ProjectContext {
   const parts = [base, environmentBlock(root)];
   const files: string[] = [];
+  const personal = join(homedir(), ".clixad", "CLIXAD.md");
 
   for (const path of contextFileCandidates(root)) {
     if (!existsSync(path)) continue;
     let text: string;
     try {
+      // The project's two files come from the repository, so they are confined
+      // to it like any file a tool reads: a `CLIXAD.md` that is a symlink to
+      // `~/.ssh/id_rsa` would otherwise put the key into the system prompt of
+      // every request. The personal file is the user's own and is not.
+      if (path !== personal) safeResolve(root, path);
       text = readFileSync(path, "utf8").trim();
     } catch {
       continue;

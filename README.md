@@ -63,7 +63,11 @@ before it changes anything. `shift+tab` cycles through the permission modes. Bey
 - **Keeps a task list** on multi-step work, and **asks you** when guessing wrong would waste real
   work.
 - **Uses MCP servers** you configure in `.mcp.json` or `~/.clixad/mcp.json`; `/mcp` shows their
-  status. Every tool a server offers is put to you before it runs.
+  status. Every tool a server offers is put to you before it runs. A server from a project's
+  `.mcp.json` or `.clixad/mcp.json` starts only after you approve it (asked once per project, and
+  again if its entry changes; `/mcp approve` starts one later). A server gets `PATH`, `HOME` and the
+  locale from your environment and nothing else, so pass what it needs in its `env`, for example
+  `"env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" }`.
 
 Type `/help` for the commands, `@` to attach a file, and `!` to run a shell command yourself.
 
@@ -95,8 +99,8 @@ github.com/clixad/cli is an automatic one-way copy of the CLI's part of it, so a
 nowhere to be merged and is closed automatically. If you have a fix in mind, describe it in an
 issue.
 
-Please report security problems privately, through "Report a vulnerability" on the repository's
-Security tab, rather than in a public issue.
+Please report security problems by email to [info@clixad.io](mailto:info@clixad.io), not in a
+public GitHub issue. See [SECURITY.md](https://github.com/clixad/cli/blob/main/SECURITY.md).
 
 ## Status
 

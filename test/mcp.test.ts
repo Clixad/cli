@@ -11,8 +11,8 @@
  * unset key, a package that no longer publishes — and none of that may stop a
  * coding agent from opening.
  */
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runMcpTool, ToolError, type ToolContext } from "../src/tools.ts";
@@ -23,6 +23,8 @@ import {
   expandEnv,
   isMcpToolName,
   loadMcpConfig,
+  mcpApprovalsPath,
+  mcpServerEnv,
   qualifiedToolName,
   renderContent,
 } from "../src/mcp.ts";
@@ -144,6 +146,186 @@ describe("loadMcpConfig", () => {
     const loaded = loadMcpConfig(root);
     expect(loaded.servers).toEqual({});
     expect(loaded.errors).toEqual([]);
+  });
+});
+
+describe("where a server came from, and what approving it means", () => {
+  afterEach(() => rmSync(mcpApprovalsPath(), { force: true }));
+
+  it("marks the workspace's files as project and the home file as user", () => {
+    mkdirSync(join(homedir(), ".clixad"), { recursive: true });
+    const personal = join(homedir(), ".clixad", "mcp.json");
+    writeFileSync(personal, JSON.stringify({ mcpServers: { mine: { command: "mine" } } }));
+    try {
+      mkdirSync(join(root, ".clixad"), { recursive: true });
+      writeFileSync(join(root, ".mcp.json"), JSON.stringify({ mcpServers: { shared: { command: "shared" } } }));
+      writeFileSync(join(root, ".clixad/mcp.json"), JSON.stringify({ mcpServers: { local: { command: "local" } } }));
+      const { origins } = loadMcpConfig(root);
+      expect(origins.mine!.scope).toBe("user");
+      expect(origins.shared!.scope).toBe("project");
+      expect(origins.local!.scope).toBe("project");
+    } finally {
+      rmSync(personal, { force: true });
+    }
+  });
+
+  it("fingerprints the entry as written: a changed command is a new entry, a changed variable value is not", () => {
+    const write = (servers: unknown) => writeFileSync(join(root, ".mcp.json"), JSON.stringify({ mcpServers: servers }));
+    write({ gh: { command: "npx", args: ["server-github"], env: { TOKEN: "${GH_TOKEN}" } } });
+    const before = loadMcpConfig(root).origins.gh!.fingerprint;
+    process.env.GH_TOKEN = "one";
+    expect(loadMcpConfig(root).origins.gh!.fingerprint).toBe(before);
+    process.env.GH_TOKEN = "two";
+    expect(loadMcpConfig(root).origins.gh!.fingerprint).toBe(before);
+    delete process.env.GH_TOKEN;
+    // Key order is not a change.
+    write({ gh: { env: { TOKEN: "${GH_TOKEN}" }, args: ["server-github"], command: "npx" } });
+    expect(loadMcpConfig(root).origins.gh!.fingerprint).toBe(before);
+    write({ gh: { command: "npx", args: ["evil-server"], env: { TOKEN: "${GH_TOKEN}" } } });
+    expect(loadMcpConfig(root).origins.gh!.fingerprint).not.toBe(before);
+  });
+
+  it("describes what will run without expanding a variable, and names every variable it will be handed", () => {
+    process.env.GH_TOKEN = "ghp_secret_value";
+    try {
+      writeFileSync(
+        join(root, ".mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            gh: { command: "npx", args: ["-y", "server github", "--key=${GH_TOKEN}"], env: { HOST: "${GH_HOST}" } },
+            web: { type: "http", url: "https://example.com/mcp?k=${API_KEY}", headers: { Authorization: "Bearer ${WEB_TOKEN}" } },
+          },
+        }),
+      );
+      const { origins } = loadMcpConfig(root);
+      expect(origins.gh!.display).toContain('npx -y "server github" --key=${GH_TOKEN}');
+      expect(origins.gh!.display).toContain("env HOST=${GH_HOST}");
+      expect(origins.gh!.display).not.toContain("ghp_secret_value");
+      expect(origins.gh!.variables).toEqual(["GH_HOST", "GH_TOKEN"]);
+      expect(origins.web!.display).toContain("http https://example.com/mcp?k=${API_KEY}");
+      expect(origins.web!.variables).toEqual(["API_KEY", "WEB_TOKEN"]);
+    } finally {
+      delete process.env.GH_TOKEN;
+    }
+  });
+
+  it("escapes control characters, so a config cannot repaint the prompt that shows it", () => {
+    writeFileSync(
+      join(root, ".mcp.json"),
+      JSON.stringify({ mcpServers: { a: { command: "node", args: ["ok\u001b[2K\rlooks harmless"] }, ["b\u001b[31m"]: { command: "x" } } }),
+    );
+    const loaded = loadMcpConfig(root);
+    expect(loaded.origins.a!.display).not.toContain("\u001b");
+    expect(loaded.origins.a!.display).toContain("\\u001b");
+    expect(Object.keys(loaded.servers)).toEqual(["a"]);
+    expect(loaded.errors.join()).toMatch(/control characters/);
+  });
+
+  it("escapes a right-to-left override, so the command cannot be shown in a different order than it runs", () => {
+    writeFileSync(join(root, ".mcp.json"), JSON.stringify({ mcpServers: { a: { command: "node", args: ["safe\u202e.js"] } } }));
+    const display = loadMcpConfig(root).origins.a!.display;
+    expect(display).not.toContain("\u202e");
+    expect(display).toContain("\\u202e");
+  });
+
+  it("holds a project server unstarted, and starts a user one", async () => {
+    const markerFile = join(root, "started");
+    const starter = join(root, "starter.mjs");
+    writeFileSync(starter, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(markerFile)}, "ran"); setTimeout(() => {}, 5000);`);
+    writeFileSync(join(root, ".mcp.json"), JSON.stringify({ mcpServers: { repo: { command: process.execPath, args: [starter] } } }));
+    const hub = McpHub.fromConfig(loadMcpConfig(root), { root });
+    hubs.push(hub);
+    await hub.startReleased(500);
+    await new Promise((r) => setTimeout(r, 800));
+    expect(existsSync(markerFile)).toBe(false);
+    expect(hub.status()).toEqual([{ name: "repo", state: "unapproved", transport: "stdio", toolCount: 0 }]);
+    expect(hub.pending().map((p) => p.name)).toEqual(["repo"]);
+    expect(hub.toolSchemas()).toEqual([]);
+  });
+
+  it("remembers an approval for this workspace and this entry only", async () => {
+    const server = writeServer();
+    writeFileSync(join(root, ".mcp.json"), JSON.stringify({ mcpServers: { demo: { command: process.execPath, args: [server] } } }));
+    const first = McpHub.fromConfig(loadMcpConfig(root), { root });
+    hubs.push(first);
+    const started = await first.approve(["demo"], { remember: true, timeoutMs: 10_000 });
+    expect(started.map((s) => s.state)).toEqual(["ready"]);
+
+    const second = McpHub.fromConfig(loadMcpConfig(root), { root });
+    hubs.push(second);
+    expect(second.pending()).toEqual([]);
+
+    // Another workspace with the identical file is a different question.
+    const other = mkdtempSync(join(tmpdir(), "clixad-mcp-other-"));
+    try {
+      writeFileSync(join(other, ".mcp.json"), readFileSync(join(root, ".mcp.json")));
+      expect(McpHub.fromConfig(loadMcpConfig(other), { root: other }).pending().map((p) => p.name)).toEqual(["demo"]);
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+
+    writeFileSync(join(root, ".mcp.json"), JSON.stringify({ mcpServers: { demo: { command: process.execPath, args: [server, "x"] } } }));
+    expect(McpHub.fromConfig(loadMcpConfig(root), { root }).pending().map((p) => p.name)).toEqual(["demo"]);
+  });
+
+  it("remembers a refusal, and an approval made only for now is not remembered", async () => {
+    writeFileSync(join(root, ".mcp.json"), JSON.stringify({ mcpServers: { a: { command: process.execPath, args: [writeServer()] }, b: { command: "nope" } } }));
+    const hub = McpHub.fromConfig(loadMcpConfig(root), { root });
+    hubs.push(hub);
+    hub.decline(["b"]);
+    await hub.approve(["a"], { remember: false, timeoutMs: 10_000 });
+    const next = McpHub.fromConfig(loadMcpConfig(root), { root });
+    expect(next.status().map((s) => [s.name, s.state])).toEqual([
+      ["a", "unapproved"],
+      ["b", "declined"],
+    ]);
+    expect(next.pending().map((p) => p.name)).toEqual(["a"]);
+    expect(next.pending({ includeDeclined: true }).map((p) => p.name)).toEqual(["a", "b"]);
+  });
+});
+
+describe("the environment a server is started with", () => {
+  const source = {
+    PATH: "/usr/bin",
+    HOME: "/home/me",
+    LANG: "de_DE.UTF-8",
+    SOME_PROVIDER_API_KEY: "sk-secret",
+    AWS_SECRET_ACCESS_KEY: "aws-secret",
+    GITHUB_TOKEN: "ghp_secret",
+    SHELL: "() { :; }; echo pwned",
+  };
+
+  it("passes what a program needs to run and nothing else", () => {
+    const env = mcpServerEnv({}, source, "linux");
+    expect(env).toEqual({ PATH: "/usr/bin", HOME: "/home/me", LANG: "de_DE.UTF-8" });
+  });
+
+  it("adds what the server's own entry names, over the inherited values", () => {
+    const env = mcpServerEnv({ GITHUB_TOKEN: "ghp_given", PATH: "/opt/bin" }, source, "darwin");
+    expect(env.GITHUB_TOKEN).toBe("ghp_given");
+    expect(env.PATH).toBe("/opt/bin");
+    expect(env.SOME_PROVIDER_API_KEY).toBeUndefined();
+  });
+
+  it("matches Windows names without case", () => {
+    const env = mcpServerEnv({}, { Path: "C:\\Windows", SystemRoot: "C:\\Windows", OPENAI_API_KEY: "sk" }, "win32");
+    expect(env).toEqual({ PATH: "C:\\Windows", SYSTEMROOT: "C:\\Windows" });
+  });
+
+  it("is what a spawned server actually sees", async () => {
+    const dump = join(root, "env.json");
+    const script = join(root, "env-server.mjs");
+    writeFileSync(script, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(dump)}, JSON.stringify(process.env)); process.exit(0);`);
+    process.env.CLIXAD_TEST_SECRET_FOR_MCP = "do-not-pass";
+    try {
+      await connect({ dumper: { command: process.execPath, args: [script], env: { GIVEN: "yes" } } });
+      const seen = JSON.parse(readFileSync(dump, "utf8")) as Record<string, string>;
+      expect(seen.CLIXAD_TEST_SECRET_FOR_MCP).toBeUndefined();
+      expect(seen.GIVEN).toBe("yes");
+      expect(seen.PATH).toBe(process.env.PATH);
+    } finally {
+      delete process.env.CLIXAD_TEST_SECRET_FOR_MCP;
+    }
   });
 });
 

@@ -9,7 +9,17 @@
  * dependency: the CLI ships standalone through npx and every dependency is
  * weight on someone else's `npm install`.
  *
- * Three rules hold the design together.
+ * Four rules hold the design together.
+ *
+ * **Nothing from a repository runs before the user says so.** `.mcp.json` and
+ * `.clixad/mcp.json` arrive with whatever was cloned, and starting a server is
+ * running a program. So a server from either is held, unstarted, until the user
+ * approves it, and the approval is bound to that server's entry exactly as
+ * written: a later change to its command asks again. Only `~/.clixad/mcp.json`,
+ * which the user wrote, starts on its own. And no server inherits this
+ * process's environment: it gets the handful of variables a program needs to
+ * run (`INHERITED_ENV`) plus what its own entry names, so an API key exported
+ * in the shell reaches a server only when its config asks for it by name.
  *
  * **A server that will not start is a warning, never a crash.** The config
  * points at other people's programs — a wrong path, an unset key, an npx
@@ -29,9 +39,10 @@
  * rewritten and de-duplicated rather than sent and rejected.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 /** How long a server gets to answer `initialize` and `tools/list`. */
 export const CONNECT_TIMEOUT_MS = 20_000;
@@ -70,8 +81,34 @@ export function isHttpConfig(c: McpServerConfig): c is McpHttpConfig {
   return (c as McpHttpConfig).url !== undefined;
 }
 
+/**
+ * Whose file a server came from. `user` is `~/.clixad/mcp.json`, written by the
+ * person at the keyboard; `project` is either file in the workspace, which came
+ * with the repository and starts nothing until approved.
+ */
+export type McpScope = "user" | "project";
+
+/** Where one server's config came from, and what the user is shown to approve it. */
+export interface McpServerOrigin {
+  scope: McpScope;
+  /** The file, `~`-shortened. */
+  file: string;
+  /**
+   * SHA-256 of the entry as written, before `${VAR}` expansion. An approval is
+   * for this and nothing else, so a changed command is a new question, while a
+   * changed value of a variable it names is not.
+   */
+  fingerprint: string;
+  /** The command line or URL as written, printable: control characters are escaped. */
+  display: string;
+  /** Every `${VAR}` the entry names: the environment it will be handed. */
+  variables: string[];
+}
+
 export interface LoadedMcpConfig {
   servers: Record<string, McpServerConfig>;
+  /** Per server, where its entry came from; the nearest file wins, as in `servers`. */
+  origins: Record<string, McpServerOrigin>;
   /** Files that contributed, nearest last — the same order they were merged in. */
   sources: string[];
   /** Files that exist but could not be used, with why. Surfaced by `/mcp`. */
@@ -88,16 +125,27 @@ export interface LoadedMcpConfig {
  * personal one without editing it.
  */
 export function mcpConfigPaths(root: string): string[] {
-  return [join(homedir(), ".clixad", "mcp.json"), join(root, ".mcp.json"), join(root, ".clixad", "mcp.json")];
+  return mcpConfigFiles(root).map((f) => f.path);
+}
+
+/** The same files with their scope. A workspace that *is* the home directory reads the personal file once. */
+function mcpConfigFiles(root: string): { path: string; scope: McpScope }[] {
+  const personal = join(homedir(), ".clixad", "mcp.json");
+  const files: { path: string; scope: McpScope }[] = [{ path: personal, scope: "user" }];
+  for (const path of [join(root, ".mcp.json"), join(root, ".clixad", "mcp.json")]) {
+    if (resolve(path) !== resolve(personal)) files.push({ path, scope: "project" });
+  }
+  return files;
 }
 
 /** Read and merge the config files that exist. Never throws. */
 export function loadMcpConfig(root: string): LoadedMcpConfig {
   const servers: Record<string, McpServerConfig> = {};
+  const origins: Record<string, McpServerOrigin> = {};
   const sources: string[] = [];
   const errors: string[] = [];
 
-  for (const path of mcpConfigPaths(root)) {
+  for (const { path, scope } of mcpConfigFiles(root)) {
     if (!existsSync(path)) continue;
     let parsed: unknown;
     try {
@@ -120,15 +168,28 @@ export function loadMcpConfig(root: string): LoadedMcpConfig {
     sources.push(short(path));
     for (const [name, raw] of Object.entries(declared as Record<string, unknown>)) {
       const config = validateServer(name, raw);
-      if (typeof config === "string") errors.push(`${short(path)}: ${config}`);
-      else servers[name] = config;
+      if (typeof config === "string") {
+        errors.push(`${short(path)}: ${config}`);
+        continue;
+      }
+      servers[name] = config;
+      origins[name] = {
+        scope,
+        file: short(path),
+        fingerprint: fingerprint(raw),
+        display: describeEntry(raw as Record<string, unknown>),
+        variables: [...new Set(variablesIn(raw))].sort(),
+      };
     }
   }
-  return { servers, sources, errors };
+  return { servers, origins, sources, errors };
 }
 
 /** A validated server config, or the reason it is not one. */
 function validateServer(name: string, raw: unknown): McpServerConfig | string {
+  // A name is printed in notices and in the approval prompt, so one carrying an
+  // escape sequence could repaint the terminal around the question it is in.
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(name)) return `server ${JSON.stringify(name)} has control characters in its name`;
   if (typeof raw !== "object" || raw === null) return `server "${name}" is not an object`;
   const c = raw as Record<string, unknown>;
   if (typeof c.url === "string") {
@@ -182,6 +243,179 @@ function short(path: string): string {
   return path.replace(homedir(), "~");
 }
 
+/** JSON with every object's keys sorted, so the same entry always hashes the same. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.keys(value as object)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson((value as Record<string, unknown>)[k])}`);
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function fingerprint(raw: unknown): string {
+  return createHash("sha256").update(canonicalJson(raw)).digest("hex");
+}
+
+/** Every `${VAR}` named anywhere in an entry. */
+function variablesIn(value: unknown): string[] {
+  if (typeof value === "string") return [...value.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g)].map((m) => m[1]!);
+  if (Array.isArray(value)) return value.flatMap(variablesIn);
+  if (value && typeof value === "object") return Object.values(value).flatMap(variablesIn);
+  return [];
+}
+
+/** Longest description printed in full; the file has the rest, and the prompt says so. */
+const MAX_DISPLAY_CHARS = 2_000;
+
+/**
+ * One word as it would be typed: bare when it is printable ASCII with no space
+ * or quote, otherwise quoted with every character outside printable ASCII
+ * written as `\uXXXX`. The prompt is the only thing between a repository and a
+ * running program, so what it shows has to be exactly what runs: an escape
+ * sequence must not be able to repaint it, and a right-to-left override must
+ * not be able to reorder it.
+ */
+function shellWord(word: string): string {
+  if (/^[\x21\x23-\x5b\x5d-\x7e]+$/.test(word)) return word;
+  return JSON.stringify(word).replace(/[^\x20-\x7e]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+/** An entry as the approval prompt shows it: the command line or URL, then its env, cwd and headers. */
+function describeEntry(raw: Record<string, unknown>): string {
+  const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+  const pairs = (v: unknown): [string, string][] =>
+    isStringMap(v) ? Object.entries(v) : [];
+  const lines: string[] = [];
+  if (typeof raw.url === "string") {
+    lines.push(`${raw.type === "sse" ? "sse" : "http"} ${shellWord(raw.url)}`);
+    for (const [k, v] of pairs(raw.headers)) lines.push(`header ${shellWord(k)}: ${shellWord(v)}`);
+  } else {
+    lines.push([String(raw.command ?? ""), ...strings(raw.args)].map(shellWord).join(" "));
+    for (const [k, v] of pairs(raw.env)) lines.push(`env ${shellWord(k)}=${shellWord(v)}`);
+    if (typeof raw.cwd === "string") lines.push(`cwd ${shellWord(raw.cwd)}`);
+  }
+  const text = lines.join("\n");
+  return text.length > MAX_DISPLAY_CHARS
+    ? `${text.slice(0, MAX_DISPLAY_CHARS)}… (${text.length - MAX_DISPLAY_CHARS} more characters; read the file before approving)`
+    : text;
+}
+
+// ---------------------------------------------------------------------------
+// What a server process is given
+// ---------------------------------------------------------------------------
+
+/**
+ * The variables a server inherits from this process, and nothing else.
+ *
+ * The MCP SDK's own default list (`getDefaultEnvironment`), plus the locale,
+ * the temp directory and the time zone, none of which is a secret. Everything
+ * else a server needs it names in its entry's `env`, usually as `${VAR}`, which
+ * is also how the approval prompt can say which secrets it will receive.
+ */
+export const INHERITED_ENV: Readonly<Record<"posix" | "win32", readonly string[]>> = {
+  posix: ["HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ"],
+  win32: [
+    "APPDATA",
+    "COMSPEC",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "PATH",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "PROGRAMFILES",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERNAME",
+    "USERPROFILE",
+    "WINDIR",
+  ],
+};
+
+/** The environment a stdio server is started with. */
+export function mcpServerEnv(
+  own: Record<string, string> = {},
+  source: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  const wanted = INHERITED_ENV[platform === "win32" ? "win32" : "posix"];
+  // Windows spells `Path` and `PATH` as one variable; match without case there.
+  const byName = new Map(Object.keys(source).map((k) => [platform === "win32" ? k.toUpperCase() : k, k]));
+  for (const name of wanted) {
+    const key = byName.get(name);
+    const value = key === undefined ? undefined : source[key];
+    // A value starting `()` is an exported bash function, the SDK's exclusion.
+    if (value !== undefined && !value.startsWith("()")) env[name] = value;
+  }
+  return { ...env, ...own };
+}
+
+// ---------------------------------------------------------------------------
+// Approvals
+// ---------------------------------------------------------------------------
+
+export type McpDecision = "approved" | "declined";
+
+interface ApprovalsFile {
+  version: 1;
+  /** Per workspace (its real path), per server name: the entry decided on, and how. */
+  projects: Record<string, Record<string, { fingerprint: string; decision: McpDecision; at: string }>>;
+}
+
+/** Where the decisions are kept. In the home directory, so nothing in a workspace can answer for the user. */
+export function mcpApprovalsPath(): string {
+  return join(homedir(), ".clixad", "mcp-approvals.json");
+}
+
+function workspaceKey(root: string): string {
+  try {
+    return realpathSync.native(root);
+  } catch {
+    return resolve(root);
+  }
+}
+
+/** The decisions on disk. A file that cannot be read is no decisions, so everything is asked again. */
+function readApprovals(): ApprovalsFile {
+  try {
+    const parsed = JSON.parse(readFileSync(mcpApprovalsPath(), "utf8")) as ApprovalsFile;
+    if (parsed?.version === 1 && parsed.projects && typeof parsed.projects === "object") return parsed;
+  } catch {
+    /* none yet, or unreadable */
+  }
+  return { version: 1, projects: {} };
+}
+
+/** What the user decided about this server in this workspace, if it was this exact entry. */
+export function mcpDecision(root: string, name: string, fingerprint: string): McpDecision | undefined {
+  const entry = readApprovals().projects[workspaceKey(root)]?.[name];
+  return entry && entry.fingerprint === fingerprint ? entry.decision : undefined;
+}
+
+/** Remember a decision about these servers in this workspace. Written whole through a rename. */
+export function recordMcpDecision(
+  root: string,
+  servers: { name: string; fingerprint: string }[],
+  decision: McpDecision,
+  at: Date = new Date(),
+): void {
+  const file = readApprovals();
+  const key = workspaceKey(root);
+  const project = (file.projects[key] ??= {});
+  for (const server of servers) project[server.name] = { fingerprint: server.fingerprint, decision, at: at.toISOString() };
+  const path = mcpApprovalsPath();
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  renameSync(tmp, path);
+}
+
 // ---------------------------------------------------------------------------
 // JSON-RPC transports
 // ---------------------------------------------------------------------------
@@ -214,10 +448,13 @@ class StdioTransport implements Transport {
   constructor(config: McpStdioConfig, root: string) {
     this.child = spawn(config.command, config.args ?? [], {
       cwd: config.cwd ?? root,
-      // The server's own env plus ours. `shell: false` on purpose: the command
-      // and its args are already separate, so there is nothing for a shell to
-      // re-split, and a path with a space in it would be split if there were.
-      env: { ...process.env, ...(config.env ?? {}) },
+      // What a program needs to run plus what the entry names, and never the
+      // rest of ours: this process's environment holds whatever the user
+      // exported, API keys included, and a server is somebody else's program.
+      // `shell: false` on purpose: the command and its args are already
+      // separate, so there is nothing for a shell to re-split, and a path with
+      // a space in it would be split if there were.
+      env: mcpServerEnv(config.env),
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
       // npx and friends are .cmd shims on Windows, which CreateProcess cannot
@@ -460,7 +697,12 @@ export interface McpToolInfo {
   inputSchema?: Record<string, unknown>;
 }
 
-export type McpState = "connecting" | "ready" | "failed" | "closed";
+/**
+ * `unapproved`: from the repository and not yet approved, so not started.
+ * `declined`: the user said not to start it, for this exact entry.
+ * Neither has a process or a connection behind it.
+ */
+export type McpState = "unapproved" | "declined" | "connecting" | "ready" | "failed" | "closed";
 
 export interface McpStatus {
   name: string;
@@ -470,6 +712,15 @@ export interface McpStatus {
   error?: string;
 }
 
+/** A server waiting on the user, as the approval prompt shows it. */
+export interface McpPendingServer {
+  name: string;
+  file: string;
+  display: string;
+  variables: string[];
+  fingerprint: string;
+}
+
 /** Text and any images one `tools/call` returned. */
 export interface McpToolResult {
   text: string;
@@ -477,26 +728,46 @@ export interface McpToolResult {
 }
 
 export class McpServerConnection {
-  state: McpState = "connecting";
+  state: McpState;
   error?: string;
   tools: McpToolInfo[] = [];
-  private transport: Transport;
+  /**
+   * Created by `connect()` and nowhere else, because creating a stdio
+   * transport *is* starting the program. A held connection never has one.
+   */
+  private transport?: Transport;
 
   constructor(
     readonly name: string,
     readonly config: McpServerConfig,
-    root: string,
+    private readonly root: string,
+    readonly origin?: McpServerOrigin,
+    held?: "unapproved" | "declined",
   ) {
-    this.transport = isHttpConfig(config) ? new HttpTransport(config) : new StdioTransport(config, root);
+    this.state = held ?? "connecting";
   }
 
   get kind(): "stdio" | "http" {
     return isHttpConfig(this.config) ? "http" : "stdio";
   }
 
+  /** Lift the hold, after the user approved. Starts nothing by itself. */
+  release(): void {
+    if (this.state === "unapproved" || this.state === "declined") this.state = "connecting";
+  }
+
+  /** Remember a refusal, so `/mcp` can say why it is not running. */
+  decline(): void {
+    if (this.state === "unapproved") this.state = "declined";
+  }
+
   async connect(timeoutMs = CONNECT_TIMEOUT_MS): Promise<void> {
+    // Held, already connected or failed, or closed: there is nothing to start.
+    if (this.state !== "connecting" || this.transport) return;
+    const transport = isHttpConfig(this.config) ? new HttpTransport(this.config) : new StdioTransport(this.config, this.root);
+    this.transport = transport;
     try {
-      await this.transport.request(
+      await transport.request(
         "initialize",
         {
           protocolVersion: PROTOCOL_VERSION,
@@ -507,8 +778,8 @@ export class McpServerConnection {
       );
       // Required by the spec before any other request; a strict server refuses
       // `tools/list` without it.
-      await this.transport.notify("notifications/initialized", {});
-      const listed = (await this.transport.request("tools/list", {}, timeoutMs)) as {
+      await transport.notify("notifications/initialized", {});
+      const listed = (await transport.request("tools/list", {}, timeoutMs)) as {
         tools?: { name?: unknown; description?: unknown; inputSchema?: unknown }[];
       };
       this.tools = (listed?.tools ?? [])
@@ -522,17 +793,20 @@ export class McpServerConnection {
           ...(typeof t.description === "string" ? { description: t.description } : {}),
           ...(t.inputSchema && typeof t.inputSchema === "object" ? { inputSchema: t.inputSchema } : {}),
         }));
+      // Closed while the handshake was running: stay closed.
+      if (this.state !== "connecting") return;
       this.state = "ready";
     } catch (err) {
+      if (this.state !== "connecting") return;
       this.state = "failed";
-      const diagnostics = this.transport.diagnostics();
+      const diagnostics = transport.diagnostics();
       this.error = (err as Error).message + (diagnostics ? `\n  ${diagnostics.split("\n").slice(-3).join("\n  ")}` : "");
-      await this.transport.close().catch(() => undefined);
+      await transport.close().catch(() => undefined);
     }
   }
 
   async call(tool: string, args: unknown, timeoutMs: number, signal?: AbortSignal): Promise<McpToolResult> {
-    if (this.state !== "ready") throw new McpError(`server "${this.name}" is ${this.state}`);
+    if (this.state !== "ready" || !this.transport) throw new McpError(`server "${this.name}" is ${this.state}`);
     const raw = (await this.transport.request(
       "tools/call",
       { name: tool, arguments: args ?? {} },
@@ -553,7 +827,7 @@ export class McpServerConnection {
 
   async close(): Promise<void> {
     this.state = "closed";
-    await this.transport.close().catch(() => undefined);
+    await this.transport?.close().catch(() => undefined);
   }
 }
 
@@ -611,11 +885,16 @@ export function isMcpToolName(name: string): boolean {
 }
 
 export class McpHub {
-  private constructor(readonly servers: McpServerConnection[]) {}
+  private constructor(
+    readonly servers: McpServerConnection[],
+    private readonly root: string,
+  ) {}
 
   /**
-   * Connect to every configured server, in parallel, and never reject.
+   * Connect to every server given, in parallel, and never reject.
    *
+   * For servers the caller has already decided may run; a config read from
+   * disk goes through `fromConfig`, which holds the repository's servers.
    * Parallel because a slow server must not delay the others, and one that
    * cannot start must not delay anything: the whole point is that the REPL opens
    * whether or not somebody's Docker daemon is running today.
@@ -625,26 +904,114 @@ export class McpHub {
     opts: { root: string; timeoutMs?: number } = { root: process.cwd() },
   ): Promise<McpHub> {
     const connections = Object.entries(servers).map(([name, config]) => new McpServerConnection(name, config, opts.root));
-    await Promise.all(connections.map((c) => c.connect(opts.timeoutMs)));
+    const hub = new McpHub(connections, opts.root);
+    await hub.startReleased(opts.timeoutMs);
+    return hub;
+  }
 
-    // Assign qualified names once every server has listed, so a collision — two
-    // servers with the same tool, or two long names that truncate together — is
-    // visible and can be broken deterministically.
-    const taken = new Set<string>();
-    for (const conn of connections) {
+  /**
+   * A hub for the config on disk, with nothing started yet.
+   *
+   * A server from `~/.clixad/mcp.json` is ready to start. A server from the
+   * workspace is held unless the user approved this exact entry for this
+   * workspace before, and stays held if they declined it. `startReleased`
+   * then starts what may start; `approve` releases the rest.
+   */
+  static fromConfig(loaded: LoadedMcpConfig, opts: { root: string }): McpHub {
+    const connections = Object.entries(loaded.servers).map(([name, config]) => {
+      const origin = loaded.origins[name];
+      let held: "unapproved" | "declined" | undefined;
+      // No origin means nothing says where it came from, which is not a reason to trust it.
+      if (!origin || origin.scope !== "user") {
+        const decision = origin ? mcpDecision(opts.root, name, origin.fingerprint) : undefined;
+        held = decision === "approved" ? undefined : decision === "declined" ? "declined" : "unapproved";
+      }
+      return new McpServerConnection(name, config, opts.root, origin, held);
+    });
+    return new McpHub(connections, opts.root);
+  }
+
+  /** An empty hub — what a run with no config, or a scripted run, gets. */
+  static empty(): McpHub {
+    return new McpHub([], process.cwd());
+  }
+
+  /**
+   * Start every server that may start and has not been, in parallel. Returns
+   * the ones it started, so the caller can say how each one went.
+   */
+  async startReleased(timeoutMs?: number): Promise<McpStatus[]> {
+    const starting = this.servers.filter((s) => s.state === "connecting");
+    await Promise.all(starting.map((c) => c.connect(timeoutMs)));
+    this.assignNames();
+    const names = new Set(starting.map((s) => s.name));
+    return this.status().filter((s) => names.has(s.name));
+  }
+
+  /**
+   * Give every listed tool its model-facing name. Names already given keep
+   * theirs, so a server approved later cannot rename a tool the model has
+   * already been told about. A collision (two servers with the same tool, or
+   * two long names that truncate together) is broken deterministically.
+   */
+  private assignNames(): void {
+    const taken = new Set(this.servers.flatMap((s) => s.tools.map((t) => t.qualified)).filter(Boolean));
+    for (const conn of this.servers) {
       for (const tool of conn.tools) {
+        if (tool.qualified) continue;
         let name = qualifiedToolName(conn.name, tool.name);
         for (let i = 2; taken.has(name); i++) name = `${name.slice(0, 61)}_${i}`;
         taken.add(name);
         tool.qualified = name;
       }
     }
-    return new McpHub(connections);
   }
 
-  /** An empty hub — what a run with no config, or a scripted run, gets. */
-  static empty(): McpHub {
-    return new McpHub([]);
+  /** The servers waiting for the user, with what the prompt shows. */
+  pending(opts: { includeDeclined?: boolean } = {}): McpPendingServer[] {
+    return this.servers
+      .filter((s) => s.state === "unapproved" || (opts.includeDeclined && s.state === "declined"))
+      .map((s) => ({
+        name: s.name,
+        file: s.origin?.file ?? "",
+        display: s.origin?.display ?? "",
+        variables: s.origin?.variables ?? [],
+        fingerprint: s.origin?.fingerprint ?? "",
+      }));
+  }
+
+  /**
+   * The user approved these held servers: remember it (bound to each entry as
+   * written) when asked to, and start them. Names that are not held are
+   * ignored. Returns how each one started.
+   */
+  async approve(names: string[], opts: { remember: boolean; timeoutMs?: number }): Promise<McpStatus[]> {
+    const chosen = this.held(names);
+    if (opts.remember) this.remember(chosen, "approved");
+    for (const s of chosen) s.release();
+    return this.startReleased(opts.timeoutMs);
+  }
+
+  /** The user declined these held servers: remember it, so they are not asked about again until the entry changes. */
+  decline(names: string[]): void {
+    const chosen = this.held(names).filter((s) => s.state === "unapproved");
+    this.remember(chosen, "declined");
+    for (const s of chosen) s.decline();
+  }
+
+  private held(names: string[]): McpServerConnection[] {
+    const wanted = new Set(names);
+    return this.servers.filter((s) => wanted.has(s.name) && (s.state === "unapproved" || s.state === "declined"));
+  }
+
+  private remember(servers: McpServerConnection[], decision: McpDecision): void {
+    const entries = servers.filter((s) => s.origin).map((s) => ({ name: s.name, fingerprint: s.origin!.fingerprint }));
+    if (!entries.length) return;
+    try {
+      recordMcpDecision(this.root, entries, decision);
+    } catch {
+      // Not remembered is not wrong: the next session asks again.
+    }
   }
 
   tools(): McpToolInfo[] {

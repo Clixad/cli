@@ -18,4 +18,5 @@ snippet if that is the clearest way to say it.
 
 ## Security problems
 
-Please do not open a public issue. See [SECURITY.md](SECURITY.md).
+Please do not open a public issue. Email them to [info@clixad.io](mailto:info@clixad.io); see
+[SECURITY.md](SECURITY.md).

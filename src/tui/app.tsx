@@ -48,7 +48,7 @@ import {
   type StreakInfo,
   type WalletInfo,
 } from "../client.ts";
-import { loadMcpConfig, McpHub } from "../mcp.ts";
+import { loadMcpConfig, McpHub, type McpPendingServer, type McpStatus } from "../mcp.ts";
 import { TodoList } from "../todos.ts";
 import { shells } from "../shells.ts";
 import { saveConfig, saveEffort, type CliConfig } from "../config.ts";
@@ -1572,31 +1572,11 @@ export function App({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- run once
   }, []);
 
-  /**
-   * Connect the configured MCP servers, in the background.
-   *
-   * Never awaited by anything on the startup path: these are other people's
-   * programs — a wrong path, an unset key, an npx package that no longer
-   * publishes — and none of that may be a reason a coding agent takes six
-   * seconds to open, or fails to. Tools appear when they appear, and a server
-   * that never comes up is a line in `/mcp` rather than an error here.
-   */
-  useEffect(() => {
-    const { servers, errors } = loadMcpConfig(root);
-    // A config with a trailing comma that silently does nothing is
-    // indistinguishable from a feature that does not work, so say so.
-    for (const problem of errors) push({ kind: "notice", tone: "warn", text: `  mcp config — ${problem}` });
-    const names = Object.keys(servers);
-    if (names.length === 0) return;
-
-    let cancelled = false;
-    void McpHub.connect(servers, { root }).then((hub) => {
-      // Unmounted while connecting: hand the servers back rather than leaking
-      // a child process per one of them.
-      if (cancelled) return void hub.close();
-      mcpRef.current = hub;
-      const ready = hub.status().filter((s) => s.state === "ready");
-      const failed = hub.status().filter((s) => s.state === "failed");
+  /** Say how servers that were just started came up: one line for the ready ones, one per failure. */
+  const reportMcpStarted = useCallback(
+    (started: McpStatus[]) => {
+      const ready = started.filter((s) => s.state === "ready");
+      const failed = started.filter((s) => s.state === "failed");
       if (ready.length) {
         push({
           kind: "notice",
@@ -1606,11 +1586,101 @@ export function App({
       for (const server of failed) {
         push({ kind: "notice", tone: "warn", text: `  mcp: ${server.name} did not start — ${server.error}` });
       }
+    },
+    [push],
+  );
+
+  /**
+   * Put the workspace's held MCP servers to the user, and start them only on a yes.
+   *
+   * Each server is printed first, as it will run: the command line or URL, the
+   * file it came from and every environment variable it will be handed, which is
+   * the part that decides what it can read. The picker then asks once for all of
+   * them. Esc is "not now": nothing starts, and the next session asks again.
+   */
+  const askMcpApproval = useCallback(
+    (hub: McpHub, pending: McpPendingServer[]) => {
+      if (!pending.length) return;
+      const files = [...new Set(pending.map((p) => p.file))].join(" and ");
+      push({
+        kind: "notice",
+        tone: "warn",
+        text:
+          `  ${files} in this project ${pending.length === 1 ? "wants to start an MCP server" : `wants to start ${pending.length} MCP servers`}. ` +
+          "A server is a program that runs on this machine; nothing has been started.\n" +
+          pending
+            .map(
+              (p) =>
+                `    ${p.name}\n` +
+                p.display
+                  .split("\n")
+                  .map((line) => `      ${line}`)
+                  .join("\n") +
+                `\n      environment it gets: ${p.variables.length ? p.variables.join(", ") : "none beyond PATH, HOME and the locale"}`,
+            )
+            .join("\n"),
+      });
+      const names = pending.map((p) => p.name);
+      setPickerSel(1);
+      setPicker({
+        title: pending.length === 1 ? `Start the MCP server "${names[0]}"?` : `Start these ${pending.length} MCP servers?`,
+        subtitle: "Only if you trust this project · esc: not now",
+        items: [
+          { value: "approve", label: "Yes, start", hint: "and remember it for this project until the config changes" },
+          { value: "later", label: "Not now", hint: "ask again next time · /mcp approve starts them" },
+          { value: "decline", label: "No", hint: "and don't ask again until the config changes" },
+        ],
+        onPick: (choice) => {
+          if (choice.value === "approve") {
+            push({ kind: "notice", text: `  mcp: starting ${names.join(", ")}` });
+            void hub.approve(names, { remember: true }).then(reportMcpStarted);
+          } else if (choice.value === "decline") {
+            hub.decline(names);
+            push({ kind: "notice", text: `  mcp: not starting ${names.join(", ")} · /mcp approve starts them` });
+          } else {
+            push({ kind: "notice", text: "  mcp: not started · /mcp approve starts them" });
+          }
+        },
+        onCancel: () => push({ kind: "notice", text: "  mcp: not started · /mcp approve starts them" }),
+      });
+    },
+    [push, reportMcpStarted],
+  );
+
+  /**
+   * Connect the configured MCP servers, in the background.
+   *
+   * Never awaited by anything on the startup path: these are other people's
+   * programs — a wrong path, an unset key, an npx package that no longer
+   * publishes — and none of that may be a reason a coding agent takes six
+   * seconds to open, or fails to. Tools appear when they appear, and a server
+   * that never comes up is a line in `/mcp` rather than an error here.
+   *
+   * **Only the user's own servers start here.** A server from the workspace's
+   * `.mcp.json` or `.clixad/mcp.json` came with the repository and is held
+   * (`McpHub.fromConfig`) until the user approves it: it used to be spawned
+   * the moment the REPL mounted, with this process's whole environment.
+   */
+  useEffect(() => {
+    const loaded = loadMcpConfig(root);
+    // A config with a trailing comma that silently does nothing is
+    // indistinguishable from a feature that does not work, so say so.
+    for (const problem of loaded.errors) push({ kind: "notice", tone: "warn", text: `  mcp config — ${problem}` });
+    if (Object.keys(loaded.servers).length === 0) return;
+
+    const hub = McpHub.fromConfig(loaded, { root });
+    mcpRef.current = hub;
+    let cancelled = false;
+    void hub.startReleased().then((started) => {
+      if (!cancelled) reportMcpStarted(started);
     });
+    askMcpApproval(hub, hub.pending());
 
     return () => {
       cancelled = true;
-      void mcpRef.current.close();
+      // Unmounted, or unmounted while connecting: hand the servers back rather
+      // than leaking a child process per one of them.
+      void hub.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- run once
   }, []);
@@ -3652,7 +3722,31 @@ export function App({
           return;
         }
         case "mcp": {
-          const status = mcpRef.current.status();
+          const hub = mcpRef.current;
+          const [verb, ...targets] = arg.split(/\s+/).filter(Boolean);
+          // `/mcp approve [name…|all]`: the way to start a server from this
+          // project after "not now" or "no", or one added since the prompt.
+          // Named servers start; bare or `all` puts every held one to the user
+          // again, so nothing starts without the command line on screen.
+          if (verb === "approve") {
+            const held = hub.pending({ includeDeclined: true });
+            if (!held.length) {
+              push({ kind: "notice", text: "  no MCP servers waiting for approval" });
+              return;
+            }
+            if (!targets.length || targets.includes("all")) return askMcpApproval(hub, held);
+            const unknown = targets.filter((t) => !held.some((h) => h.name === t));
+            if (unknown.length) {
+              push({
+                kind: "notice",
+                tone: "warn",
+                text: `  not waiting for approval: ${unknown.join(", ")} · waiting: ${held.map((h) => h.name).join(", ")}`,
+              });
+              return;
+            }
+            return askMcpApproval(hub, held.filter((h) => targets.includes(h.name)));
+          }
+          const status = hub.status();
           if (!status.length) {
             push({
               kind: "notice",
@@ -3662,15 +3756,18 @@ export function App({
             });
             return;
           }
+          const label: Partial<Record<McpStatus["state"], string>> = { unapproved: "not approved", declined: "declined" };
+          const anyHeld = status.some((s) => s.state === "unapproved" || s.state === "declined");
           push({
             kind: "notice",
-            text: status
-              .map((s) => {
-                const head = `  ${s.name.padEnd(16)} ${s.state.padEnd(10)} ${s.transport}`;
-                if (s.state === "ready") return `${head}  ${s.toolCount} tool${s.toolCount === 1 ? "" : "s"}`;
-                return s.error ? `${head}\n    ${s.error.split("\n").join("\n    ")}` : head;
-              })
-              .join("\n"),
+            text:
+              status
+                .map((s) => {
+                  const head = `  ${s.name.padEnd(16)} ${(label[s.state] ?? s.state).padEnd(12)} ${s.transport}`;
+                  if (s.state === "ready") return `${head}  ${s.toolCount} tool${s.toolCount === 1 ? "" : "s"}`;
+                  return s.error ? `${head}\n    ${s.error.split("\n").join("\n    ")}` : head;
+                })
+                .join("\n") + (anyHeld ? "\n  /mcp approve shows what a server runs and starts it" : ""),
           });
           return;
         }
@@ -3720,7 +3817,7 @@ export function App({
           push({ kind: "notice", tone: "warn", text: `  unknown command: /${cmd} — try /help` });
       }
     },
-    [client, cols, config, cycleMode, exit, model, modelTaskHints, premium, push, replayConversation, root, runAdWall, runBusy, runBuy, runLogin, runTurn, setPremium, writeToStdout],
+    [askMcpApproval, client, cols, config, cycleMode, exit, model, modelTaskHints, premium, push, replayConversation, root, runAdWall, runBusy, runBuy, runLogin, runTurn, setPremium, writeToStdout],
   );
 
   /**

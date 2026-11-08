@@ -11,8 +11,19 @@
  * `permissions.ts` and the dialog in the TUI.
  */
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, type Dirent } from "node:fs";
-import { isAbsolute, relative, resolve, dirname, join, sep } from "node:path";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+  type Dirent,
+} from "node:fs";
+import { basename, isAbsolute, relative, resolve, dirname, join, sep } from "node:path";
 import { diffView, renderDiff, type DiffView } from "./diff.ts";
 import { extractPdfText, looksLikePdf } from "./pdf.ts";
 import { killTree, shells, ShellError, type ShellRegistry, type ShellSnapshot } from "./shells.ts";
@@ -41,20 +52,104 @@ export class PermissionDeniedError extends ToolError {
 /**
  * Confine a possibly-relative path to `root`; throw on escape attempts.
  *
- * Exported because `mentions.ts` resolves `@path` references and has to apply
- * *this* rule rather than one that looks like it: two implementations of a
- * sandbox check is how a sandbox develops a hole.
+ * Two checks, and the second is the one that holds. The first is on the path
+ * as written (`../`, an absolute path elsewhere). The second is on where the
+ * path **really lands** once every symlink in it is followed: a link inside
+ * the workspace that points outside it (`notes.txt -> ~/.ssh/id_rsa`, or a
+ * linked directory) passed the first check, and `readFileSync` follows links,
+ * so a cloned repository could hand the agent any file on the machine. A link
+ * that stays inside the workspace still works.
+ *
+ * The path returned is the one as written, so what the user and the model are
+ * shown does not change; only whether it is allowed does.
+ *
+ * Exported because `mentions.ts` and `context.ts` read workspace files and have
+ * to apply *this* rule rather than one that looks like it: two implementations
+ * of a sandbox check is how a sandbox develops a hole.
  */
 export function safeResolve(root: string, p: string): string {
   const abs = isAbsolute(p) ? p : resolve(root, p);
+  if (escapes(root, abs)) throw new ToolError(`path escapes workspace: ${p}`);
+  let real: string;
+  let realRoot: string;
+  try {
+    real = realLocation(abs);
+    realRoot = realLocation(resolve(root));
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    throw new ToolError(code === "ELOOP" ? `${p}: the path goes through a symlink loop` : `cannot resolve ${p}`);
+  }
+  if (escapes(realRoot, real)) {
+    throw new ToolError(`path escapes workspace: ${p} is a symlink (or inside one) that points outside the workspace`);
+  }
+  return abs;
+}
+
+/** Whether `abs` lies outside `root`, compared as paths. */
+function escapes(root: string, abs: string): boolean {
   const rel = relative(root, abs);
   // Only a leading `..` *segment* escapes. A bare `startsWith("..")` also rejected
   // real in-workspace files whose names merely begin with dots (`..gitignore`),
   // which read to the model as a sandbox violation it could do nothing about.
-  if (rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel)) {
-    throw new ToolError(`path escapes workspace: ${p}`);
+  return rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel);
+}
+
+/** The kernel's own limit on links followed in one lookup. */
+const MAX_LINK_HOPS = 40;
+
+/**
+ * Where `abs` really is once every symlink in it is followed, for a path that
+ * exists and for one that does not yet.
+ *
+ * `realpathSync` answers the first. The second matters for writes: a link to a
+ * file that does not exist yet (`out.txt -> /elsewhere/new.txt`) has no real
+ * path, and `writeFileSync` would follow it and create the file at the other
+ * end. So a missing path is its real parent plus its name, and a dangling link
+ * is followed by hand to the place a write would land. Throws ELOOP past
+ * `MAX_LINK_HOPS`, and passes on anything else (EACCES) for the caller to
+ * refuse.
+ */
+function realLocation(abs: string, hops = 0): string {
+  try {
+    return realpathSync.native(abs);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
   }
-  return abs;
+  const parent = dirname(abs);
+  if (parent === abs) return abs;
+  let link: string | undefined;
+  try {
+    if (lstatSync(abs).isSymbolicLink()) link = readlinkSync(abs);
+  } catch {
+    /* not there at all: its parent decides */
+  }
+  const realParent = realLocation(parent, hops);
+  if (link === undefined) return join(realParent, basename(abs));
+  if (hops >= MAX_LINK_HOPS) throw Object.assign(new Error("too many symlinks"), { code: "ELOOP" });
+  return realLocation(resolve(realParent, link), hops + 1);
+}
+
+/**
+ * The workspace's real path, for checking entries found while walking it.
+ * Falls back to the path as given when it cannot be resolved, which can only
+ * make the check stricter.
+ */
+function realRootOf(root: string): string {
+  try {
+    return realLocation(resolve(root));
+  } catch {
+    return resolve(root);
+  }
+}
+
+/** Whether a symlink found while walking or listing points inside the workspace. */
+function linkStaysInside(abs: string, realRoot: string): boolean {
+  try {
+    return !escapes(realRoot, realpathSync.native(abs));
+  } catch {
+    return false;
+  }
 }
 
 /** Workspace-relative, forward-slashed — what we show the user and match globs against. */
@@ -313,12 +408,15 @@ function describeValue(value: unknown): string {
  * entirely, and why `list_dir` had to `stat` each name and died on the first
  * dangling link it met. One guarded `stat`, and only for the entries that need
  * it: a link pointing at nothing is `other`, which is the honest answer and the
- * one both callers want.
+ * one both callers want. So is a link pointing outside the workspace.
  */
-function entryKind(entry: Dirent, abs: string): "dir" | "file" | "other" {
+function entryKind(entry: Dirent, abs: string, realRoot: string): "dir" | "file" | "other" {
   if (entry.isDirectory()) return "dir";
   if (entry.isFile()) return "file";
   if (!entry.isSymbolicLink()) return "other"; // sockets, fifos, devices
+  // A link out of the workspace is `other`: not read by `grep`, not listed by
+  // `glob`, and not even `stat`ed, so what sits at the other end stays unknown.
+  if (!linkStaysInside(abs, realRoot)) return "other";
   try {
     const stat = statSync(abs);
     return stat.isDirectory() ? "dir" : stat.isFile() ? "file" : "other";
@@ -539,9 +637,10 @@ export const TOOLS = {
     // take the turn with it. A symlink still gets its own `stat`, because
     // whether it points at a directory is the one thing the entry cannot say,
     // and that one is guarded.
+    const realRoot = realRootOf(ctx.root);
     const entries = fsCall(`cannot list ${name}`, () => readdirSync(abs, { withFileTypes: true })).map(
       (entry) => {
-        const isDir = entryKind(entry, resolve(abs, entry.name)) === "dir";
+        const isDir = entryKind(entry, resolve(abs, entry.name), realRoot) === "dir";
         return { name: isDir ? `${entry.name}/` : entry.name, isDir };
       },
     );
@@ -622,6 +721,9 @@ export const TOOLS = {
       path: name,
       root: ctx.root,
     });
+    // Checked again after the gate: the dialog can sit open for minutes, and a
+    // path that was a file when it was asked about may be a link out by now.
+    safeResolve(ctx.root, abs);
     fsCall(`cannot write ${name}`, () => {
       mkdirSync(dirname(abs), { recursive: true });
       writeFileSync(abs, content, "utf8");
@@ -681,6 +783,7 @@ export const TOOLS = {
       path: name,
       root: ctx.root,
     });
+    safeResolve(ctx.root, abs); // again after the gate, `write_file`'s reason
     fsCall(`cannot edit ${name}`, () => writeFileSync(abs, after, "utf8"));
     ctx.present?.(view);
     return `edited ${name} (${count > 1 ? `${count} occurrences` : "1 occurrence"})`;
@@ -1213,17 +1316,20 @@ export function listWorkspaceFiles(root: string, limit = 5000): string[] {
  * in this file: nothing retries it, and the model concludes the code does not
  * exist.
  *
- * Symlinked **files** are walked like any other file; symlinked
- * **directories** are not descended into. A linked file is a file somebody put
- * in the tree on purpose and was skipped entirely before (`isFile()` is false
- * for a symlink), while descending into a linked directory is how a
- * depth-first walk finds its way into a cycle.
+ * Symlinked **files** are walked like any other file as long as they point
+ * inside the workspace; symlinked **directories** are not descended into. A
+ * linked file is a file somebody put in the tree on purpose and was skipped
+ * entirely before (`isFile()` is false for a symlink), while descending into a
+ * linked directory is how a depth-first walk finds its way into a cycle. A
+ * link that points outside the workspace is skipped (`entryKind`), or `grep`
+ * would read whatever it names.
  */
 function walk(dir: string, root: string, visit: (abs: string) => boolean): void {
   if (isFilePath(dir)) {
     visit(dir);
     return;
   }
+  const realRoot = realRootOf(root);
   let seen = 0;
   const stack = [dir];
   while (stack.length > 0) {
@@ -1236,7 +1342,7 @@ function walk(dir: string, root: string, visit: (abs: string) => boolean): void 
     }
     for (const entry of entries) {
       const abs = join(current, entry.name);
-      const kind = entryKind(entry, abs);
+      const kind = entryKind(entry, abs, realRoot);
       if (kind === "dir") {
         // A directory reached through a symlink is skipped rather than
         // descended: see the note above about cycles. Everything else is
@@ -1251,7 +1357,6 @@ function walk(dir: string, root: string, visit: (abs: string) => boolean): void 
       if (!visit(abs)) return;
     }
   }
-  void root;
 }
 
 /**

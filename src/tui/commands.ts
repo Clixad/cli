@@ -62,7 +62,7 @@ export const COMMANDS: SlashCommand[] = [
   // enter complete the command instead of running it, and listing is what both
   // are for. `/bg kill <id>` still works when typed in full.
   { name: "bg", desc: "background commands the agent started" },
-  { name: "mcp", desc: "connected MCP servers and their tools" },
+  { name: "mcp", desc: "MCP servers and their tools (approve: start one from this project)" },
   { name: "exit", desc: "quit clixad" },
 ];
 
