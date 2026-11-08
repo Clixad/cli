@@ -1,6 +1,6 @@
 {
   "name": "clixad",
-  "version": "0.0.1-beta.47",
+  "version": "0.0.1-beta.48",
   "description": "Free AI coding agent in your terminal, funded by rewarded ads.",
   "license": "Apache-2.0",
   "type": "module",
