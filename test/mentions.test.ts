@@ -77,8 +77,32 @@ describe("expandMentions", () => {
     writeFileSync(join(root, "big.txt"), "x".repeat(5000));
     const { text, attached } = expandMentions("@big.txt", root, 500);
     expect(attached).toEqual(["big.txt"]);
-    expect(text).toContain("attachment truncated");
+    // Cut where the room ends, and said where it is.
+    expect(text).toContain("characters left out");
     expect(text.length).toBeLessThan(2000);
+  });
+
+  it("attaches a long file up to a whole line that fits, and says which lines went in", () => {
+    // 2026-11-08: `@notes.md` naming a 430 kB markdown file made
+    // a message no model with a small window could be sent.
+    const lines = Array.from({ length: 3_000 }, (_, i) => `line ${i + 1}: ${"words ".repeat(12)}`);
+    writeFileSync(join(root, "long.md"), `${lines.join("\n")}\n`);
+    const { text, attached, partial } = expandMentions("summarise @long.md", root, 20_000);
+    expect(attached).toEqual(["long.md"]);
+    expect(partial).toHaveLength(1);
+    const p = partial[0]!;
+    expect(p).toMatchObject({ path: "long.md", from: 1, total: 3_000 });
+    expect(p.to).toBeGreaterThan(100);
+    expect(p.to).toBeLessThan(3_000);
+    // The last line in it is whole, and the model is told where to read on.
+    expect(text).toContain(`line ${p.to}: ${"words ".repeat(12).trimEnd()}`);
+    expect(text).not.toContain(`line ${p.to + 1}:`);
+    expect(text).toContain(`Read on with offset: ${p.to + 1}.`);
+    expect(Buffer.byteLength(JSON.stringify(text))).toBeLessThan(20_000 + 1_000);
+  });
+
+  it("says nothing is partial when every file went in whole", () => {
+    expect(expandMentions("diff @src/b.ts against @src/a.ts", root).partial).toEqual([]);
   });
 
   it("attaches several files in the order they were mentioned", () => {

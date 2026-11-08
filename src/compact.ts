@@ -22,7 +22,7 @@
  * meant to fix.
  */
 import type { AgentClient } from "./agent.ts";
-import { messageText, type ChatMessage, type ContentPart, type Spendable } from "./client.ts";
+import { messageText, type ChatMessage, type ChatTurn, type ContentPart, type Spendable } from "./client.ts";
 
 /** Rough token estimate — ~4 chars per token is close enough to decide *when*. */
 export function estimateTokens(text: string): number {
@@ -61,9 +61,35 @@ export function conversationTokens(messages: ChatMessage[]): number {
 
 export const COMPACT_THRESHOLD = 0.75;
 
-export function shouldCompact(messages: ChatMessage[], contextTokens: number, threshold = COMPACT_THRESHOLD): boolean {
-  return conversationTokens(messages) > contextTokens * threshold;
+/**
+ * Whether `messages` (system prompt first) weigh more than the budget, by
+ * `requestTokens`. It counted characters until 2026-11-08, which reads a
+ * conversation in a script of three bytes a character as a third of what the
+ * gateway counts it as.
+ */
+export function shouldCompact(messages: ChatMessage[], contextTokens: number): boolean {
+  return requestTokens(messages) > compactBudget(contextTokens);
 }
+
+/**
+ * The models whose window as the gateway serves it is the one a conversation
+ * has to fit at the start of a turn, while within a turn the gateway takes a
+ * longer one and refuses a request that is too long without charging for it
+ * (`PromptTooLongError`). Compacting them at the window part way through a
+ * task would summarise work the model can still be shown, so a turn on one of
+ * them is compacted when the gateway refuses it. Every other model's window is
+ * its own, and a turn on it is compacted before the provider would refuse.
+ * Retired ids are in it when the model serving them is.
+ */
+export const COMPACTS_ON_REFUSAL: ReadonlySet<string> = new Set([
+  "claude-haiku-5.5",
+  "gpt-6-sol",
+  "kimi-k2",
+  "claude-haiku-4.5",
+  "gpt-5.2",
+  "gpt-5.5",
+  "gpt-5.2-pro",
+]);
 
 /** The most a conversation may weigh, by `requestTokens`, after compaction, and the most any request compaction sends. */
 export function compactBudget(contextTokens: number): number {
@@ -157,9 +183,10 @@ function summaryReserve(budget: number): number {
 function summaryPrompt(words: number): string {
   return (
     "Summarise the conversation above for your future self, which will continue " +
-    "the work without seeing it. Cover: what the user asked for, what was already " +
+    "the work without seeing it. Start with the user's latest request, in their " +
+    "own words if it is short. Then cover: what the user asked for before, what was already " +
     "changed (files and the reasoning), what was learned about the codebase, and " +
-    "what is still open. Be specific about file paths and names. If it opens with " +
+    "what is still open. Be specific about file paths, names and line numbers. If it opens with " +
     "a summary of earlier messages, carry what that summary says forward. " +
     `At most ${words.toLocaleString("en-US")} words. No preamble.`
   );
@@ -174,20 +201,34 @@ export interface CompactPlan {
   over: boolean;
 }
 
+export interface PlanOptions {
+  /** User messages kept as they are, the last one included, where the budget allows. */
+  keepTurns?: number;
+  /**
+   * The first message that must be kept as it is: the cut is at or before it.
+   * A turn's opening message before the model has seen it, which a summary
+   * must not stand in for.
+   */
+  keepFrom?: number;
+}
+
 /**
  * Where to cut, or undefined when there is nothing to summarise.
  *
  * Under the budget, the rule it always was: keep the last `keepTurns` turns,
  * and nothing to do without turns before them. Over it, the same cut when the
  * turns it keeps leave room, else the earliest later place that does, inside a
- * turn if need be, else everything. What is kept is held to half the budget,
- * so the next message starts well under the line rather than on it.
+ * turn if need be, else everything up to `keepFrom`. What is kept is held to
+ * half the budget, so the next message starts well under the line rather
+ * than on it.
  */
 export function planCompaction(
   messages: ChatMessage[],
   contextTokens: number,
-  keepTurns = 2,
+  options: number | PlanOptions = {},
 ): CompactPlan | undefined {
+  const { keepTurns = 2, keepFrom = messages.length } =
+    typeof options === "number" ? { keepTurns: options } : options;
   if (messages.length < 2) return undefined;
   const budget = compactBudget(contextTokens);
   // suffix[i]: what messages i onwards weigh, the part a cut at i keeps.
@@ -196,12 +237,12 @@ export function planCompaction(
   const total = suffix[0]!;
   const tail = (from: number) => suffix[from]!;
   const fixed = total - suffix[1]! + summaryReserve(budget) + messageWeight({ role: "assistant", content: SUMMARY_ACK });
-  const preferred = cutPoint(messages, keepTurns);
+  const preferred = Math.min(cutPoint(messages, keepTurns), keepFrom);
   const over = total > budget;
 
   if (!over) return preferred > 1 ? { cut: preferred, fits: fixed + tail(preferred) <= budget, over } : undefined;
 
-  const cuts = safeCuts(messages).filter((c) => c >= Math.max(preferred, 2));
+  const cuts = safeCuts(messages).filter((c) => c >= Math.max(preferred, 2) && c <= keepFrom);
   if (cuts.length === 0) return undefined;
   const keep = Math.min(budget - fixed, Math.floor(budget / 2));
   const cut = cuts.find((c) => tail(c) <= keep) ?? cuts.at(-1)!;
@@ -303,6 +344,15 @@ export interface CompactResult {
   after: number;
   /** Model calls the summary took: more than one when the part summarised did not fit one request. */
   calls: number;
+  /** Whether the compacted conversation weighs no more than the budget. */
+  fits: boolean;
+}
+
+export interface CompactOptions extends PlanOptions {
+  signal?: AbortSignal;
+  effort?: string;
+  /** Every summary call as it comes back, for metering: each one is charged. */
+  onCall?: (turn: ChatTurn) => void;
 }
 
 /**
@@ -320,9 +370,9 @@ export async function compact(
   model: string,
   messages: ChatMessage[],
   contextTokens: number,
-  opts: { keepTurns?: number; signal?: AbortSignal; effort?: string } = {},
+  opts: CompactOptions = {},
 ): Promise<CompactResult | undefined> {
-  const plan = planCompaction(messages, contextTokens, opts.keepTurns ?? 2);
+  const plan = planCompaction(messages, contextTokens, opts);
   if (!plan) return undefined;
   const { cut } = plan;
   const budget = compactBudget(contextTokens);
@@ -378,6 +428,7 @@ export async function compact(
     // nothing. Both calls are metered, so both are counted.
     for (let attempt = 0; attempt < 2 && !text; attempt++) {
       const turn = await client.chatStream(request, model, { signal: opts.signal, effort: opts.effort });
+      opts.onCall?.(turn);
       calls++;
       creditsCharged += turn.creditsCharged;
       balance = turn.balance;
@@ -411,6 +462,7 @@ export async function compact(
     before,
     after: conversationTokens(compacted),
     calls,
+    fits: !shouldCompact(compacted, contextTokens),
   };
 }
 

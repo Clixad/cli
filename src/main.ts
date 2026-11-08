@@ -54,14 +54,14 @@ import {
 import { syncPreferences } from "./preferences.ts";
 import { TERMS_NOTICE, parseLoginArgs, performLogin } from "./login.ts";
 import { freeAlternativeLine, freeModelToName } from "./free-tier.ts";
-import { NO_SEARCH_INSTRUCTION, runAgent, type AgentEvent } from "./agent.ts";
+import { compactionCost, NO_SEARCH_INSTRUCTION, runAgent, type AgentEvent } from "./agent.ts";
 import { toolSchemaFor } from "./tools.ts";
 import { collectContext, shouldSuggestInit } from "./context.ts";
 import { denyAll } from "./permissions.ts";
 import { TodoList } from "./todos.ts";
 import { shells } from "./shells.ts";
 import { hasSessionIn, latestSession, listSessions, loadSession, sameDirectory, type StoredSession } from "./session.ts";
-import { runKimiCode } from "./kimi.ts";
+import { contextTokensFor, runKimiCode } from "./kimi.ts";
 import { clearScreen } from "./banner.ts";
 import { loadTui } from "./tui/load.ts";
 import { openBrowser } from "./browser.ts";
@@ -623,10 +623,8 @@ async function printCmd(client: GatewayClient, config: CliConfig, task: string) 
   // Ask what this gateway can do before assembling the tools: with no search
   // key, advertising `web_search` costs input tokens on every call and buys a
   // round-trip's worth of error.
-  const capabilities = await client
-    .models()
-    .then(() => client.capabilities)
-    .catch(() => undefined);
+  const catalog = await client.models().catch(() => undefined);
+  const capabilities = catalog ? client.capabilities : undefined;
 
   try {
     const res = await runAgent(client, task, {
@@ -647,6 +645,9 @@ async function printCmd(client: GatewayClient, config: CliConfig, task: string) 
       webSearch: (query, opts) => client.webSearch(query, opts),
       webSearchAvailable: capabilities?.web_search === true,
       todos: new TodoList(),
+      // The model's window, so a long run is compacted and its tool results
+      // sized to it rather than refused part way, as in the REPL.
+      contextTokens: catalog?.find((m) => m.id === config.model)?.context_window ?? contextTokensFor(config.model),
       onEvent: printAgentEvent,
     });
     // The free tier gets said out loud here for the reason it does in the REPL:
@@ -717,6 +718,14 @@ function printAgentEvent(event: AgentEvent) {
       console.log(c.dim(`    ${preview.slice(0, 400)}`));
       break;
     }
+    case "compacted":
+      console.log(
+        c.dim(
+          `\n  [compacted context${event.history ? "" : " part way through the task"}: ` +
+            `~${Math.round(event.before / 1000)}k → ~${Math.round(event.after / 1000)}k tokens, ${compactionCost(event.creditsCharged, event.creditsWaived)}]`,
+        ),
+      );
+      break;
     case "attachment":
       console.log(c.dim(`    (showing the model: ${event.labels.join(", ")})`));
       break;

@@ -1,11 +1,14 @@
 /**
- * A conversation refused as too long for its model, through the real REPL.
+ * A conversation too long for its model, through the real REPL.
  *
- * The report: one task (a prompt, then large file reads) was refused part way
- * because the conversation had grown past what the model is sold for. The
- * refusal said to run /compact, and /compact answered "nothing to compact
- * yet": the only place it knew to cut was between turns, and the whole
- * conversation was one turn.
+ * The first report: one task (a prompt, then large file reads) was refused
+ * part way because the conversation had grown past what the model is sold
+ * for, and /compact answered "nothing to compact yet". The second, the same
+ * day: a fresh session with Claude Haiku 5.5 was refused after four tool
+ * calls, because one read returned 2,000 lines. A task now keeps going:
+ * reads are sized to the window, and the conversation is compacted part way
+ * through when the gateway refuses it, and before a turn starts when it
+ * would.
  *
  * The gateway here enforces the line the way the real one does when it knows
  * nothing about a conversation, one byte a token over everything a request
@@ -20,6 +23,7 @@ import { render } from "ink-testing-library";
 vi.mock("../src/browser.ts", () => ({ openBrowser: () => undefined }));
 import { App, KEPT_AFTER_ERROR } from "../src/tui/app.tsx";
 import { compactBudget, requestTokens } from "../src/compact.ts";
+import { roundRoom } from "../src/room.ts";
 import type { CliConfig } from "../src/config.ts";
 import {
   PromptTooLongError,
@@ -65,14 +69,14 @@ function bound(messages: ChatMessage[], tools: unknown): number {
 const FILES = ["lexer.ts", "parser.ts", "printer.ts", "checker.ts", "emitter.ts"];
 
 /**
- * A model that reads one file after another until told to stop, writes a
- * summary when asked for one, and answers "continue" once it has read
- * everything it was going to; and a gateway in front of it that refuses any
- * request over the line, with the sentence `refusal` gives.
+ * A model that reads one file after another until it has read `reads` of
+ * them, then answers; writes a summary when asked for one, and answers
+ * "continue" and any other message plainly. In front of it a gateway that
+ * refuses any request over the line, with the sentence `refusal` gives.
  */
-function gateway(refusal: (messages: ChatMessage[]) => string = () => CONVERSATION) {
+function gateway(refusal: (messages: ChatMessage[]) => string = () => CONVERSATION, reads = 10) {
   const sent: { messages: ChatMessage[]; bound: number; refused: boolean }[] = [];
-  let reads = 0;
+  let done = 0;
   const client = {
     models: async () => [],
     wallet: async () => ({ balance: 1_000_000, ads_today: 0, earned_usd_today: 0, max_reward_usd_per_day: 5, grant_per_ad: 1, ledger: [] }),
@@ -84,15 +88,21 @@ function gateway(refusal: (messages: ChatMessage[]) => string = () => CONVERSATI
       const last = messages.at(-1)!;
       const reply = (message: ChatMessage): ChatTurn => ({ message, finishReason: "stop", creditsCharged: 3, balance: 1_000_000 });
       if (typeof last.content === "string" && last.content.startsWith("Summarise the conversation above")) {
-        return reply({ role: "assistant", content: `SUMMARY: read ${reads} files of the parser so far; nothing changed yet.` });
+        return reply({ role: "assistant", content: `SUMMARY: read ${done} files of the parser so far; nothing changed yet.` });
       }
-      if (last.role === "user" && last.content === "continue") return reply({ role: "assistant", content: "ANSWERED" });
-      const file = FILES[reads++ % FILES.length]!;
+      if (last.role === "user") {
+        if (last.content === "continue") return reply({ role: "assistant", content: "ANSWERED" });
+        if (typeof last.content === "string" && !last.content.startsWith("read every file")) {
+          return reply({ role: "assistant", content: `GOT ${last.content.length} characters` });
+        }
+      }
+      if (done >= reads) return reply({ role: "assistant", content: "EXPLAINED: the parser reads tokens." });
+      const file = FILES[done++ % FILES.length]!;
       return {
         message: {
           role: "assistant",
           content: null,
-          tool_calls: [{ id: `call${reads}`, type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: file }) } }],
+          tool_calls: [{ id: `call${done}`, type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: file }) } }],
         },
         finishReason: "tool_calls",
         creditsCharged: 3,
@@ -130,51 +140,132 @@ afterEach(() => {
   rmSync(cwd, { recursive: true, force: true });
 });
 
-describe("one long task refused as too long for the model", () => {
-  it("is told to /compact, and /compact brings it under the line", async () => {
+describe("one long task on a model the gateway refuses past a line", () => {
+  it("keeps going past the line, compacting part way through, and finishes", async () => {
     const { client, sent } = gateway();
     const { stdin, lastFrame, unmount } = render(<App client={client} config={config()} />);
 
     await submit(stdin, "read every file of the parser and explain it");
-    const refused = await frameIn(lastFrame, { has: ["This conversation is too long for Claude Haiku 5.5.", "Run /compact"] });
-    // The turn's work is kept, so the advice says so instead of the usual line.
-    expect(fold(refused)).not.toContain(fold(KEPT_AFTER_ERROR));
-    expect(fold(refused)).not.toContain("Run /clear to start over, or /model to switch");
-    const turn = sent.filter((s) => !s.refused).length;
-    expect(sent.at(-1)!.refused).toBe(true);
-    // A single turn: one user message, nothing before it to cut at.
-    expect(sent.at(-1)!.messages.filter((m) => m.role === "user")).toHaveLength(1);
+    const frame = await frameWith(lastFrame, "EXPLAINED: the parser reads tokens.");
+    expect(fold(frame)).not.toContain("error:");
+    expect(fold(frame)).not.toContain("too long for Claude Haiku 5.5");
+    unmount();
 
-    await submit(stdin, "/compact");
-    const compacted = await frameWith(lastFrame, "compacted:");
-    expect(compacted).not.toContain("nothing to compact yet");
-    const summaries = sent.slice(turn + 1);
-    expect(summaries.length).toBeGreaterThan(0);
-    for (const s of summaries) {
-      expect(s.refused).toBe(false);
-      expect(requestTokens(s.messages)).toBeLessThanOrEqual(compactBudget(WINDOW));
+    // Refused once, compacted, sent again and taken; never refused twice in a row.
+    expect(sent.some((s) => s.refused)).toBe(true);
+    for (const [i, s] of sent.entries()) if (s.refused) expect(sent[i + 1]?.refused).toBe(false);
+    // Every read sized to the window: no tool result larger than a round may take.
+    for (const s of sent) {
+      for (const m of s.messages) {
+        if (m.role === "tool") expect(Buffer.byteLength(JSON.stringify(m.content))).toBeLessThanOrEqual(roundRoom(WINDOW) + 2);
+      }
     }
+    // The last request is a summary, then the turn's latest rounds, still one task.
+    const last = sent.at(-1)!.messages;
+    expect(last[1]!.content).toMatch(/^Summary of the earlier conversation:\n\nSUMMARY: /);
+    expect(last.filter((m) => m.role === "tool").length).toBeGreaterThan(0);
+  });
+
+  it("says it compacted, and the turn's credits are every call it made, the summaries included", async () => {
+    const { client, sent } = gateway();
+    const { stdin, lastFrame, unmount } = render(<App client={client} config={config()} />);
+    await submit(stdin, "read every file of the parser and explain it");
+    const frame = fold(await frameWith(lastFrame, "EXPLAINED: the parser reads tokens."));
+    unmount();
+    expect(frame).toContain("compacted context part way through the task, to fit the model:");
+    const charged = sent.filter((s) => !s.refused).length * 3;
+    expect(frame).toContain(`[${charged} credits · balance 1,000,000]`);
+  });
+
+  it("leaves a conversation the next message can be sent on", async () => {
+    const { client, sent } = gateway();
+    const { stdin, lastFrame, unmount } = render(<App client={client} config={config()} />);
+    await submit(stdin, "read every file of the parser and explain it");
+    await frameWith(lastFrame, "EXPLAINED: the parser reads tokens.");
 
     await submit(stdin, "continue");
     await frameWith(lastFrame, "ANSWERED");
-    unmount();
-
     const next = sent.at(-1)!;
     expect(next.refused).toBe(false);
-    expect(next.messages[1]!.content).toMatch(/^Summary of the earlier conversation:\n\nSUMMARY: /);
+    expect(requestTokens(next.messages)).toBeLessThanOrEqual(compactBudget(WINDOW) + 100);
     expect(next.messages.at(-1)).toEqual({ role: "user", content: "continue" });
+    unmount();
+  });
+});
+
+describe("a large new message on a long session", () => {
+  it("compacts what came before it and sends the message whole", async () => {
+    const { client, sent } = gateway(() => MESSAGE);
+    const { stdin, lastFrame, unmount } = render(<App client={client} config={config()} />);
+    // Two messages that each fit, and a session that ends just under the line.
+    await submit(stdin, `first part:\n${"a".repeat(30_000)}`);
+    await frameWith(lastFrame, "GOT 30012 characters");
+    await submit(stdin, `second part:\n${"b".repeat(30_000)}`);
+    await frameWith(lastFrame, "GOT 30013 characters");
+    // Under the budget: nothing was compacted before this point.
+    expect(sent.every((s) => !s.refused)).toBe(true);
+
+    const big = `third part:\n${"c".repeat(40_000)}`;
+    await submit(stdin, big);
+    const frame = fold(await frameWith(lastFrame, "GOT 40012 characters"));
+    unmount();
+    expect(frame).toContain("compacted context:");
+    expect(frame).not.toContain("error:");
+    const answered = sent.at(-1)!;
+    expect(answered.refused).toBe(false);
+    expect(answered.messages.at(-1)).toEqual({ role: "user", content: big });
+    expect(answered.messages[1]!.content).toMatch(/^Summary of the earlier conversation:/);
+  });
+});
+
+/** What a turn that grew past the line inside itself leaves on disk. */
+function longSession() {
+    const messages: ChatMessage[] = [{ role: "user", content: "read every file of the parser and explain it" }];
+    for (let i = 0; i < 6; i++) {
+      messages.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: `r${i}`, type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: FILES[i % 5] }) } }],
+      });
+      messages.push({ role: "tool", tool_call_id: `r${i}`, name: "read_file", content: "x".repeat(17_000) });
+    }
+    messages.push({ role: "assistant", content: "EXPLAINED: the parser reads tokens." });
+    return {
+      id: "20261108T120000-long",
+      started: "2026-11-08T12:00:00.000Z",
+      updated: "2026-11-08T12:10:00.000Z",
+      cwd,
+      model: MODEL,
+      title: "read every file of the parser and explain it",
+      messages,
+    };
+}
+
+describe("a session resumed over the line (--continue)", () => {
+  it("is compacted before its first request, and that request is taken", async () => {
+    const session = longSession();
+    expect(requestTokens(session.messages)).toBeGreaterThan(compactBudget(WINDOW));
+    const { client, sent } = gateway();
+    const { stdin, lastFrame, unmount } = render(<App client={client} config={config()} session={session} />);
+    await submit(stdin, "continue");
+    const frame = fold(await frameWith(lastFrame, "ANSWERED"));
+    unmount();
+    expect(frame).toContain("compacted context:");
+    expect(sent.every((s) => !s.refused)).toBe(true);
+    expect(sent.at(-1)!.messages.at(-1)).toEqual({ role: "user", content: "continue" });
   });
 
-  it("is brought under the line by the next message too, which compacts first", async () => {
+  it("is brought under the line by /compact by hand, in requests the gateway takes", async () => {
     const { client, sent } = gateway();
-    const { stdin, lastFrame, unmount } = render(<App client={client} config={config()} />);
-    await submit(stdin, "read every file of the parser and explain it");
-    await frameIn(lastFrame, { has: ["Run /compact"] });
-
+    const { stdin, lastFrame, unmount } = render(<App client={client} config={config()} session={longSession()} />);
+    await submit(stdin, "/compact");
+    const frame = await frameWith(lastFrame, "compacted:");
+    expect(frame).not.toContain("nothing to compact yet");
     await submit(stdin, "continue");
-    await frameWith(lastFrame, ["compacted context:", "ANSWERED"]);
+    await frameWith(lastFrame, "ANSWERED");
     unmount();
-    expect(sent.at(-1)!.refused).toBe(false);
+    expect(sent.every((s) => !s.refused)).toBe(true);
+    for (const s of sent) expect(requestTokens(s.messages)).toBeLessThanOrEqual(compactBudget(WINDOW) + 100);
   });
 });
 

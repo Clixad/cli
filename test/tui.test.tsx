@@ -742,19 +742,19 @@ describe("TUI ctrl+o", () => {
     const big = (tag: string) => Array.from({ length: 2000 }, (_, i) => `${tag}-${i + 1} `.padEnd(190, "x")).join("\n");
     const files = ["f1", "f2", "f3", "f4", "f5", "f6", "f7"];
     for (const f of files) writeFileSync(join(root, `${f}.txt`), big(f.toUpperCase()));
+    // One read a round: the results of one round share the room the model's
+    // window gives them, so seven at once would each come back much shorter.
     const turns = [
-      {
+      ...files.map((f) => ({
         message: {
           role: "assistant" as const,
           content: null,
-          tool_calls: files.map((f) => ({
-            id: f,
-            type: "function" as const,
-            function: { name: "read_file", arguments: JSON.stringify({ path: `${f}.txt` }) },
-          })),
+          tool_calls: [
+            { id: f, type: "function" as const, function: { name: "read_file", arguments: JSON.stringify({ path: `${f}.txt` }) } },
+          ],
         },
         finishReason: "tool_calls",
-      },
+      })),
       { message: { role: "assistant" as const, content: "Read them all." }, finishReason: "stop" },
     ];
     let i = 0;

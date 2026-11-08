@@ -28,7 +28,8 @@ import { diffView, renderDiff, type DiffView } from "./diff.ts";
 import { extractPdfText, looksLikePdf } from "./pdf.ts";
 import { killTree, shells, ShellError, type ShellRegistry, type ShellSnapshot } from "./shells.ts";
 import { parseTodos, todoResult, TodoError, type TodoList } from "./todos.ts";
-import { fetchPage, WebError } from "./web.ts";
+import { fetchPage, MAX_TEXT_CHARS, WebError } from "./web.ts";
+import { fitResult, jsonBytes } from "./room.ts";
 import { isMcpToolName, McpError, type McpHub } from "./mcp.ts";
 import { PaywallError, type ImageAttachment, type WebSearchOutcome, type WebSearchResult } from "./client.ts";
 import type { Permit, PermissionMode, PermissionRequest, PlanDecision } from "./permissions.ts";
@@ -216,6 +217,13 @@ export interface ToolContext {
   present?: (view: DiffView) => void;
   /** Background command registry. Defaults to the process-wide one. */
   shells?: ShellRegistry;
+  /**
+   * The JSON bytes this call's result may take (`room.ts`), sized to the
+   * model's window. `read_file` stops at the last whole line that fits and
+   * says where to read on; anything else is cut by the agent loop. Absent =
+   * only the tools' own ceilings.
+   */
+  room?: number;
 }
 
 /** Ask the gate, or proceed when no gate is wired. */
@@ -450,6 +458,8 @@ function searchBase(ctx: ToolContext, path: string | undefined): string {
 }
 
 const MAX_FILE_BYTES = 400_000;
+/** What `read_file` keeps free of its room for the line that says where to read on. */
+const READ_NOTE_BYTES = 200;
 /** Lines one `read_file` returns without an explicit `limit`. */
 const MAX_READ_LINES = 2000;
 /** A single line longer than this is truncated: it is minified, not source. */
@@ -594,28 +604,47 @@ export const TOOLS = {
       return `${path} has ${total} lines; offset ${first} is past the end`;
     }
 
-    const body = all
-      .slice(first - 1, last)
-      .map((line, i) => {
-        const n = String(first + i).padStart(5, " ");
-        const text = line.length > MAX_READ_LINE_CHARS ? `${line.slice(0, MAX_READ_LINE_CHARS)}… [line truncated]` : line;
-        return `${n}\t${text}`;
-      })
-      .join("\n");
+    // The line caps bound the shape of the output but not its size (two
+    // thousand lines of two thousand characters is four megabytes), so the
+    // read also stops at the last whole line that fits its room: the model's
+    // share of the window (`ctx.room`), and never more than the byte ceiling.
+    // It used to return 2,000 lines whatever they weighed, and one read of a
+    // 430 kB markdown file was more than Claude Haiku 5.5 takes in a request.
+    const room = Math.min(ctx.room ?? Infinity, MAX_FILE_BYTES) - READ_NOTE_BYTES;
+    const lines: string[] = [];
+    let used = 0;
+    let shown = first - 1;
+    for (let n = first; n <= last; n++) {
+      const line = all[n - 1]!;
+      const text = line.length > MAX_READ_LINE_CHARS ? `${line.slice(0, MAX_READ_LINE_CHARS)}… [line truncated]` : line;
+      let numbered = `${String(n).padStart(5, " ")}\t${text}`;
+      const bytes = jsonBytes(numbered) + 2;
+      if (used + bytes > room) {
+        if (lines.length > 0) break;
+        // A first line too long for the room on its own is cut, so a read
+        // always moves forward.
+        numbered = fitResult("read_file", numbered, Math.max(64, room - 2));
+      }
+      lines.push(numbered);
+      used += bytes;
+      shown = n;
+    }
+    const body = lines.join("\n");
 
     // Said only when it is true, and said at the end where the model is
     // looking after the content — a silently shortened file read as a whole one
     // is how an agent concludes a symbol does not exist.
+    // A window that reaches the end says so instead of offering a line
+    // after the last, which a model reading page by page would ask for.
     const note =
-      last < total || first > 1
-        ? `\n… showing lines ${first}-${last} of ${total}. Read on with offset: ${last + 1}.`
-        : "";
-    // The line caps bound the shape of the output but not its size — two
-    // thousand lines of two thousand characters is four megabytes — and this is
-    // a metered context, so the byte ceiling stays as the outer bound.
-    if (body.length > MAX_FILE_BYTES) {
-      return `${body.slice(0, MAX_FILE_BYTES)}\n… [truncated at ${MAX_FILE_BYTES} chars — read a smaller range with offset/limit]`;
-    }
+      shown < last
+        ? `\n… showing lines ${first}-${shown} of ${total}: that is as much as one read returns here. ` +
+          `Read on with offset: ${shown + 1}.`
+        : shown < total
+          ? `\n… showing lines ${first}-${shown} of ${total}. Read on with offset: ${shown + 1}.`
+          : first > 1
+            ? `\n… showing lines ${first}-${shown} of ${total}, the end of the file.`
+            : "";
     return body + note;
   },
 
@@ -927,10 +956,15 @@ export const TOOLS = {
    */
   async web_fetch(ctx: ToolContext, args: { url: string; max_chars?: number }): Promise<string> {
     let page;
+    // The page is cut where the model's room ends, by the converter that
+    // says so in its own words, rather than cut again afterwards.
+    const asked = args.max_chars === undefined ? undefined : Math.max(1_000, countArg(args.max_chars, MAX_FILE_BYTES));
+    const fits = ctx.room === undefined ? undefined : Math.max(1_000, Math.floor(ctx.room * 0.8));
+    const maxChars = fits === undefined ? asked : Math.min(asked ?? MAX_TEXT_CHARS, fits);
     try {
       page = await fetchPage(optionalString(args.url, "web_fetch", "url") ?? "", {
         ...(ctx.signal ? { signal: ctx.signal } : {}),
-        ...(args.max_chars === undefined ? {} : { maxChars: Math.max(1_000, countArg(args.max_chars, MAX_FILE_BYTES)) }),
+        ...(maxChars === undefined ? {} : { maxChars }),
       });
     } catch (err) {
       networkToolError(err);

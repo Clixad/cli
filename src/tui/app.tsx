@@ -64,15 +64,23 @@ import {
   visibleLength,
   welcomeBanner,
 } from "../banner.ts";
-import { interruptedConversation, NO_SEARCH_INSTRUCTION, runAgent, type AgentEvent } from "../agent.ts";
+import {
+  compactionCost,
+  interruptedConversation,
+  NO_SEARCH_INSTRUCTION,
+  runAgent,
+  usageEvent,
+  type AgentEvent,
+} from "../agent.ts";
 import { collectContext, INIT_HINT, INIT_PROMPT, shouldSuggestInit } from "../context.ts";
-import { expandMentions } from "../mentions.ts";
+import { expandMentions, MAX_MENTION_CHARS } from "../mentions.ts";
+import { mentionRoom } from "../room.ts";
 import {
   compact,
   compactionHelps,
   conversationTokens,
+  requestTokens,
   estimateTokens,
-  shouldCompact,
   withCompactAdvice,
 } from "../compact.ts";
 import {
@@ -2231,6 +2239,24 @@ export function App({
           });
           return;
         }
+        case "compacted": {
+          // The calls were metered as they came back (`usage`); this says what
+          // they were for, and where in the turn.
+          // Before the turn's first call (`history` set) it is the compaction
+          // a long session always had; part way through, it says so.
+          const where = event.history
+            ? "compacted context"
+            : event.why === "window"
+              ? "compacted context part way through the task"
+              : "compacted context part way through the task, to fit the model";
+          push({
+            kind: "notice",
+            text:
+              `  ${where}: ~${Math.round(event.before / 1000)}k → ~${Math.round(event.after / 1000)}k tokens ` +
+              `(${compactionCost(event.creditsCharged, event.creditsWaived)})`,
+          });
+          return;
+        }
         case "attachment":
           // Said out loud because an image is the one thing in a conversation
           // the user cannot see in the transcript, and it is the expensive
@@ -2354,30 +2380,6 @@ export function App({
         });
       };
       try {
-        // Compact before the call, so a long session never dies on context.
-        const window = contextWindow(model);
-        if (shouldCompact([{ role: "system", content: contextRef.current.systemPrompt }, ...history], window)) {
-          const res = await compact(
-            client,
-            model,
-            [{ role: "system", content: contextRef.current.systemPrompt }, ...history],
-            window,
-            { signal: ac.signal, effort: savedEffort(config, model) },
-          );
-          if (res) {
-            history = res.messages.slice(1);
-            setMessages(history);
-            balanceSeqRef.current++;
-            setBalance(res.balance);
-            if (res.spendable) takeSpendable(res.spendable, res.balance);
-            setSpent((s) => s + res.creditsCharged);
-            push({
-              kind: "notice",
-              text: `  compacted context: ~${Math.round(res.before / 1000)}k → ~${Math.round(res.after / 1000)}k tokens (${res.creditsCharged.toLocaleString("en-US")} credits)`,
-            });
-          }
-        }
-
         const result = await runAgent(client, task, {
           model,
           // Read now rather than from the render, for `modelRef`'s reason: a
@@ -2421,7 +2423,22 @@ export function App({
               webSearch: searchRef.current,
             }),
           signal: ac.signal,
-          onEvent: handleEvent,
+          // The window the conversation is kept inside, at the start of the
+          // turn and part way through: compaction happens in the run, so a
+          // long task carries on instead of stopping at the line, and a large
+          // new message on a long session is weighed with what came before it.
+          contextTokens: contextWindow(model),
+          onEvent: (event) => {
+            // Compacted before the turn's first call: that is the history now,
+            // whatever happens to the turn, as it was when the REPL compacted
+            // before calling the agent.
+            if (event.type === "compacted" && event.history) {
+              history = event.history;
+              setMessages(history);
+              persist(history);
+            }
+            handleEvent(event);
+          },
           // Without the system prompt, which is rebuilt per run.
           onCheckpoint: (conversation) => persist(conversation.slice(1)),
         });
@@ -3370,20 +3387,28 @@ export function App({
         // several calls has been charged for the ones already finished.
         case "compact":
           await runBusy(COMPACTING, async (signal) => {
+            let waived = 0;
             const res = await compact(
               client,
               model,
               [{ role: "system", content: contextRef.current.systemPrompt }, ...messagesRef.current],
               contextWindow(model),
-              { signal, effort: savedEffort(config, model) },
+              {
+                signal,
+                effort: savedEffort(config, model),
+                // Each summary call metered as a turn's are: the balance, the
+                // spend, and on a free model what is left of the allowance.
+                onCall: (turn) => {
+                  waived += turn.creditsWaived ?? 0;
+                  handleEvent(usageEvent(turn));
+                },
+              },
             );
             if (!res) return void push({ kind: "notice", text: "  nothing to compact yet" });
             setMessages(res.messages.slice(1));
-            setBalance(res.balance);
-            setSpent((s) => s + res.creditsCharged);
             push({
               kind: "notice",
-              text: `  compacted: ~${Math.round(res.before / 1000)}k → ~${Math.round(res.after / 1000)}k tokens (${res.creditsCharged.toLocaleString("en-US")} credits)`,
+              text: `  compacted: ~${Math.round(res.before / 1000)}k → ~${Math.round(res.after / 1000)}k tokens (${compactionCost(res.creditsCharged, waived)})`,
             });
           });
           return;
@@ -3844,7 +3869,7 @@ export function App({
           push({ kind: "notice", tone: "warn", text: `  unknown command: /${cmd} — try /help` });
       }
     },
-    [askMcpApproval, client, cols, config, cycleMode, exit, model, modelTaskHints, premium, push, replayConversation, root, runAdWall, runBusy, runBuy, runLogin, runTurn, setPremium, writeToStdout],
+    [askMcpApproval, client, cols, config, cycleMode, exit, handleEvent, model, modelTaskHints, premium, push, replayConversation, root, runAdWall, runBusy, runBuy, runLogin, runTurn, setPremium, writeToStdout],
   );
 
   /**
@@ -3907,13 +3932,29 @@ export function App({
       // the name, called read_file, and the user paid a round-trip for a file
       // they had already pointed at. The typed line stays on screen; only the
       // model's copy carries the contents.
-      const { text: task, attached, images } = expandMentions(line, root);
+      // Sized to the model the turn will run on, so a long file attaches as
+      // much of itself as the message can carry and says where it stops,
+      // rather than making the message too long to send.
+      const { text: task, attached, partial, images } = expandMentions(
+        line,
+        root,
+        Math.min(MAX_MENTION_CHARS, mentionRoom(contextWindow(modelRef.current))),
+      );
       if (attached.length) {
         push({ kind: "notice", text: `  attached ${attached.join(", ")}` });
       }
+      for (const p of partial) {
+        push({
+          kind: "notice",
+          tone: "warn",
+          text:
+            `  ${p.path}: lines ${p.from}-${p.to} of ${p.total.toLocaleString("en-US")} attached, as much as one ` +
+            "message carries on this model. The agent reads the rest as it needs.",
+        });
+      }
       return runTurn(task, images);
     },
-    [push, root, runCommand, runShell, runTurn],
+    [contextWindow, push, root, runCommand, runShell, runTurn],
   );
 
   /**
@@ -4958,11 +4999,13 @@ export function App({
     () => conversationTokens([{ role: "system", content: contextRef.current.systemPrompt }, ...messages]),
     [messages],
   );
+  // Measured the way compaction decides (`shouldCompact`), so 75% here is
+  // where the next turn compacts.
   const contextPct = useMemo(() => {
     const window = contextWindow(model);
     if (!window) return 0;
-    return conversationUsed / window;
-  }, [contextWindow, conversationUsed, model]);
+    return requestTokens([{ role: "system", content: contextRef.current.systemPrompt }, ...messages]) / window;
+  }, [contextWindow, messages, model]);
 
   // What the tool schema adds to every call, which the conversation estimate
   // above does not count. Per mode, since plan mode advertises fewer tools.

@@ -307,6 +307,47 @@ describe("read_file numbering and windows", () => {
     expect(out).toContain("past the end");
   });
 
+  /**
+   * 2026-11-08: one read of a 430 kB markdown file came back as 2,000
+   * lines, more than Claude Haiku 5.5 takes in a request, and the task was
+   * refused after four tool calls. A read now stops at the last whole line
+   * that fits the room it is given.
+   */
+  it("stops at the last whole line that fits its room, and says where to read on", () => {
+    writeFileSync(join(root, "long.md"), Array.from({ length: 2_500 }, (_, i) => `${i + 1}: ${"text ".repeat(16)}`).join("\n"));
+    const out = TOOLS.read_file({ root, room: 18_000 }, { path: "long.md" });
+    expect(Buffer.byteLength(JSON.stringify(out)) - 2).toBeLessThanOrEqual(18_000);
+    const last = /showing lines 1-(\d+) of 2500: that is as much as one read returns here\. Read on with offset: (\d+)\./.exec(out);
+    expect(last).not.toBeNull();
+    const shown = Number(last![1]);
+    expect(Number(last![2])).toBe(shown + 1);
+    expect(shown).toBeGreaterThan(100);
+    // Whole lines only: the last one shown is complete, the next is absent.
+    expect(out).toContain(`\t${shown}: ${"text ".repeat(16)}`);
+    expect(out).not.toContain(`\t${shown + 1}: `);
+    // Reading on picks up exactly there.
+    const next = TOOLS.read_file({ root, room: 18_000 }, { path: "long.md", offset: shown + 1 });
+    expect(next.split("\n")[0]).toBe(`${String(shown + 1).padStart(5, " ")}\t${shown + 1}: ${"text ".repeat(16)}`);
+  });
+
+  it("returns at least part of a line too long for its room, so a read always moves on", () => {
+    writeFileSync(join(root, "wide.txt"), `${"w".repeat(1_900)}\nsecond\n`);
+    const out = TOOLS.read_file({ root, room: 600 }, { path: "wide.txt" });
+    expect(out.startsWith("    1\twww")).toBe(true);
+    expect(out).toContain("characters left out");
+    expect(out).toContain("Read on with offset: 2.");
+  });
+
+  it("says a window that reaches the end is the end, rather than offering a line after it", () => {
+    const out = TOOLS.read_file(ctx(), { path: "many.txt", offset: 240 });
+    expect(out).toContain("showing lines 240-250 of 250, the end of the file.");
+    expect(out).not.toContain("offset: 251");
+  });
+
+  it("is unchanged when the file fits its room", () => {
+    expect(TOOLS.read_file({ root, room: 1_000_000 }, { path: "many.txt" })).toBe(TOOLS.read_file(ctx(), { path: "many.txt" }));
+  });
+
   it("tells a model that copied the line numbers exactly what went wrong", async () => {
     writeFileSync(join(root, "edit.txt"), "hello\n");
     await expect(

@@ -18,12 +18,16 @@
  * drift.
  */
 import { TOOLS, safeResolve } from "./tools.ts";
+import { jsonBytes } from "./room.ts";
 import type { ImageAttachment } from "./client.ts";
 
 /** Characters that end a mention but are not part of a path. */
 const TRAILING = /[),;:]+$/;
 
-/** Total characters of attached file content in one message. */
+/**
+ * Total JSON bytes of attached file content in one message, on a model whose
+ * window takes it; the REPL passes less for a smaller one (`mentionRoom`).
+ */
 export const MAX_MENTION_CHARS = 120_000;
 
 /**
@@ -53,6 +57,12 @@ export interface ExpandResult {
   /** Paths that were attached, for the notice in the TUI. */
   attached: string[];
   /**
+   * Attachments that stop before the end of their file because the rest did
+   * not fit the message: which lines went in, so the TUI can say so. The model
+   * is told the same in the attachment, with where to read on.
+   */
+  partial: { path: string; from: number; to: number; total: number }[];
+  /**
    * Images among them, which cannot be appended as text.
    *
    * They travel as their own content parts on the same user message, so
@@ -71,10 +81,11 @@ export interface ExpandResult {
  */
 export function expandMentions(text: string, root: string, limit = MAX_MENTION_CHARS): ExpandResult {
   const mentions = findMentions(text);
-  if (mentions.length === 0) return { text, attached: [], images: [] };
+  if (mentions.length === 0) return { text, attached: [], partial: [], images: [] };
 
   const blocks: string[] = [];
   const attached: string[] = [];
+  const partial: ExpandResult["partial"] = [];
   const images: ImageAttachment[] = [];
   let used = 0;
 
@@ -85,26 +96,31 @@ export function expandMentions(text: string, root: string, limit = MAX_MENTION_C
       safeResolve(root, path); // same confinement the tools use, not a copy of it
       // An image collected here rather than described: `read_file` hands the
       // bytes to `attach` and returns the sentence that goes with them, which
-      // is exactly the shape a user message needs.
-      body = TOOLS.read_file({ root, attach: (image) => images.push(image) }, { path });
+      // is exactly the shape a user message needs. A text file is read up to
+      // the room left, at a whole line, with where to read on said at its end.
+      body = TOOLS.read_file({ root, room: limit - used, attach: (image) => images.push(image) }, { path });
     } catch {
       continue; // missing, a directory, an oversized image, or outside the workspace
     }
     const room = limit - used;
     const clipped =
-      body.length > room ? `${body.slice(0, room)}\n… [attachment truncated — read the rest with read_file]` : body;
-    used += clipped.length;
+      jsonBytes(body) > room ? `${body.slice(0, room)}\n… [attachment truncated — read the rest with read_file]` : body;
+    used += jsonBytes(clipped);
     attached.push(path);
+    const stops = /\n… showing lines (\d+)-(\d+) of (\d+)[.:]/.exec(clipped.slice(-300));
+    if (stops) partial.push({ path, from: Number(stops[1]), to: Number(stops[2]), total: Number(stops[3]) });
     blocks.push(`--- ${path} ---\n${clipped}`);
   }
 
-  if (blocks.length === 0) return { text, attached: [], images: [] };
+  if (blocks.length === 0) return { text, attached: [], partial: [], images: [] };
   return {
     text:
       `${text}${MENTIONS_HEADING}` +
-      "Their contents are below, already read for you — do not call read_file on them again.\n\n" +
+      "Their contents are below, already read for you — do not call read_file on them again, " +
+      "except to read on where one says it stops.\n\n" +
       blocks.join("\n\n"),
     attached,
+    partial,
     images,
   };
 }

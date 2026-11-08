@@ -31,9 +31,12 @@ import type { TodoList } from "./todos.ts";
 import type { DiffView } from "./diff.ts";
 import type { PermissionRequest, PlanDecision, Permit, ReviewVerdict } from "./permissions.ts";
 import { parseReview, reviewFailure, reviewMessages, userTexts } from "./auto-mode.ts";
+import { compact, COMPACTS_ON_REFUSAL, IMAGE_TOKEN_ESTIMATE, shouldCompact } from "./compact.ts";
+import { fitResult, jsonBytes, roundRoom } from "./room.ts";
 import {
   imagePart,
   messageText,
+  PromptTooLongError,
   type ChatMessage,
   type ChatTurn,
   type ChatOptions,
@@ -105,6 +108,29 @@ export type AgentEvent =
    * too old to say; `balance` likewise.
    */
   | { type: "search"; id?: string; creditsCharged?: number; balance?: number; cached: boolean }
+  /**
+   * The conversation was summarised to fit the model's window (`compact.ts`):
+   * at the start of the turn (`start`), part way through it because it grew
+   * past the window (`window`), or because the gateway refused a request as
+   * too long and it was compacted and sent again (`refused`). Its calls are
+   * metered like any other, as `usage` events before this one. `before` and
+   * `after` are estimated tokens.
+   *
+   * `history` is set on a compaction at the start of a turn: the conversation
+   * before the turn's own message, compacted, which is what the caller keeps
+   * if the turn goes no further. Without the system prompt.
+   */
+  | {
+      type: "compacted";
+      why: "start" | "window" | "refused";
+      before: number;
+      after: number;
+      creditsCharged: number;
+      /** What the free tier absorbed of the summaries instead. */
+      creditsWaived: number;
+      calls: number;
+      history?: ChatMessage[];
+    }
   | { type: "final"; content: string; creditsCharged: number; balance: number }
   | { type: "aborted" }
   | { type: "max_steps" };
@@ -155,6 +181,15 @@ export interface RunAgentOptions {
    * process never finishes (a closed terminal, a crash) can still be resumed.
    */
   onCheckpoint?: (messages: ChatMessage[]) => void;
+  /**
+   * The model's context window as the gateway serves it (`context_window`).
+   * Given, the run keeps the conversation inside it: tool results are sized
+   * to it (`room.ts`), and the conversation is compacted when it outgrows it,
+   * before the turn's first call and part way through (`COMPACTS_ON_REFUSAL`
+   * says which models wait for the gateway's refusal for the second), so a
+   * long task carries on rather than stopping. Absent, neither happens.
+   */
+  contextTokens?: number;
   /** Loop guard: max model round-trips before giving up. */
   maxSteps?: number;
   /** Backs `web_search`; absent = the tool says so rather than returning nothing. */
@@ -370,7 +405,7 @@ export async function runAgent(
         let turn: ChatTurn;
         try {
           turn = await client.chatStream(
-            reviewMessages({ request: req, userMessages: userTexts(messages), root: opts.root }),
+            reviewMessages({ request: req, userMessages: said, root: opts.root }),
             review.model,
             { ...(review.effort ? { effort: review.effort } : {}), signal: opts.signal },
           );
@@ -417,6 +452,9 @@ export async function runAgent(
         : task,
     },
   ];
+  // What the user said, read before anything is compacted: the reviewer reads
+  // it, and a summary is not something the user typed.
+  const said = userTexts(messages);
 
   /**
    * Run one sub-agent and return its answer as a string.
@@ -457,6 +495,9 @@ export async function runAgent(
       webSearch: opts.webSearch,
       webSearchAvailable: opts.webSearchAvailable,
       shells: opts.shells,
+      // Its own conversation, kept inside the same window by the same rules,
+      // so a sub-agent that reads a lot is compacted rather than refused.
+      contextTokens: opts.contextTokens,
       depth: depth + 1,
       onEvent: (event) => {
         if (event.type === "usage") {
@@ -498,19 +539,71 @@ export async function runAgent(
 
   /** Every model call is metered and reported, the ones that come back empty included. */
   function emitUsage(turn: ChatTurn): void {
-    emit({
-      type: "usage",
-      creditsCharged: turn.creditsCharged,
-      balance: turn.balance,
-      ...(turn.free
-        ? {
-            free: true,
-            creditsWaived: turn.creditsWaived ?? 0,
-            freeCreditsLeft: turn.freeCreditsLeft ?? 0,
-          }
-        : {}),
-      ...(turn.spendable ? { spendable: turn.spendable } : {}),
+    emit(usageEvent(turn));
+  }
+
+  /** One metered call counted on this run: its credits, the free tier's, the balance, and its `usage` event. */
+  function account(turn: ChatTurn): void {
+    creditsCharged += turn.creditsCharged;
+    creditsWaived += turn.creditsWaived ?? 0;
+    if (turn.freeCreditsLeft !== undefined) freeCreditsLeft = turn.freeCreditsLeft;
+    balance = turn.balance;
+    emitUsage(turn);
+  }
+
+  const window = opts.contextTokens;
+  // A model whose window is its own is compacted part way through a turn when
+  // the conversation outgrows it; one the gateway takes more of within a turn
+  // waits for the gateway to say so (`COMPACTS_ON_REFUSAL`).
+  const atWindow = !COMPACTS_ON_REFUSAL.has(opts.model);
+  // Whether the model has answered in this run: from then on the turn's own
+  // work is in the conversation, and a compaction may cut inside it.
+  let worked = false;
+  // A compaction that could not bring the conversation under the budget (the
+  // turn's message, or the instructions, are too large for this model on their
+  // own). Not tried again at the window in this run: it would summarise the
+  // same thing again before every call. The gateway's refusal still gets one.
+  let stuck = false;
+
+  /**
+   * Compact the conversation in place. Before the model has answered, the
+   * turn's own message is kept as it is (the cut is before it) and two turns
+   * before it where they fit; after, the cut may fall inside the turn. False
+   * when there was nothing to summarise.
+   */
+  async function compactNow(why: "start" | "window" | "refused"): Promise<boolean> {
+    let charged = 0;
+    let waived = 0;
+    const res = await compact(client, opts.model, messages, window!, {
+      ...(worked ? {} : { keepTurns: 3, keepFrom: messages.length - 1 }),
+      signal: opts.signal,
+      effort: opts.effort,
+      onCall: (turn) => {
+        charged += turn.creditsCharged;
+        waived += turn.creditsWaived ?? 0;
+        account(turn);
+      },
     });
+    if (!res) {
+      stuck = true;
+      return false;
+    }
+    messages.splice(0, messages.length, ...res.messages);
+    stuck = !res.fits;
+    emit({
+      type: "compacted",
+      why,
+      before: res.before,
+      after: res.after,
+      creditsCharged: charged,
+      creditsWaived: waived,
+      calls: res.calls,
+      ...(worked ? {} : { history: withoutReasoning(messages.slice(1, -1)) }),
+    });
+    // The compacted conversation is the one to resume from, and every tool
+    // call in it is answered: a compaction runs only between rounds.
+    if (worked) opts.onCheckpoint?.(withoutReasoning(messages));
+    return true;
   }
 
   // Everything from here on is this run's own work. An error that ends the run
@@ -518,14 +611,13 @@ export async function runAgent(
   // the files were edited and the commands were run whatever the gateway said
   // next, and a conversation that forgot them would be one the model can no
   // longer continue. One that ends before any of it is left as it was.
-  const base = messages.length;
   try {
     return await loop();
   } catch (err) {
     if (typeof err === "object" && err !== null) {
       // Set or cleared on every level, so a sub-agent's conversation recorded
       // on the same error is never handed to the caller as this one.
-      if (messages.length > base) interrupted.set(err, closeOpenCalls(withoutReasoning(messages)));
+      if (worked) interrupted.set(err, closeOpenCalls(withoutReasoning(messages)));
       else interrupted.delete(err);
     }
     throw err;
@@ -533,27 +625,57 @@ export async function runAgent(
 
   async function loop(): Promise<AgentResult> {
     let retriedEmpty = false;
-    for (let step = 0; step < maxSteps; step++) {
+    // The step limit was sized for reads that come back whole. A round whose
+    // result was cut to fit the window adds one step to it, so reading on
+    // through a file in the parts the window allows does not end the turn,
+    // up to twice the limit.
+    let limit = maxSteps;
+    for (let step = 0; step < limit; step++) {
       if (opts.signal?.aborted) return stop("aborted");
 
       let turn: ChatTurn;
       try {
-        turn = await client.chatStream(messages, opts.model, {
-          effort: opts.effort,
-          tools: opts.tools ? opts.tools() : TOOL_SCHEMA,
-          signal: opts.signal,
-          onDelta: (text) => emit({ type: "delta", text }),
-        });
+        // The conversation is brought inside the window before the call: at
+        // the start of the turn on every model, so a long session or a large
+        // new message does not reach the gateway too long, and part way
+        // through on a model whose window is its own.
+        let compacted = false;
+        if (window !== undefined && !stuck && (!worked || atWindow) && shouldCompact(messages, window)) {
+          compacted = await compactNow(worked ? "window" : "start");
+        }
+        const send = () =>
+          client.chatStream(messages, opts.model, {
+            effort: opts.effort,
+            tools: opts.tools ? opts.tools() : TOOL_SCHEMA,
+            signal: opts.signal,
+            onDelta: (text) => emit({ type: "delta", text }),
+          });
+        try {
+          turn = await send();
+        } catch (err) {
+          // Refused as too long for the model, which costs nothing: compacted
+          // and sent again, once. A conversation already under the budget, or
+          // one just compacted, is refused for something compaction cannot
+          // change (the message or the instructions alone), and the refusal
+          // stands. One that grew since a compaction that could not reach the
+          // budget (long instructions) is compacted again: what grew can go.
+          if (
+            !(err instanceof PromptTooLongError) ||
+            window === undefined ||
+            compacted ||
+            !shouldCompact(messages, window) ||
+            !(await compactNow("refused"))
+          ) {
+            throw err;
+          }
+          turn = await send();
+        }
       } catch (err) {
         if (isAbort(err) || opts.signal?.aborted) return stop("aborted");
         throw err;
       }
 
-      creditsCharged += turn.creditsCharged;
-      creditsWaived += turn.creditsWaived ?? 0;
-      if (turn.freeCreditsLeft !== undefined) freeCreditsLeft = turn.freeCreditsLeft;
-      balance = turn.balance;
-      emitUsage(turn);
+      account(turn);
 
       const content = messageText(turn.message);
       const calls = turn.message.tool_calls ?? [];
@@ -573,6 +695,7 @@ export async function runAgent(
       }
       retriedEmpty = false;
       messages.push(turn.message);
+      worked = true;
       if (content) lastText = content;
 
       if (calls.length === 0) {
@@ -593,6 +716,16 @@ export async function runAgent(
       if (content) emit({ type: "message", content });
 
       pendingImages = [];
+      // What this round's results may take together (`roundRoom`), shared out
+      // fairly (`fairRoom`): a file read is measured before it runs, anything
+      // else is expected to need an equal share, and what a call leaves
+      // unused goes to the calls after it. So a long file read beside a short
+      // one gets the room the short one did not need, and not less than the
+      // calls next to it.
+      const roundBytes = window === undefined ? undefined : roundRoom(window);
+      const wants = roundBytes === undefined ? [] : calls.map((c) => readSize(opts.root, c) ?? Math.ceil(roundBytes / calls.length));
+      let left = roundBytes ?? 0;
+      let paged = false;
       for (const [i, call] of calls.entries()) {
         if (opts.signal?.aborted) {
           // Every announced tool_call needs a matching tool message, or the next
@@ -600,9 +733,14 @@ export async function runAgent(
           for (const rest of calls.slice(i)) messages.push(toolMessage(rest, "cancelled by the user"));
           return stop("aborted");
         }
-        const result = await executeToolCall(ctx, call, emit);
+        const room = roundBytes === undefined ? undefined : fairRoom(left, wants.slice(i));
+        const images = pendingImages.length;
+        const result = await executeToolCall(room === undefined ? ctx : { ...ctx, room }, call, emit);
         messages.push(toolMessage(call, result));
+        left -= jsonBytes(result) + (pendingImages.length - images) * IMAGE_TOKEN_ESTIMATE * 4;
+        if (cutToFit(result)) paged = true;
       }
+      if (paged) limit = Math.min(maxSteps * 2, limit + 1);
 
       // Images last, once every tool_call has its answer: a user message in
       // between an assistant's tool_calls and their results is malformed, and
@@ -627,7 +765,7 @@ export async function runAgent(
       creditsWaived,
       freeCreditsLeft,
       searchCredits,
-      steps: maxSteps,
+      steps: limit,
       stopped: "max_steps",
     };
   }
@@ -645,6 +783,79 @@ export async function runAgent(
       steps: 0,
       stopped: reason,
     };
+  }
+}
+
+/** The `usage` event one metered call makes. */
+export function usageEvent(turn: ChatTurn): Extract<AgentEvent, { type: "usage" }> {
+  return {
+    type: "usage",
+    creditsCharged: turn.creditsCharged,
+    balance: turn.balance,
+    ...(turn.free
+      ? {
+          free: true,
+          creditsWaived: turn.creditsWaived ?? 0,
+          freeCreditsLeft: turn.freeCreditsLeft ?? 0,
+        }
+      : {}),
+    ...(turn.spendable ? { spendable: turn.spendable } : {}),
+  };
+}
+
+/** What a compaction's calls cost, for the line that says it happened: credits, or that the free tier paid. */
+export function compactionCost(creditsCharged: number, creditsWaived: number): string {
+  if (creditsCharged === 0 && creditsWaived > 0) return "free";
+  return `${creditsCharged.toLocaleString("en-US")} credits`;
+}
+
+/** Whether a result was cut to fit the model's window, by `read_file` or by `fitResult`. */
+function cutToFit(result: string): boolean {
+  return result.includes("that is as much as one read returns here") || result.includes("more than one result takes on this model");
+}
+
+/** The least room a call is given however full its round is, so a read always moves on. */
+const MIN_ROOM = 1_024;
+
+/**
+ * The room the first of `wants` gets out of `left`: all it wants when every
+ * call can have that, else an equal level that the smaller wants fall under
+ * (each of those gets what it wants, and the larger ones share the rest), and
+ * never less than `MIN_ROOM`. When everything fits, the first call may also
+ * have what the others do not want, since what it leaves goes on to them.
+ */
+export function fairRoom(left: number, wants: number[]): number {
+  const [first, ...rest] = wants;
+  if (first === undefined) return Math.max(MIN_ROOM, left);
+  const total = wants.reduce((n, w) => n + w, 0);
+  if (total <= left) return Math.max(MIN_ROOM, left - rest.reduce((n, w) => n + w, 0));
+  const sorted = [...wants].sort((a, b) => a - b);
+  let budget = left;
+  let level = 0;
+  for (const [k, w] of sorted.entries()) {
+    const share = budget / (sorted.length - k);
+    if (w >= share) {
+      level = share;
+      break;
+    }
+    budget -= w;
+    level = w;
+  }
+  return Math.max(MIN_ROOM, Math.floor(Math.min(first, level)));
+}
+
+/**
+ * What a `read_file` call would return, in JSON bytes, read without a room
+ * and without attaching anything; undefined for any other call. A read is
+ * cheap and changes nothing, which is what lets its round be shared out by
+ * what each read actually needs.
+ */
+function readSize(root: string, call: ToolCall): number | undefined {
+  if (call.function.name !== "read_file") return undefined;
+  try {
+    return jsonBytes(TOOLS.read_file({ root }, JSON.parse(call.function.arguments || "{}")));
+  } catch {
+    return 0;
   }
 }
 
@@ -764,7 +975,9 @@ async function executeToolCall(
       : {}),
   };
   try {
-    const result = await dispatch(scoped, name, args);
+    // Sized to the model before anybody sees it, so the row on screen and the
+    // model read the same thing.
+    const result = fitResult(name, await dispatch(scoped, name, args), ctx.room);
     emit({ type: "tool_result", id, name, result, ok: true, ...(view ? { view } : {}) });
     return result;
   } catch (err) {

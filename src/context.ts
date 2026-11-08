@@ -53,7 +53,11 @@ export function collectContext(root: string, base: string = SYSTEM_PROMPT): Proj
     parts.push(
       `# Project instructions (${path.replace(homedir(), "~")})\n` +
         "These come from the user and take precedence over your defaults.\n\n" +
-        text.slice(0, MAX_CONTEXT_FILE_CHARS),
+        // Cut where it is too long, and said: instructions read as whole
+        // that are not are instructions the model follows without the rest.
+        (text.length > MAX_CONTEXT_FILE_CHARS
+          ? `${text.slice(0, MAX_CONTEXT_FILE_CHARS)}\n\n[… the rest of this file, ${(text.length - MAX_CONTEXT_FILE_CHARS).toLocaleString("en-US")} characters, is not included here; read it with read_file when it matters]`
+          : text),
     );
   }
 
