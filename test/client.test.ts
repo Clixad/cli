@@ -19,6 +19,7 @@ import {
   PremiumLockedError,
   accessColumn,
   adsPerTaskLabel,
+  budgetUntilLabel,
   grantLabel,
   ledgerReasonLabel,
   packsFromClause,
@@ -787,6 +788,16 @@ describe("the access column", () => {
     expect(accessColumn(premiumModel, { unlocked: false, credits: 1 })).toBe("premium ");
     expect(accessColumn(premiumModel, { unlocked: true, credits: 0 })).toBe("premium ");
     expect(premiumLocked(undefined)).toBe(false);
+  });
+
+  it("says until when a premium model is a budget one, only with the gateway's date", () => {
+    const lent = { access: "budget" as const, access_until: "2027-01-15T00:00:00Z" };
+    expect(budgetUntilLabel(lent)).toBe("budget until January 15, 2027, 00:00 UTC");
+    // Nothing to say without a date, with one that cannot be read, or once the
+    // gateway calls the model premium again.
+    expect(budgetUntilLabel({ access: "budget" })).toBe("");
+    expect(budgetUntilLabel({ access: "budget", access_until: "soon" })).toBe("");
+    expect(budgetUntilLabel({ access: "premium", access_until: "2027-01-15T00:00:00Z" })).toBe("");
   });
 
   it("falls back to the tier on a gateway that sends no access", () => {

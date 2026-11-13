@@ -26,6 +26,7 @@ import {
   PaywallError,
   PremiumLockedError,
   accessColumn,
+  budgetUntilLabel,
   adsPerTaskLabel,
   grantLabel,
   NO_PREMIUM_CREDITS,
@@ -366,6 +367,8 @@ async function listModels(client: GatewayClient, config: CliConfig) {
         : turns > 0
           ? c.green(` [free: ~${turns} turn${turns === 1 ? "" : "s"} left today]`)
           : c.dim(" [free: none left today]");
+    const until = budgetUntilLabel(m);
+    const untilTag = until ? c.dim(` [${until}]`) : "";
     const lockTag =
       m.access === "premium" && premiumLocked(premium)
         ? c.yellow(` [${premiumHeadline(client.premiumUnlockUsd).replace(/\.$/, "")}]`)
@@ -373,7 +376,7 @@ async function listModels(client: GatewayClient, config: CliConfig) {
     console.log(
       `  ${c.cyan(m.id.padEnd(22))} ${accessColumn(m, premium)} ` +
         `in ${String(m.credits_per_mtoken_input).padStart(9)}  out ${String(m.credits_per_mtoken_output).padStart(9)}  ` +
-        `${task(m) ?? adsPerTaskLabel(m.est_ads_per_task)}${tag}${freeTag}${lockTag}`,
+        `${task(m) ?? adsPerTaskLabel(m.est_ads_per_task)}${tag}${freeTag}${untilTag}${lockTag}`,
     );
   }
 }

@@ -45,6 +45,12 @@ const allowance = {
 };
 
 describe("the model picker", () => {
+  it("puts the date a lent model goes back to premium first, where a cut row keeps it", () => {
+    const lent = model({ id: "gemini-3.8-flash", free: false, access: "budget", access_until: "2027-01-15T00:00:00Z" });
+    expect(modelHint(lent, allowance).startsWith("budget until January 15, 2027, 00:00 UTC · ")).toBe(true);
+    expect(modelHint(model({ id: "kimi-k2.5", free: false, access: "budget" }), allowance)).not.toContain("until");
+  });
+
   it("says how many free turns are left, per model", () => {
     // The thing the picker exists to show: the same allowance is thirty turns
     // on one free model and three on another, and nothing else on screen says

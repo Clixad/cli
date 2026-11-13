@@ -93,6 +93,12 @@ export interface ModelInfo {
    */
   access?: "budget" | "premium";
   /**
+   * The instant (ISO 8601, UTC) until which a premium model is offered as a
+   * budget model; `access` says "budget" until then and "premium" after. Only
+   * sent while that applies; absent everywhere else and on older gateways.
+   */
+  access_until?: string;
+  /**
    * Whether auto mode is offered on this model (`autoMode` in the catalog).
    * Absent on a gateway older than the field, which is read as "not offered":
    * a mode that runs commands nobody approved is not one to switch on by guess.
@@ -115,6 +121,20 @@ export function accessColumn(m: Pick<ModelInfo, "tier" | "access">, premium: Pre
   if (m.access === undefined) return m.tier.padEnd(8);
   if (m.access === "budget") return "budget  ";
   return premiumLocked(premium) ? "locked  " : "premium ";
+}
+
+/**
+ * "budget until January 15, 2027, 00:00 UTC": what a row says about a model
+ * that is a budget model only until a date, from the gateway's `access_until`.
+ * Empty when there is no such date or it cannot be read, so a row never shows
+ * a date the gateway did not send.
+ */
+export function budgetUntilLabel(m: Pick<ModelInfo, "access" | "access_until">): string {
+  if (m.access !== "budget" || !m.access_until) return "";
+  const at = new Date(m.access_until);
+  if (Number.isNaN(at.getTime())) return "";
+  const day = at.toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric", timeZone: "UTC" });
+  return `budget until ${day}, ${at.toISOString().slice(11, 16)} UTC`;
 }
 
 /** Whether premium models are closed to this account, as far as the gateway has said. */

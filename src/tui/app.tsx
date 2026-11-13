@@ -21,6 +21,7 @@ import {
   PremiumLockedError,
   PromptTooLongError,
   accessColumn,
+  budgetUntilLabel,
   parseSpendable,
   adsPerTaskLabel,
   NO_PREMIUM_CREDITS,
@@ -5590,7 +5591,8 @@ export function modelHint(
   /** What a task costs on this row (`rowTaskHint`); absent, the gateway's ads-per-task figure as before. */
   task?: string,
 ): string {
-  const effort = task ?? adsPerTaskLabel(m.est_ads_per_task);
+  const until = budgetUntilLabel(m);
+  const effort = (until ? `${until} · ` : "") + (task ?? adsPerTaskLabel(m.est_ads_per_task));
   // `m.free` is the catalog's own flag and `free.models` is this account's
   // allowance; both have to agree before a row claims to be free, so a paused
   // tier (which answers with an empty allowance) cannot leave "free" on screen.
