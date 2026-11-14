@@ -87,6 +87,13 @@ export interface CliConfig {
    */
   turns?: number;
   /**
+   * The one-time announcements this install has already shown, by id
+   * (`announcements.ts`), so each appears once and not on every start.
+   * Optional for `sponsor`'s reason; like `turns`, a property of the install,
+   * which `logout` leaves alone.
+   */
+  seenNotices?: string[];
+  /**
    * The `/effort` setting per model id, as typed at `/effort` (already moved
    * to a level that model takes). A model with no entry runs at its default.
    *

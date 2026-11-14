@@ -307,7 +307,10 @@ export function streakLabel(streak: StreakInfo): string | null {
   // here.
   const tomorrow = streak.schedule[Math.min(streak.day, streak.length - 1)];
   const next = tomorrow === undefined ? "" : ` · tomorrow ${n(tomorrow)}`;
-  return `daily streak: ${where} · +${n(streak.credits)} credits${next}`;
+  // Free usage on the budget models for today and tomorrow, not the balance,
+  // from a gateway that says so.
+  const unit = streak.freeAllowance ? "credits of free usage for today and tomorrow" : "credits";
+  return `daily streak: ${where} · +${n(streak.credits)} ${unit}${next}`;
 }
 
 
@@ -561,6 +564,12 @@ export interface StreakInfo {
   schedule: number[];
   /** How many days the ramp distinguishes before it flattens. */
   length: number;
+  /**
+   * The credits went to the free allowance for today and tomorrow rather than
+   * the balance (a gateway from 2026-11-14 on). Absent from an older gateway,
+   * which credited the balance.
+   */
+  freeAllowance?: boolean;
 }
 
 /**
@@ -1058,7 +1067,7 @@ export class PaywallError extends Error {
      * refusal it can end without a screenout; null from an older gateway or
      * when none is open.
      */
-    readonly ownSurvey: { credits: number; leftToday: number } | null = null,
+    readonly ownSurvey: { credits: number; leftToday: number; freeAllowance?: boolean } | null = null,
     /**
      * A short ad on the earn page that the gateway would credit right now:
      * what one pays and how many are left today. Null from an older gateway,
@@ -1263,11 +1272,18 @@ function paywallError(body: PaywallBody): PaywallError {
 }
 
 /** A 402's `own_survey` (or `rewarded_ad`), read defensively: anything unusable is no offer. */
-function ownSurveyOffer(raw: unknown): { credits: number; leftToday: number } | null {
+function ownSurveyOffer(raw: unknown): { credits: number; leftToday: number; freeAllowance?: boolean } | null {
   if (typeof raw !== "object" || raw === null) return null;
-  const o = raw as { credits?: unknown; left_today?: unknown };
+  const o = raw as { credits?: unknown; left_today?: unknown; free_allowance?: unknown };
   const ok = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v > 0;
-  return ok(o.credits) && ok(o.left_today) ? { credits: o.credits, leftToday: Math.floor(o.left_today) } : null;
+  if (!ok(o.credits) || !ok(o.left_today)) return null;
+  // A gateway from 2026-11-14 on adds our surveys' credits to the free
+  // allowance for today and tomorrow rather than the balance, and says so.
+  return {
+    credits: o.credits,
+    leftToday: Math.floor(o.left_today),
+    ...(o.free_allowance === true ? { freeAllowance: true } : {}),
+  };
 }
 
 /**
@@ -1715,6 +1731,7 @@ export class GatewayClient {
         balance: typeof body.balance === "number" ? body.balance : 0,
         schedule: Array.isArray(body.schedule) ? body.schedule : [],
         length: typeof body.length === "number" ? body.length : 0,
+        ...((body as { free_allowance?: unknown }).free_allowance === true ? { freeAllowance: true } : {}),
       };
     } catch {
       return null;

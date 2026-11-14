@@ -21,7 +21,7 @@ describe("buildKimiConfig", () => {
     expect(toml).toContain('provider = "clixad"');
     expect(toml).toContain('model = "gemini-2.5-flash-lite"');
     // Known model → its real context window, not the fallback.
-    expect(toml).toContain("max_context_size = 1048576");
+    expect(toml).toContain("max_context_size = 78000");
   });
 
   it("normalizes a trailing slash on the gateway URL", () => {

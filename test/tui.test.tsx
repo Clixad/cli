@@ -702,7 +702,9 @@ describe("TUI ctrl+o", () => {
     ];
     let i = 0;
     const client = {
-      models: async () => catalog,
+      // A window of a million tokens, as the model in this config served until
+      // it was retired, so seven whole reads fit without a compaction.
+      models: async () => catalog.map((m) => ({ ...m, context_window: 1_048_576 })),
       wallet: async () => wallet,
       async chatStream(): Promise<ChatTurn> {
         return { ...turns[i++]!, creditsCharged: 7, balance: 4981 } as ChatTurn;
@@ -759,7 +761,9 @@ describe("TUI ctrl+o", () => {
     ];
     let i = 0;
     const client = {
-      models: async () => catalog,
+      // A window of a million tokens, as the model in this config served until
+      // it was retired, so seven whole reads fit without a compaction.
+      models: async () => catalog.map((m) => ({ ...m, context_window: 1_048_576 })),
       wallet: async () => wallet,
       async chatStream(): Promise<ChatTurn> {
         return { ...turns[i++]!, creditsCharged: 7, balance: 4981 } as ChatTurn;

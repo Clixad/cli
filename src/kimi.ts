@@ -32,7 +32,7 @@ import type { CliConfig } from "./config.ts";
  */
 export const CONTEXT_TOKENS: Record<string, number> = {
   "gpt-5-nano": 400_000,
-  "gemini-2.5-flash-lite": 1_048_576,
+  "gpt-6-luna": 78_000,
   "claude-haiku-5.5": 24_000,
   "deepseek-v4-flash": 1_048_576,
   "gemini-3.5-flash-lite": 1_048_576,
@@ -40,11 +40,12 @@ export const CONTEXT_TOKENS: Record<string, number> = {
   "kimi-k2.5": 262_144,
   "gemini-3.8-flash": 1_048_576,
   "kimi-k2.7-code": 262_144,
+  "gemini-4-hydrogen": 1_048_576,
   "claude-sonnet-5.5": 1_000_000,
   "gpt-6-sol": 78_000,
   "kimi-k3": 1_048_576,
   "claude-opus-5.5": 1_000_000,
-  "claude-fable-5.1": 1_000_000,
+  "claude-fable-5.2": 1_000_000,
   // Retired on 2026-09-27 and served by their successor (the gateway's
   // `retired_models`), so an install still configured with one compacts
   // against the window of the model that actually answers.
@@ -60,6 +61,9 @@ export const CONTEXT_TOKENS: Record<string, number> = {
   "claude-sonnet-5": 1_000_000,
   // Retired on 2026-10-12 for Claude Haiku 5.5.
   "claude-haiku-4.5": 24_000,
+  // Retired on 2026-11-14 for GPT-6 Luna and Claude Fable 5.2.
+  "gemini-2.5-flash-lite": 78_000,
+  "claude-fable-5.1": 1_000_000,
 };
 export const DEFAULT_CONTEXT_TOKENS = 256_000;
 

@@ -233,7 +233,10 @@ async function login(
       // Grouped, like `clixad wallet` and the TUI. Five figures is where a bare
       // integer starts being read as the wrong number, and this is the first
       // balance anyone sees.
-      const bonus = account.created
+      // No signup bonus since 2026-11-14: a new account starts at 0 with the
+      // day's free allowance, so a bonus is named only where one was paid.
+      const bonusPaid = account.signupBonus ?? account.balance;
+      const bonus = account.created && bonusPaid > 0
         ? c.dim(account.signupBonus === undefined ? " (signup bonus)" : ` (signup bonus ${credits(account.signupBonus)})`)
         : "";
       console.log(`  balance: ${c.bold(credits(account.balance))} credits${bonus}`);

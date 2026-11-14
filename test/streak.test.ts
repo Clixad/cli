@@ -108,6 +108,12 @@ describe("streakLabel", () => {
     expect(streakLabel(streak())).toBe("daily streak: day 3 of 7 · +400 credits · tomorrow 500");
   });
 
+  it("says the credits are free usage for today and tomorrow when the gateway says so (2026-11-14)", () => {
+    expect(streakLabel(streak({ freeAllowance: true }))).toBe(
+      "daily streak: day 3 of 7 · +400 credits of free usage for today and tomorrow · tomorrow 500",
+    );
+  });
+
   it("says nothing happened when today was already counted", () => {
     // The claim is idempotent and three surfaces make it, so a label that
     // announced a grant every time would report the same 400 credits three

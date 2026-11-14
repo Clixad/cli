@@ -54,6 +54,7 @@ import { loadMcpConfig, McpHub, type McpPendingServer, type McpStatus } from "..
 import { TodoList } from "../todos.ts";
 import { shells } from "../shells.ts";
 import { saveConfig, saveEffort, type CliConfig } from "../config.ts";
+import { CREDIT_MODEL_NOTICE_ID, creditModelNotice, withNoticeSeen } from "../announcements.ts";
 import { preferencesInstruction, sponsorPreference, type TurnPreferences } from "../preferences.ts";
 import { effortLabel, effortRaised, effortsOf, parseEffortArg, resolveEffort, savedEffort } from "../effort.ts";
 import { TERMS_NOTICE, TERMS_URL, parseLoginArgs, performLogin } from "../login.ts";
@@ -1519,6 +1520,12 @@ export function App({
         text: `  ${host} did not answer, so the balance is unknown for now. It fills in once a request gets through.`,
       });
     }
+    // The change of 14 November 2026, once per install, before the streak line
+    // that is the first place it shows. Saved as seen when drawn, and for a new
+    // account without being drawn.
+    const announce = creditModelNotice(config, streak, Boolean(newAccount));
+    if (announce.text) push({ kind: "notice", tone: "good", text: `  ${announce.text}` });
+    if (announce.markSeen) saveConfig(withNoticeSeen(config, CREDIT_MODEL_NOTICE_ID));
     const streakLine = streak && streak.claimed ? streakLabel(streak) : null;
     if (streakLine) push({ kind: "notice", tone: "good", text: `  ${streakLine}` });
     // The free models, on every start, because this is where most people never
@@ -2634,7 +2641,7 @@ export function App({
               `  ${premiumHeadline(err.unlockUsd)}\n` +
               `  ${err.model} is a premium model. It runs on credits from offer-wall surveys or purchases.\n` +
               short +
-              "  Your bonus credits (the signup bonus, our own surveys) still work on budget models.\n" +
+              "  Budget models are free each day, and any bonus credits you hold work on them too.\n" +
               rewardedAdLine(err.rewardedAd) +
               "  Press enter to unlock it or to switch to a budget model. Your request is kept.",
           });
@@ -2653,8 +2660,11 @@ export function App({
           // Our own survey, when the gateway says one is open (2026-10-19): the
           // way on with no screenout, and the first card on the wall.
           const own = err.ownSurvey
-            ? `  Our own surveys pay ${err.ownSurvey.credits.toLocaleString("en-US")} credits each and nobody is ` +
-              `screened out (${err.ownSurvey.leftToday} left today). They are first on the wall.\n`
+            ? err.ownSurvey.freeAllowance
+              ? `  Our own surveys add ${err.ownSurvey.credits.toLocaleString("en-US")} credits of free usage each for today and ` +
+                `tomorrow, and nobody is screened out (${err.ownSurvey.leftToday} left today). They are first on the wall.\n`
+              : `  Our own surveys pay ${err.ownSurvey.credits.toLocaleString("en-US")} credits each and nobody is ` +
+                `screened out (${err.ownSurvey.leftToday} left today). They are first on the wall.\n`
             : "";
           const ad = rewardedAdLine(err.rewardedAd);
           push({
@@ -2855,7 +2865,10 @@ export function App({
               text:
                 `  signed in as ${account.login ?? account.email ?? "you"} · ` +
                 `balance ${account.balance.toLocaleString("en-US")} credits` +
-                (account.created ? " (signup bonus)" : ""),
+                // No signup bonus since 2026-11-14: a new account starts at 0
+                // with the day's free allowance, and only an older gateway's
+                // bonus is named.
+                (account.created && account.balance > 0 ? " (signup bonus)" : ""),
             });
             // A brand-new account starts on the gateway's default, and
             // `performLogin` has already saved it. The ref moves first, for the
@@ -5630,7 +5643,7 @@ export function turnMeta(result: {
   const search = result.searchCredits && result.searchCredits > 0 ? ` · web search ${n(result.searchCredits)} credits` : "";
   if (result.creditsWaived <= 0) return `[${n(result.creditsCharged)} credits${search} · ${balance}]`;
   const left =
-    result.freeCreditsLeft === undefined ? "" : ` · ${n(result.freeCreditsLeft)} free credits left`;
+    result.freeCreditsLeft === undefined ? "" : ` · ${n(result.freeCreditsLeft)} free usage left`;
   if (result.creditsCharged > 0) {
     return `[free: ${n(result.creditsWaived)} credits · then ${n(result.creditsCharged)} charged${search} · ${balance}]`;
   }

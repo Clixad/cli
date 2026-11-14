@@ -73,7 +73,7 @@ interface Script {
   /** Every call the TUI made: the model it used and the prompt it sent. */
   calls: { model: string; prompt: string }[];
   /** One of our own surveys open to the account, as the refusal reports it. */
-  own?: { credits: number; leftToday: number } | null;
+  own?: { credits: number; leftToday: number; freeAllowance?: boolean } | null;
   /** A short ad the gateway would credit now, as the refusal reports it. */
   ad?: { credits: number; leftToday: number } | null;
 }
@@ -240,6 +240,17 @@ describe("the paywall names our own survey first when one is open (2026-10-19)",
         "Our own surveys pay 10,000 credits each and nobody is screened out (4 left today). They are first on the wall.",
       );
     }
+  });
+
+  it("says the credits are free usage for today and tomorrow when the gateway says so (2026-11-14)", async () => {
+    const { lastFrame } = await runIntoThePaywall({
+      free: [],
+      own: { credits: 10_000, leftToday: 4, freeAllowance: true },
+      calls: [],
+    });
+    expect(strip(lastFrame() ?? "").replace(/\s+/g, " ")).toContain(
+      "Our own surveys add 10,000 credits of free usage each for today and tomorrow, and nobody is screened out (4 left today).",
+    );
   });
 
   it("says nothing about them when the gateway offers none", async () => {

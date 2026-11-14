@@ -82,8 +82,10 @@ export function shouldCompact(messages: ChatMessage[], contextTokens: number): b
  * Retired ids are in it when the model serving them is.
  */
 export const COMPACTS_ON_REFUSAL: ReadonlySet<string> = new Set([
+  "gpt-6-luna",
   "claude-haiku-5.5",
   "gpt-6-sol",
+  "gemini-2.5-flash-lite",
   "kimi-k2",
   "claude-haiku-4.5",
   "gpt-5.2",

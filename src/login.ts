@@ -82,7 +82,7 @@ export interface LoginAccount {
   /** GitHub login. Absent on the dev shortcut, which has no GitHub identity. */
   login?: string;
   balance: number;
-  /** A brand-new account, i.e. the balance is the signup bonus. */
+  /** A brand-new account: the balance is the signup bonus, or 0 from a gateway that pays none (2026-11-14). */
   created: boolean;
   /** The bonus figure, when the gateway reported one separately. */
   signupBonus?: number;

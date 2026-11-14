@@ -109,7 +109,7 @@ export function freeHelpLine(
   if (free.credits_left <= 0) return { label: "free models", desc: `used up today, back at midnight UTC${search}` };
   return {
     label: "free today",
-    desc: `${free.models.length} models, ${free.credits_left.toLocaleString("en-US")} free credits left · /model switches${search}`,
+    desc: `${free.models.length} models, ${free.credits_left.toLocaleString("en-US")} credits of free usage left · /model switches${search}`,
   };
 }
 

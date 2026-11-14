@@ -128,7 +128,7 @@ describe("/help", () => {
   it("leads with the free models while there are any", () => {
     const text = helpText(freeHelpLine({ ...FREE, credits_left: 8_400 }));
     expect(text.split("\n")[0]).toContain("free today");
-    expect(text.split("\n")[0]).toContain("8,400 free credits left");
+    expect(text.split("\n")[0]).toContain("8,400 credits of free usage left");
     expect(text.split("\n")[0]).toContain("/model");
   });
 

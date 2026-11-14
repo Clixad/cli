@@ -111,7 +111,7 @@ describe("the turn meta line", () => {
     const line = turnMeta({ creditsCharged: 0, creditsWaived: 390, freeCreditsLeft: 7_110, balance });
     expect(line).toContain("free");
     expect(line).toContain("390 credits waived");
-    expect(line).toContain("7,110 free credits left");
+    expect(line).toContain("7,110 free usage left");
     expect(line).not.toContain("0 credits ·");
   });
 
@@ -125,7 +125,7 @@ describe("the turn meta line", () => {
   it("names what web searches took on a free turn, and the balance they took it from", () => {
     // A free turn's model calls charge nothing; its searches do not stop being paid.
     const line = turnMeta({ creditsCharged: 0, creditsWaived: 4_000, freeCreditsLeft: 56_000, searchCredits: 2_138, balance });
-    expect(line).toBe("[free · 4,000 credits waived · 56,000 free credits left · web search 2,138 credits · balance 4,988]");
+    expect(line).toBe("[free · 4,000 credits waived · 56,000 free usage left · web search 2,138 credits · balance 4,988]");
   });
 
   it("names searches beside a paid turn's model credits, and nothing when there were none", () => {

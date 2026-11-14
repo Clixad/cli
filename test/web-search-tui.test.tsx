@@ -137,7 +137,7 @@ describe("a web search on a free model", () => {
     const frame = strip(view.lastFrame()!);
     expect(frame).toContain('Web Search("vitest fake timers")');
     expect(frame).toContain("⎿  No results · 1,069 credits");
-    expect(frame).toContain("[free · 410 credits waived · 59,590 free credits left · web search 1,069 credits · balance 3,919]");
+    expect(frame).toContain("[free · 410 credits waived · 59,590 free usage left · web search 1,069 credits · balance 3,919]");
     // The balance and the session's spend moved for a turn whose model calls were free.
     expect(statusRow(frame)).toContain("3,919 cr");
     expect(statusRow(frame)).toContain("−1,069");
