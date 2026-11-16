@@ -12,6 +12,7 @@ import {
   freeTierNotice,
   webSearchCostLine,
   type FreeTier,
+  walletSummaryLines,
 } from "../src/free-tier.ts";
 import { helpText } from "../src/tui/commands.ts";
 
@@ -127,19 +128,21 @@ describe("the notice when the REPL opens", () => {
 describe("/help", () => {
   it("leads with the free models while there are any", () => {
     const text = helpText(freeHelpLine({ ...FREE, credits_left: 8_400 }));
-    expect(text.split("\n")[0]).toContain("free today");
-    expect(text.split("\n")[0]).toContain("8,400 credits of free usage left");
+    expect(text.split("\n")[0]).toContain("free limit");
+    expect(text.split("\n")[0]).toContain("8,400 left today on");
     expect(text.split("\n")[0]).toContain("/model");
   });
 
   it("says when they come back once they are gone", () => {
-    expect(helpText(freeHelpLine(SPENT)).split("\n")[0]).toContain("midnight UTC");
+    expect(helpText(freeHelpLine(SPENT)).split("\n")[0]).toContain("used up today, back at 00:00 UTC");
   });
 
   it("is the old list on a gateway with no free tier", () => {
     expect(freeHelpLine(PAUSED)).toBeUndefined();
     expect(helpText(freeHelpLine(undefined))).toBe(helpText());
-    expect(helpText().split("\n")[0]).toContain("/help");
+    // How the free limit and credits fit leads, then the commands.
+    expect(helpText().split("\n")[0]).toContain("The budget models are free every day up to a daily limit");
+    expect(helpText()).toContain("/help");
   });
 
   it("says web searches are not free when search is on, and nothing about them when it is off", () => {
@@ -179,5 +182,27 @@ describe("a one-shot command refused for credits", () => {
   it("says nothing when nothing is free", () => {
     expect(freeAlternativeLine([])).toBeUndefined();
     expect(freeAlternativeLine([{ id: "kimi-k2.5", turnsLeft: 0 }])).toBeUndefined();
+  });
+});
+
+describe("/wallet's first lines (2026-11-16)", () => {
+  it("says the free limit and the credits apart, with no expiry beside either", () => {
+    const lines = walletSummaryLines({ balance: 120_000, free: { ...FREE, credits_left: 45_000 }, premium: { unlocked: false, credits: 120_000 } });
+    expect(lines).toEqual([
+      "free limit: 45,000 left today on the budget models",
+      "credits: 120,000 · they work on every model and do not expire",
+    ]);
+    expect(lines.join(" ")).not.toMatch(/tomorrow|expires|free usage/);
+  });
+
+  it("names old bonus credits only where the account still holds some", () => {
+    const lines = walletSummaryLines({ balance: 120_000, free: SPENT, premium: { unlocked: false, credits: 87_000 } });
+    expect(lines).toEqual([
+      "free limit: used up today, back at 00:00 UTC",
+      "credits: 120,000 · they work on every model and do not expire",
+      "  33,000 of them are bonus credits from before 14 November, for budget models only",
+    ]);
+    // Every credit opens premium for an account that bought before 19 October.
+    expect(walletSummaryLines({ balance: 120_000, free: undefined, premium: { unlocked: true, credits: 120_000 } })).toHaveLength(1);
   });
 });

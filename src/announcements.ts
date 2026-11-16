@@ -19,9 +19,9 @@ export const CREDIT_MODEL_NOTICE_ID = "credit-model-2026-11-14";
  * and the REPL's other lines already quote them.
  */
 export const CREDIT_MODEL_NOTICE =
-  "Since 14 November every budget model is free up to the daily allowance, and our own surveys and the\n" +
-  "  daily streak add free usage for that day and the next instead of credits. Credits you already have\n" +
-  "  stay in your balance and work as before.";
+  "Since 14 November the budget models are free every day up to a daily limit, and our own surveys and\n" +
+  "  the daily login streak raise that limit instead of adding credits. Credits you already have stay in\n" +
+  "  your balance and work as before.";
 
 /**
  * The announcement to draw at this start, if any. The streak claim is the

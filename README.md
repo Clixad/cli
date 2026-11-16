@@ -1,11 +1,13 @@
 # clixad
 
 A terminal coding agent that routes model calls through the Clixad metering gateway. No
-subscription: the cheapest models are free to use up to a daily allowance, and past that you earn
-credits by completing rewarded offers in your browser and spend them on real model API calls.
+subscription: one free limit, plus credits. The budget models are free every day up to a daily
+limit, which resets at 00:00 UTC. Our own surveys and the daily login streak raise the limit, each
+for that day and the next. You earn credits on the offer walls or buy them. They work on every model
+and do not expire. Budget models use the free limit first, then credits.
 
-`/model` marks which models are free and shows roughly how many free turns the allowance still buys
-on each. The same allowance goes a lot further on the cheapest one. The status line counts it down,
+`/model` marks which models are free and shows roughly how many free turns the limit still buys on
+each. The same limit goes a lot further on the cheapest one. The status line counts it down,
 and once it is gone the model carries on against credits. The REPL names the free models when it
 opens and again if your balance runs out. `/help` leads with them too, and a new account starts on
 one.
@@ -38,6 +40,10 @@ or install it globally:
 npm install -g clixad
 ```
 
+When a newer version is out, the REPL says so once a day, and `/update` installs it for a global npm
+install. It names the command to run yourself when it cannot, for example when npm may not write to
+its global folder.
+
 Requires Node.js >= 20.
 
 ## What it does
@@ -49,8 +55,7 @@ before it changes anything. `shift+tab` cycles through the permission modes. Bey
   and a short list of destructive ones (`sudo`, deleting your home directory, piping a download into
   a shell, reading your SSH keys) is refused outright. Anything else is checked first by one short
   call to the model you are using, billed like any other call, and if that check cannot run you are
-  asked instead. It is offered on every model except the two smallest, GPT-5 Nano and Gemini 2.5
-  Flash-Lite.
+  asked instead. It is offered on every model except GPT-5 Nano, GPT-6 Luna and GLM 5.3 Flash.
 
 - **Reads the web:** searches for current documentation and error messages, and fetches a page,
   JSON endpoint or PDF to read it.
@@ -60,6 +65,9 @@ before it changes anything. `shift+tab` cycles through the permission modes. Bey
   filename.
 - **Delegates wide searches** to a sub-agent, so the forty files it opened to find the three that
   mattered stay out of the conversation you are paying for.
+- **Takes back a message:** `/undo` puts your last message back in the input box to edit and send
+  again. The files the agent changed for it stay changed, and the credits it used stay spent; it says
+  which files.
 - **Keeps a task list** on multi-step work, and **asks you** when guessing wrong would waste real
   work.
 - **Uses MCP servers** you configure in `.mcp.json` or `~/.clixad/mcp.json`; `/mcp` shows their

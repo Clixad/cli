@@ -37,8 +37,36 @@ const SHELL_NOTE = /^I ran `([^\n]*)` in the workspace myself\. Its output:\n\n(
 const IMAGE_NOTE = /^Here (?:is the image|are the images) you read \(/;
 
 /** A tool result the agent loop wrote for a call that did not succeed. */
-function failed(result: string): boolean {
+export function failed(result: string): boolean {
   return result.startsWith("error: ") || result === INTERRUPTED_CALL;
+}
+
+/**
+ * What the person typed, for a user message they typed; undefined for the
+ * ones the REPL writes in their name (the summary, the images a tool read, a
+ * `!command`'s output). Without the files an `@path` attached after it.
+ * `/undo` reads messages the way this file draws them, so the message it
+ * takes back is the one the transcript shows as typed.
+ */
+export function typedText(text: string): string | undefined {
+  if (text.startsWith(SUMMARY_LEAD) || IMAGE_NOTE.test(text) || SHELL_NOTE.test(text)) return undefined;
+  const cut = text.indexOf(MENTIONS_HEADING);
+  const typed = (cut >= 0 ? text.slice(0, cut) : text).trim();
+  return typed || undefined;
+}
+
+/** Whether a user message is the conversation's summary. */
+export function isSummary(text: string): boolean {
+  return text.startsWith(SUMMARY_LEAD);
+}
+
+/** Whether a user message is a `!command` the person ran, and its command. */
+export function shellCommand(text: string): string | undefined {
+  return SHELL_NOTE.exec(text)?.[1];
+}
+
+export function parseToolArgs(raw: string | undefined): Record<string, unknown> {
+  return parseArgs(raw);
 }
 
 function parseArgs(raw: string | undefined): Record<string, unknown> {

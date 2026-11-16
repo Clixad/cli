@@ -94,6 +94,12 @@ export interface CliConfig {
    */
   seenNotices?: string[];
   /**
+   * Which newer version the startup line last named, and on which UTC day
+   * (`<version>@<YYYY-MM-DD>`), so it is said once a day per version and not
+   * at every start (`updateNotice`). A property of the install, like `turns`.
+   */
+  updateNotified?: string;
+  /**
    * The `/effort` setting per model id, as typed at `/effort` (already moved
    * to a level that model takes). A model with no entry runs at its default.
    *

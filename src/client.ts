@@ -307,10 +307,11 @@ export function streakLabel(streak: StreakInfo): string | null {
   // here.
   const tomorrow = streak.schedule[Math.min(streak.day, streak.length - 1)];
   const next = tomorrow === undefined ? "" : ` · tomorrow ${n(tomorrow)}`;
-  // Free usage on the budget models for today and tomorrow, not the balance,
-  // from a gateway that says so.
-  const unit = streak.freeAllowance ? "credits of free usage for today and tomorrow" : "credits";
-  return `daily streak: ${where} · +${n(streak.credits)} ${unit}${next}`;
+  // A raise of the free limit, not the balance, from a gateway that says so
+  // (2026-11-14). No expiry beside the amount: the rule is said once, in
+  // `/help` and on every page, of the limit as a whole.
+  if (streak.freeAllowance) return `daily streak: ${where} · free limit +${n(streak.credits)}${next}`;
+  return `daily streak: ${where} · +${n(streak.credits)} credits${next}`;
 }
 
 

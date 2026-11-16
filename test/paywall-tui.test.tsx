@@ -249,7 +249,7 @@ describe("the paywall names our own survey first when one is open (2026-10-19)",
       calls: [],
     });
     expect(strip(lastFrame() ?? "").replace(/\s+/g, " ")).toContain(
-      "Our own surveys add 10,000 credits of free usage each for today and tomorrow, and nobody is screened out (4 left today).",
+      "Each of our own surveys raises your free limit by 10,000, and nobody is screened out (4 left today).",
     );
   });
 

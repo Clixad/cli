@@ -96,10 +96,12 @@ import {
   taskHint,
   taskVerdict,
 } from "../estimate.ts";
-import { freeHelpLine, freeTierNotice, webSearchCostLine, type FreeTier } from "../free-tier.ts";
+import { freeHelpLine, freeTierNotice, HOW_IT_WORKS, walletSummaryLines, webSearchCostLine, type FreeTier } from "../free-tier.ts";
 import { contextTokensFor } from "../kimi.ts";
 import { openBrowser } from "../browser.ts";
-import { VERSION, VERSION_LABEL, isNewerVersion } from "../version.ts";
+import { VERSION, VERSION_LABEL } from "../version.ts";
+import { realUpdateDeps, runUpdate, updateLines, updateNotice, type UpdateOutcome } from "../update.ts";
+import { nothingToUndo, planUndo, undoLines, UNSENT_UNDO } from "../undo.ts";
 import { listWorkspaceFiles, TOOLS, type AskUserRequest } from "../tools.ts";
 import {
   createPermit,
@@ -201,6 +203,7 @@ const SIGNING_IN = "signing in…";
 const RUNNING = "running…";
 const SENDING_FEEDBACK = "sending…";
 const WAITING_FOR_PAYMENT = "waiting for the payment…";
+const UPDATING = "updating clixad…";
 
 /**
  * How many turns pass between two feedback prompts.
@@ -579,6 +582,12 @@ export interface AppProps {
    * second one begins.
    */
   initHint?: { returning: boolean } | undefined;
+  /**
+   * Run `/update`, instead of npm on this machine. A seam for `sponsorServe`'s
+   * reason: what is tested is how the REPL words every outcome, and the real
+   * thing replaces the CLI a test is running from.
+   */
+  update?: ((signal: AbortSignal) => Promise<UpdateOutcome>) | undefined;
 }
 
 /** Finished turns in one session before `/init` is suggested to a newcomer. */
@@ -675,6 +684,7 @@ export function App({
   sponsorDirect,
   initHint,
   preferences,
+  update,
 }: AppProps) {
   const { exit } = useApp();
   // The account's name and instructions, said to the model on every turn.
@@ -1171,6 +1181,14 @@ export function App({
    * exchange, and once the exchange is gone there is nothing to rate.
    */
   const lastTurnRef = useRef<Omit<FeedbackReport, "session" | "rating"> | null>(null);
+  /**
+   * Whether the running turn's conversation was kept (`setMessages` with the
+   * task in it), and the last typed message whose turn was not: a request
+   * refused before any work leaves the conversation as it was, so `/undo`
+   * would otherwise take back the message before it instead.
+   */
+  const turnKeptRef = useRef(false);
+  const unsentRef = useRef<string | null>(null);
   /** Once per session: the free allowance ran out and turns now cost credits. */
   const freeSpentNoticeRef = useRef(false);
   /** Once per session: a paid turn emptied the balance. */
@@ -1584,12 +1602,14 @@ export function App({
             text: `  ${from} was retired; now using its successor, ${successor}. /model picks another.`,
           });
         }
-        const latest = client.latestCli;
-        if (latest && isNewerVersion(latest, VERSION)) {
-          push({
-            kind: "notice",
-            text: `  clixad ${latest} is out (you have ${VERSION}). Update with: npm install -g clixad@latest`,
-          });
+        // Once a UTC day per version, not at every start: somebody who
+        // opens the REPL ten times a day is told once, and `/update` is
+        // there whenever they want it.
+        const notice = updateNotice(client.latestCli, VERSION, config.updateNotified, utcDay());
+        if (notice) {
+          config.updateNotified = notice.mark;
+          saveConfig(config);
+          push({ kind: "notice", text: `  ${notice.text}` });
         }
       })
       .catch(() => undefined);
@@ -2347,6 +2367,7 @@ export function App({
       // stale one would let enter switch to a model that has nothing left.
       pendingFreeRef.current = [];
       pendingPremiumRef.current = null;
+      turnKeptRef.current = false;
       // Deliberately shadowing the render's `model` for the length of this
       // function: see `modelRef`. Every line below wants the model this turn is
       // about to run on, which is not the same thing as the model the last
@@ -2455,6 +2476,8 @@ export function App({
         const next = result.messages.slice(1);
         setMessages(next);
         persist(next);
+        turnKeptRef.current = true;
+        unsentRef.current = null;
 
         if (result.stopped === "aborted") {
           // What was already on screen of the answer stays readable.
@@ -2603,6 +2626,8 @@ export function App({
         if (kept) {
           setMessages(kept);
           persist(kept);
+          turnKeptRef.current = true;
+          unsentRef.current = null;
         }
         // A conversation the gateway refused as too long for the model. It is
         // told to run /compact only when that is sure to bring it under the
@@ -2661,8 +2686,8 @@ export function App({
           // way on with no screenout, and the first card on the wall.
           const own = err.ownSurvey
             ? err.ownSurvey.freeAllowance
-              ? `  Our own surveys add ${err.ownSurvey.credits.toLocaleString("en-US")} credits of free usage each for today and ` +
-                `tomorrow, and nobody is screened out (${err.ownSurvey.leftToday} left today). They are first on the wall.\n`
+              ? `  Each of our own surveys raises your free limit by ${err.ownSurvey.credits.toLocaleString("en-US")}, and nobody ` +
+                `is screened out (${err.ownSurvey.leftToday} left today). They are first on the wall.\n`
               : `  Our own surveys pay ${err.ownSurvey.credits.toLocaleString("en-US")} credits each and nobody is ` +
                 `screened out (${err.ownSurvey.leftToday} left today). They are first on the wall.\n`
             : "";
@@ -3426,6 +3451,63 @@ export function App({
             });
           });
           return;
+        // The last typed message back into the input box, and the conversation
+        // cut before it, on disk as well as in memory (`undo.ts`). What the
+        // turn did to files and the credits it used stay, and the notice says
+        // which files.
+        case "undo": {
+          const unsent = unsentRef.current;
+          if (unsent !== null) {
+            unsentRef.current = null;
+            setEditor(ed.fromText(unsent));
+            push({ kind: "notice", text: `  ${UNSENT_UNDO}` });
+            return;
+          }
+          const result = planUndo(messagesRef.current);
+          if (!result.ok) {
+            push({ kind: "notice", tone: "warn", text: `  ${nothingToUndo(result.reason)}` });
+            return;
+          }
+          const { plan } = result;
+          messagesRef.current = plan.kept;
+          setMessages(plan.kept);
+          // A rating is about the exchange that was just taken back.
+          lastTurnRef.current = null;
+          if (plan.kept.length) {
+            saveSession({
+              id: sessionRef.current.id,
+              started: sessionRef.current.started,
+              updated: new Date().toISOString(),
+              cwd: root,
+              model: modelRef.current,
+              title: sessionRef.current.title ?? (plan.text.split("\n")[0] || plan.text).slice(0, 80),
+              messages: plan.kept,
+            });
+          } else {
+            // Nothing left to resume. The next message names the session again.
+            deleteSession(sessionRef.current.id);
+            sessionRef.current = { id: sessionRef.current.id, started: sessionRef.current.started };
+          }
+          setEditor(ed.fromText(plan.text));
+          const lines = undoLines(plan);
+          push({ kind: "notice", text: `  ${lines.done}` });
+          push({ kind: "notice", tone: "warn", text: `  ${lines.kept}` });
+          return;
+        }
+        // npm, run for the person rather than printed for them to copy. Only
+        // an npm global install is updated; anything else is told what to run
+        // (`update.ts`). The new version takes over at the next start.
+        case "update":
+          await runBusy(UPDATING, async (signal) => {
+            const outcome = await (update ?? ((sig) => runUpdate(realUpdateDeps(VERSION, client.latestCli), sig)))(signal);
+            const { tone, lines } = updateLines(outcome);
+            push({
+              kind: "notice",
+              ...(tone === "plain" ? {} : { tone }),
+              text: lines.map((l) => `  ${l}`).join("\n"),
+            });
+          });
+          return;
         case "init":
           // Nothing left to suggest once somebody has asked for it.
           initHintedRef.current = true;
@@ -3646,11 +3728,16 @@ export function App({
             // notice, `/wallet` is a question about the account rather than an
             // announcement, so "today's already counted" is an answer to it.
             const streakLine = streakNow && streakLabel(streakNow);
+            // The free limit first and the credits second, said the way /help
+            // and every page say them (2026-11-16): one limit, plus credits.
+            if (w.free_tier) setFreeTier(w.free_tier);
             push({
               kind: "notice",
               text:
-                `  balance ${w.balance.toLocaleString("en-US")} credits · ` +
-                `${w.ads_today} offers today · $${w.earned_usd_today.toFixed(2)}/$${w.max_reward_usd_per_day.toFixed(2)} earned` +
+                walletSummaryLines({ balance: w.balance, free: w.free_tier, premium: w.premium })
+                  .map((l) => `  ${l}`)
+                  .join("\n") +
+                `\n  ${w.ads_today} offers today · $${w.earned_usd_today.toFixed(2)}/$${w.max_reward_usd_per_day.toFixed(2)} earned` +
                 usableNow.map((l) => `\n  ${l}`).join("") +
                 (screenouts
                   ? `\n  plus ${screenoutCredits.toLocaleString("en-US")} credits from ` +
@@ -3662,7 +3749,8 @@ export function App({
                   ? `\n  recently: ${reversed.toLocaleString("en-US")} credits from ` +
                     `${reversals.length} offer${reversals.length === 1 ? "" : "s"} were reversed ` +
                     `by the provider. Run \`clixad wallet\` for the full ledger.`
-                  : ""),
+                  : "") +
+                `\n  ${HOW_IT_WORKS.order} /help says more.`,
             });
           });
           return;
@@ -3883,7 +3971,7 @@ export function App({
           push({ kind: "notice", tone: "warn", text: `  unknown command: /${cmd} — try /help` });
       }
     },
-    [askMcpApproval, client, cols, config, cycleMode, exit, handleEvent, model, modelTaskHints, premium, push, replayConversation, root, runAdWall, runBusy, runBuy, runLogin, runTurn, setPremium, writeToStdout],
+    [askMcpApproval, client, cols, config, cycleMode, exit, handleEvent, model, modelTaskHints, premium, push, replayConversation, root, runAdWall, runBusy, runBuy, runLogin, runTurn, setPremium, update, writeToStdout],
   );
 
   /**
@@ -3966,7 +4054,9 @@ export function App({
             "message carries on this model. The agent reads the rest as it needs.",
         });
       }
-      return runTurn(task, images);
+      await runTurn(task, images);
+      // Typed, sent and not kept: what `/undo` gives back.
+      if (!turnKeptRef.current) unsentRef.current = line;
     },
     [contextWindow, push, root, runCommand, runShell, runTurn],
   );
@@ -5643,7 +5733,7 @@ export function turnMeta(result: {
   const search = result.searchCredits && result.searchCredits > 0 ? ` · web search ${n(result.searchCredits)} credits` : "";
   if (result.creditsWaived <= 0) return `[${n(result.creditsCharged)} credits${search} · ${balance}]`;
   const left =
-    result.freeCreditsLeft === undefined ? "" : ` · ${n(result.freeCreditsLeft)} free usage left`;
+    result.freeCreditsLeft === undefined ? "" : ` · free limit: ${n(result.freeCreditsLeft)} left`;
   if (result.creditsCharged > 0) {
     return `[free: ${n(result.creditsWaived)} credits · then ${n(result.creditsCharged)} charged${search} · ${balance}]`;
   }
@@ -5710,10 +5800,10 @@ export function walletUsableLines(balance: number, f: Spendable): string[] {
     const back = Math.min(balance, Math.max(budget, f.budgetAfterReset)) - budget;
     lines.push(
       back >= locked
-        ? `${n(locked)} bonus credits are over today's limit and become usable at 00:00 UTC`
+        ? `${n(locked)} bonus credits are over today's limit for bonus credits and become usable at 00:00 UTC`
         : back > 0
-          ? `${n(locked)} bonus credits are over today's limit: ${n(back)} become usable at 00:00 UTC, the rest on later days`
-          : `${n(locked)} bonus credits are over today's limit`,
+          ? `${n(locked)} bonus credits are over today's limit for bonus credits: ${n(back)} become usable at 00:00 UTC, the rest on later days`
+          : `${n(locked)} bonus credits are over today's limit for bonus credits`,
     );
   }
   return lines;

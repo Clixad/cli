@@ -1,3 +1,5 @@
+import { howItWorksLines } from "../free-tier.ts";
+
 /**
  * The slash commands the REPL knows about, in one place: the autocomplete menu
  * under the input box, /help and the welcome banner all read from this list, so
@@ -52,6 +54,10 @@ export const COMMANDS: SlashCommand[] = [
   // somebody in a 401 loop needs.
   { name: "login", desc: "sign in, or switch account" },
   { name: "compact", desc: "summarise the conversation to free context" },
+  // Takes the last message back into the input box. The edits the agent made
+  // for it stay on disk and the credits it used stay spent, and the
+  // description says the first of those where the choice is made.
+  { name: "undo", desc: "take back your last message to edit it (file changes stay)" },
   { name: "clear", desc: "clear the screen and start a new session" },
   // Deliberately *no* `args` on /resume, for /login's reason: an arg hint makes
   // enter complete the command instead of running it, and the picker is the
@@ -63,6 +69,7 @@ export const COMMANDS: SlashCommand[] = [
   // are for. `/bg kill <id>` still works when typed in full.
   { name: "bg", desc: "background commands the agent started" },
   { name: "mcp", desc: "MCP servers and their tools (approve: start one from this project)" },
+  { name: "update", desc: "install the newest clixad version" },
   { name: "exit", desc: "quit clixad" },
 ];
 
@@ -95,6 +102,12 @@ export function helpText(free?: { label: string; desc: string }): string {
   const w = Math.max(...COMMANDS.map((c) => commandLabel(c).length), free ? free.label.length : 0);
   return (
     (free ? `  ${free.label.padEnd(w + 2)}${free.desc}\n\n` : "") +
+    // How the free limit and credits fit together, in the sentences every
+    // other surface uses: one limit that can be raised, and credits.
+    howItWorksLines()
+      .map((l) => `  ${l}`)
+      .join("\n") +
+    "\n\n" +
     COMMANDS.map((c) => `  ${commandLabel(c).padEnd(w + 2)}${c.desc}`).join("\n") +
     "\n\n" +
     [

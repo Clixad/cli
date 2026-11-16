@@ -273,10 +273,10 @@ describe("/wallet", () => {
   it("says what can be spent on each kind of model, and when the rest comes back", () => {
     expect(walletUsableLines(33_396, { budget: 0, premium: 0, budgetAfterReset: 33_396 })).toEqual([
       "usable now: 0 credits on budget models, 0 on premium models",
-      "33,396 bonus credits are over today's limit and become usable at 00:00 UTC",
+      "33,396 bonus credits are over today's limit for bonus credits and become usable at 00:00 UTC",
     ]);
     expect(walletUsableLines(55_358, { budget: 37, premium: 37, budgetAfterReset: 40_037 })[1]).toBe(
-      "55,321 bonus credits are over today's limit: 40,000 become usable at 00:00 UTC, the rest on later days",
+      "55,321 bonus credits are over today's limit for bonus credits: 40,000 become usable at 00:00 UTC, the rest on later days",
     );
     // Only premium held back: one line, nothing about a reset that does not apply.
     expect(walletUsableLines(25_000, { budget: 25_000, premium: 0, budgetAfterReset: 25_000 })).toEqual([
@@ -296,10 +296,10 @@ describe("/wallet", () => {
     view.stdin.write("/wallet");
     await tick();
     view.stdin.write("\r");
-    await frameIn(view.lastFrame, { has: ["usable now: 0 credits on budget models, 0 on premium models", "33,396 bonus credits are over today's limit and become usable at 00:00 UTC"] });
+    await frameIn(view.lastFrame, { has: ["usable now: 0 credits on budget models, 0 on premium models", "33,396 bonus credits are over today's limit for bonus credits and become usable at 00:00 UTC"] });
     const out = strip(view.lastFrame() ?? "");
     expect(out).toContain("usable now: 0 credits on budget models, 0 on premium models");
-    expect(out).toContain("33,396 bonus credits are over today's limit and become usable at 00:00 UTC");
+    expect(out).toContain("33,396 bonus credits are over today's limit for bonus credits and become usable at 00:00 UTC");
     expect(script.walletReads).toContainEqual({ premium: true });
   });
 });

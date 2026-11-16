@@ -34,9 +34,9 @@ export const CONTEXT_TOKENS: Record<string, number> = {
   "gpt-5-nano": 400_000,
   "gpt-6-luna": 78_000,
   "claude-haiku-5.5": 24_000,
-  "deepseek-v4-flash": 1_048_576,
-  "gemini-3.5-flash-lite": 1_048_576,
   "glm-5.3-flash": 1_048_576,
+  "deepseek-v4.1-flash": 1_048_576,
+  "gemini-3.5-flash-lite": 1_048_576,
   "kimi-k2.5": 262_144,
   "gemini-3.8-flash": 1_048_576,
   "kimi-k2.7-code": 262_144,
@@ -64,6 +64,8 @@ export const CONTEXT_TOKENS: Record<string, number> = {
   // Retired on 2026-11-14 for GPT-6 Luna and Claude Fable 5.2.
   "gemini-2.5-flash-lite": 78_000,
   "claude-fable-5.1": 1_000_000,
+  // Retired on 2026-11-16 for DeepSeek V4.1 Flash, same window.
+  "deepseek-v4-flash": 1_048_576,
 };
 export const DEFAULT_CONTEXT_TOKENS = 256_000;
 

@@ -60,7 +60,7 @@ describe("the announcement of the free-usage change", () => {
   it("is shown once, then remembered for this install", async () => {
     const cfg = config();
     const first = await open(cfg, streak());
-    expect(first).toContain("Since 14 November every budget model is free up to the daily allowance");
+    expect(first).toContain("Since 14 November the budget models are free every day up to a daily limit");
     expect(first).toContain("Credits you already have stay in your balance and work as before.");
     expect(cfg.seenNotices).toEqual([CREDIT_MODEL_NOTICE_ID]);
     const second = await open(cfg, streak({ claimed: false, credits: 0 }));

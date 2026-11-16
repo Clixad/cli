@@ -108,10 +108,8 @@ describe("streakLabel", () => {
     expect(streakLabel(streak())).toBe("daily streak: day 3 of 7 · +400 credits · tomorrow 500");
   });
 
-  it("says the credits are free usage for today and tomorrow when the gateway says so (2026-11-14)", () => {
-    expect(streakLabel(streak({ freeAllowance: true }))).toBe(
-      "daily streak: day 3 of 7 · +400 credits of free usage for today and tomorrow · tomorrow 500",
-    );
+  it("says the streak raised the free limit when the gateway says so, with no expiry beside it (2026-11-16)", () => {
+    expect(streakLabel(streak({ freeAllowance: true }))).toBe("daily streak: day 3 of 7 · free limit +400 · tomorrow 500");
   });
 
   it("says nothing happened when today was already counted", () => {

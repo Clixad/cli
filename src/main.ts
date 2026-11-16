@@ -54,7 +54,7 @@ import {
 } from "./config.ts";
 import { syncPreferences } from "./preferences.ts";
 import { TERMS_NOTICE, parseLoginArgs, performLogin } from "./login.ts";
-import { freeAlternativeLine, freeModelToName } from "./free-tier.ts";
+import { freeAlternativeLine, freeModelToName, HOW_IT_WORKS, walletSummaryLines } from "./free-tier.ts";
 import { compactionCost, NO_SEARCH_INSTRUCTION, runAgent, type AgentEvent } from "./agent.ts";
 import { toolSchemaFor } from "./tools.ts";
 import { collectContext, shouldSuggestInit } from "./context.ts";
@@ -457,33 +457,16 @@ async function showWallet(client: GatewayClient) {
   // Claimed before the balance is read, so the figure printed below already
   // includes today's grant rather than being one command behind it.
   const streak = await client.claimStreak();
-  const w = await client.wallet();
-  console.log(`balance: ${c.bold(w.balance.toLocaleString("en-US"))} credits`);
+  const w = await client.wallet(undefined, { premium: true });
+  // The free limit first and the credits second, in the words /help and every
+  // page use (2026-11-16): one limit that can be raised, plus credits.
+  const [first, ...rest] = walletSummaryLines({ balance: w.balance, free: w.free_tier, premium: w.premium });
+  for (const l of [first!, ...rest]) console.log(l.startsWith("free limit:") ? c.green(l) : l.startsWith("  ") ? c.dim(l) : l);
   // One figure, and it says it is the median. Unlabelled, a number next to the
   // balance reads as what the next offer will pay, and offers on the wall pay
   // well below and well above it. This line used to print the advertised range,
   // which carried no wall, count or date, and before that `typical grant: 40000`.
   console.log(`${earnedToday(w)}  ·  offers pay ${grantLabel(w.grant_per_ad)}`);
-  // The free allowance, on the one command whose whole job is "what have I got".
-  // Absent on a gateway with no free tier and on a paused one, which is the same
-  // silence — there is nothing free to report either way, and a line saying "0
-  // free credits" on a deployment that has never had a free tier would be
-  // describing a feature the reader cannot get to.
-  const free = w.free_tier;
-  if (free && free.daily_credits > 0) {
-    const best = free.models
-      .map((id) => ({ id, turns: free.turns_left[id] ?? 0 }))
-      .filter((m) => m.turns > 0)
-      .sort((a, b) => b.turns - a.turns)[0];
-    console.log(
-      free.credits_left > 0
-        ? c.green(
-            `free today: ${credits(free.credits_left)} of ${credits(free.daily_credits)} credits left` +
-              (best ? `  ·  ~${best.turns} turn${best.turns === 1 ? "" : "s"} on ${best.id}` : ""),
-          )
-        : c.dim(`free today: none left of ${credits(free.daily_credits)} credits — resets at midnight UTC`),
-    );
-  }
   const line = streak && streakLabel(streak);
   if (line) console.log(streak!.claimed ? c.green(line) : c.dim(line));
   if (w.ledger.length) {
@@ -505,6 +488,7 @@ async function showWallet(client: GatewayClient) {
       );
     }
   }
+  console.log(c.dim(HOW_IT_WORKS.order));
 }
 
 /**

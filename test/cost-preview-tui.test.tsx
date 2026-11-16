@@ -121,7 +121,8 @@ describe("/help", () => {
     await tick();
     view.stdin.write("\r");
     await tick(120);
-    expect(strip(view.lastFrame()!)).toContain("12,000 credits of free usage left");
+    expect(strip(view.lastFrame()!)).toContain("free limit");
+    expect(strip(view.lastFrame()!)).toContain("12,000 left today");
     view.unmount();
   });
 });

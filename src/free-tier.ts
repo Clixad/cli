@@ -19,6 +19,54 @@ export type FreeTier = NonNullable<WalletInfo["free_tier"]>;
 const turns = (n: number) => `about ${n.toLocaleString("en-US")} turn${n === 1 ? "" : "s"}`;
 
 /**
+ * How the free limit and credits fit together (2026-11-16), in the sentences
+ * the earn page, the account page and clixad.io use. A copy, since this
+ * program imports nothing from the gateway, and a test in `test/monorepo`
+ * holds it to the gateway's. One limit that can be raised, and credits: no
+ * amount anywhere carries an expiry, and the one rule about time is `raise`,
+ * said of the limit as a whole.
+ */
+export const HOW_IT_WORKS = {
+  freeLimit: "The budget models are free every day up to a daily limit, which resets at 00:00 UTC.",
+  raise: "Our own surveys and the daily login streak raise the limit, each for that day and the next.",
+  credits: "You earn credits on the offer walls or buy them. They work on every model and do not expire.",
+  order: "Budget models use the free limit first, then credits.",
+  oldBonus: "Bonus credits from before 14 November stay in your balance and work on budget models.",
+} as const;
+
+/** The explanation as `/help` prints it: the four rules, not the one about old bonus credits. */
+export function howItWorksLines(): string[] {
+  return [HOW_IT_WORKS.freeLimit, HOW_IT_WORKS.raise, HOW_IT_WORKS.credits, HOW_IT_WORKS.order];
+}
+
+/**
+ * What `/wallet` says about the free limit and the credits, before anything
+ * about offers or the streak. The free limit's figure is what is left today,
+ * with no expiry beside it; the credits' bonus part, the bonus credits from
+ * before 14 November, is named only where an account still holds some.
+ */
+export function walletSummaryLines(o: {
+  balance: number;
+  free: FreeTier | undefined;
+  /** What a premium call may spend: the credits from offers and purchases, unless every credit opens premium. */
+  premium?: { unlocked: boolean; credits: number } | undefined;
+}): string[] {
+  const n = (v: number) => Math.max(0, v).toLocaleString("en-US");
+  const lines: string[] = [];
+  if (o.free && o.free.daily_credits > 0) {
+    lines.push(
+      o.free.credits_left > 0
+        ? `free limit: ${n(o.free.credits_left)} left today on the budget models`
+        : "free limit: used up today, back at 00:00 UTC",
+    );
+  }
+  lines.push(`credits: ${n(o.balance)} · they work on every model and do not expire`);
+  const bonus = o.premium && !o.premium.unlocked ? o.balance - Math.min(o.balance, Math.max(0, o.premium.credits)) : 0;
+  if (bonus > 0) lines.push(`  ${n(bonus)} of them are bonus credits from before 14 November, for budget models only`);
+  return lines;
+}
+
+/**
  * Which free model to name, with the turns it has left, or undefined.
  *
  * The one in use when it is free and has turns left, since that is the model
@@ -106,10 +154,10 @@ export function freeHelpLine(
     searchCredits !== undefined && searchCredits > 0
       ? ` · web searches are not free, ~${searchCredits.toLocaleString("en-US")} credits each`
       : "";
-  if (free.credits_left <= 0) return { label: "free models", desc: `used up today, back at midnight UTC${search}` };
+  if (free.credits_left <= 0) return { label: "free limit", desc: `used up today, back at 00:00 UTC${search}` };
   return {
-    label: "free today",
-    desc: `${free.models.length} models, ${free.credits_left.toLocaleString("en-US")} credits of free usage left · /model switches${search}`,
+    label: "free limit",
+    desc: `${free.credits_left.toLocaleString("en-US")} left today on ${free.models.length} budget models · /model switches${search}`,
   };
 }
 
