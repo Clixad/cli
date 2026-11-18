@@ -68,7 +68,18 @@ export const MODE_STYLE: Record<PermissionMode, { color: string; glyph: string }
 };
 
 export type Entry =
-  | { id: number; kind: "banner"; text: string }
+  | {
+      id: number;
+      kind: "banner";
+      /** As drawn at the width the REPL opened at. */
+      text: string;
+      /**
+       * The banner at any width. The session is drawn again whenever the
+       * terminal changes width (`app.tsx`), and a box drawn for 100 columns,
+       * wrapped into 70, is a box whose borders run through its text.
+       */
+      draw?: (cols: number) => string;
+    }
   | { id: number; kind: "user"; text: string }
   | {
       id: number;
@@ -326,11 +337,29 @@ function toolResultRow(entry: Extract<Entry, { kind: "tool" }>): string {
   return `${RESULT_LEAD}${entry.line ?? ""}${hint}`;
 }
 
-function toolBody(entry: Extract<Entry, { kind: "tool" }>): string {
+/**
+ * A tool row's body at `cols`: one row a line, as it was built.
+ *
+ * The rows were fitted to the width the turn ran at, and the session is drawn
+ * again at every width the terminal is resized to. Past the width they were
+ * built for, they are cut rather than wrapped: a diff row is padded to the
+ * full width under its tint, and wrapped it would be two rows, the second a
+ * strip of empty colour.
+ */
+function toolBody(entry: Extract<Entry, { kind: "tool" }>, cols: number): string {
+  const room = Math.max(1, cols - TOOL_BODY_INDENT);
   return (entry.body ?? "")
     .split("\n")
-    .map((row) => `${BODY_LEAD}${row}`)
+    .map((row) => `${BODY_LEAD}${cutBodyRow(row, room)}`)
     .join("\n");
+}
+
+/** One body row in `room` columns: whole if it fits, else cut, with `…` only where text was lost. */
+function cutBodyRow(row: string, room: number): string {
+  if (visibleLength(row) <= room) return row;
+  // What lies past `room` may be only the padding a diff row carries.
+  const text = row.replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
+  return visibleLength(text) <= room ? sliceColumns(row, room) : fitRow(row, room);
 }
 
 function moreRow(more: number): string {
@@ -361,7 +390,7 @@ export function liveToolBlock(
 export function entryHeight(entry: Entry, cols: number): number {
   switch (entry.kind) {
     case "banner":
-      return lineCount(entry.text, cols);
+      return lineCount(entry.draw ? entry.draw(cols) : entry.text, cols);
     case "assistant": {
       const block = assistantBlock(entry.text, cols, { marker: !entry.cont, state: entry.md });
       return (
@@ -375,7 +404,7 @@ export function entryHeight(entry: Entry, cols: number): number {
         1 +
         lineCount(`⏺ ${entry.verb}${entry.target}`, cols) +
         (entry.line !== undefined ? lineCount(toolResultRow(entry), cols) : 0) +
-        (entry.body ? lineCount(toolBody(entry), cols) : 0) +
+        (entry.body ? lineCount(toolBody(entry, cols), cols) : 0) +
         (entry.more ? lineCount(moreRow(entry.more), cols) : 0)
       );
     case "user":
@@ -391,7 +420,7 @@ const DOT: Record<ToolStatus, string> = { ok: "green", error: "red", denied: "ye
 export function EntryView({ entry, cols }: { entry: Entry; cols: number }) {
   switch (entry.kind) {
     case "banner":
-      return <Text>{entry.text}</Text>;
+      return <Text>{entry.draw ? entry.draw(cols) : entry.text}</Text>;
 
     case "user":
       return (
@@ -430,7 +459,7 @@ export function EntryView({ entry, cols }: { entry: Entry; cols: number }) {
               {entry.expandable && !entry.more ? <Text dimColor>{" (ctrl+o to expand)"}</Text> : null}
             </Text>
           ) : null}
-          {entry.body ? <Text dimColor={!entry.plain}>{toolBody(entry)}</Text> : null}
+          {entry.body ? <Text dimColor={!entry.plain}>{toolBody(entry, cols)}</Text> : null}
           {entry.more ? <Text dimColor>{moreRow(entry.more)}</Text> : null}
         </Box>
       );

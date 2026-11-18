@@ -33,6 +33,7 @@ import type { PermissionRequest, PlanDecision, Permit, ReviewVerdict } from "./p
 import { parseReview, reviewFailure, reviewMessages, userTexts } from "./auto-mode.ts";
 import { compact, COMPACTS_ON_REFUSAL, IMAGE_TOKEN_ESTIMATE, shouldCompact } from "./compact.ts";
 import { fitResult, jsonBytes, roundRoom } from "./room.ts";
+import { DEFAULT_MAX_STEPS, REPEAT_LIMIT, type EarlyStop } from "./steps.ts";
 import {
   imagePart,
   messageText,
@@ -133,7 +134,9 @@ export type AgentEvent =
     }
   | { type: "final"; content: string; creditsCharged: number; balance: number }
   | { type: "aborted" }
-  | { type: "max_steps" };
+  /** The turn reached its ceiling (`steps` calls) or went in circles; see `steps.ts`. */
+  | { type: "max_steps"; steps: number; limit: number }
+  | { type: "repeating"; steps: number };
 
 export interface RunAgentOptions {
   model: string;
@@ -190,7 +193,10 @@ export interface RunAgentOptions {
    * long task carries on rather than stopping. Absent, neither happens.
    */
   contextTokens?: number;
-  /** Loop guard: max model round-trips before giving up. */
+  /**
+   * Ceiling on model round-trips in this run (`steps.ts`); `DEFAULT_MAX_STEPS`
+   * when absent. A run that repeats itself is stopped sooner, whatever this is.
+   */
   maxSteps?: number;
   /** Backs `web_search`; absent = the tool says so rather than returning nothing. */
   webSearch?: (query: string, opts: { count?: number; signal?: AbortSignal }) => Promise<WebSearchOutcome>;
@@ -251,7 +257,14 @@ export interface AgentResult {
    */
   searchCredits: number;
   steps: number;
-  stopped?: "aborted" | "max_steps";
+  /** Why the run ended before the model said it was done. See `steps.ts`. */
+  stopped?: "aborted" | EarlyStop;
+  /**
+   * The final answer reached the output limit and was cut off. The run cannot
+   * tell what was left unsaid, so it says so rather than presenting half an
+   * answer as the whole one.
+   */
+  cutOff?: true;
 }
 
 export const SYSTEM_PROMPT =
@@ -355,7 +368,7 @@ export async function runAgent(
   task: string,
   opts: RunAgentOptions,
 ): Promise<AgentResult> {
-  const maxSteps = opts.maxSteps ?? 16;
+  const maxSteps = opts.maxSteps ?? DEFAULT_MAX_STEPS;
   const depth = opts.depth ?? 0;
   let creditsCharged = 0;
   let creditsWaived = 0;
@@ -531,10 +544,15 @@ export async function runAgent(
     if (sub.freeCreditsLeft !== undefined) freeCreditsLeft = sub.freeCreditsLeft;
     if (sub.stopped === "aborted") return "the sub-agent was stopped before it finished";
     const answer = sub.content.trim();
+    const early =
+      sub.stopped === "max_steps"
+        ? "the sub-agent hit its step limit"
+        : sub.stopped === "repeating"
+          ? "the sub-agent was stopped for repeating the same calls"
+          : undefined;
+    if (early) return answer ? `${answer}\n\n(${early} — this answer may be incomplete)` : `${early} before it reported anything`;
     if (!answer) return "the sub-agent finished without reporting anything";
-    return sub.stopped === "max_steps"
-      ? `${answer}\n\n(the sub-agent hit its step limit — this answer may be incomplete)`
-      : answer;
+    return answer;
   }
 
   /** Every model call is metered and reported, the ones that come back empty included. */
@@ -630,6 +648,10 @@ export async function runAgent(
     // through a file in the parts the window allows does not end the turn,
     // up to twice the limit.
     let limit = maxSteps;
+    // The repeat guard (`steps.ts`): the last round's calls and results, and how
+    // many rounds in a row have been exactly that.
+    let lastRound = "";
+    let sameRounds = 0;
     for (let step = 0; step < limit; step++) {
       if (opts.signal?.aborted) return stop("aborted");
 
@@ -709,6 +731,7 @@ export async function runAgent(
           freeCreditsLeft,
           searchCredits,
           steps: step + 1,
+          ...(turn.finishReason === "length" ? { cutOff: true as const } : {}),
         };
       }
 
@@ -726,6 +749,7 @@ export async function runAgent(
       const wants = roundBytes === undefined ? [] : calls.map((c) => readSize(opts.root, c) ?? Math.ceil(roundBytes / calls.length));
       let left = roundBytes ?? 0;
       let paged = false;
+      const results: string[] = [];
       for (const [i, call] of calls.entries()) {
         if (opts.signal?.aborted) {
           // Every announced tool_call needs a matching tool message, or the next
@@ -735,8 +759,11 @@ export async function runAgent(
         }
         const room = roundBytes === undefined ? undefined : fairRoom(left, wants.slice(i));
         const images = pendingImages.length;
-        const result = await executeToolCall(room === undefined ? ctx : { ...ctx, room }, call, emit);
+        const result = await executeToolCall(room === undefined ? ctx : { ...ctx, room }, call, emit, {
+          cutOff: turn.finishReason === "length",
+        });
         messages.push(toolMessage(call, result));
+        results.push(result);
         left -= jsonBytes(result) + (pendingImages.length - images) * IMAGE_TOKEN_ESTIMATE * 4;
         if (cutToFit(result)) paged = true;
       }
@@ -754,19 +781,36 @@ export async function runAgent(
         pendingImages = [];
       }
       opts.onCheckpoint?.(withoutReasoning(messages));
+
+      // The same calls with the same results, round after round, is an agent
+      // going in circles: nothing it is being told is new, so another round
+      // will not be either. Stopped here rather than at the ceiling, which may
+      // be a hundred calls away. Every call of the round has its answer, so the
+      // conversation can be continued as it stands.
+      const round = roundSignature(calls, results);
+      sameRounds = round === lastRound ? sameRounds + 1 : 1;
+      lastRound = round;
+      if (sameRounds >= REPEAT_LIMIT) {
+        emit({ type: "repeating", steps: step + 1 });
+        return earlyStop("repeating", step + 1);
+      }
     }
 
-    emit({ type: "max_steps" });
+    emit({ type: "max_steps", steps: limit, limit: maxSteps });
+    return earlyStop("max_steps", limit);
+  }
+
+  function earlyStop(reason: EarlyStop, steps: number): AgentResult {
     return {
-      content: lastText || "(stopped: reached max steps)",
+      content: lastText,
       messages: withoutReasoning(messages),
       creditsCharged,
       balance,
       creditsWaived,
       freeCreditsLeft,
       searchCredits,
-      steps: limit,
-      stopped: "max_steps",
+      steps,
+      stopped: reason,
     };
   }
 
@@ -807,6 +851,14 @@ export function usageEvent(turn: ChatTurn): Extract<AgentEvent, { type: "usage" 
 export function compactionCost(creditsCharged: number, creditsWaived: number): string {
   if (creditsCharged === 0 && creditsWaived > 0) return "free";
   return `${creditsCharged.toLocaleString("en-US")} credits`;
+}
+
+/**
+ * One round as the repeat guard compares it: each call's name and arguments
+ * (never its id, which is new every round) and what it returned, in order.
+ */
+function roundSignature(calls: readonly ToolCall[], results: readonly string[]): string {
+  return JSON.stringify(calls.map((c, i) => [c.function.name, c.function.arguments ?? "", results[i] ?? ""]));
 }
 
 /** Whether a result was cut to fit the model's window, by `read_file` or by `fitResult`. */
@@ -895,6 +947,15 @@ function closeOpenCalls(messages: ChatMessage[]): ChatMessage[] {
   return out;
 }
 
+/** What a tool call cut off at the output limit is answered with: why, and what to do instead. */
+export function cutOffArguments(name: string): string {
+  return (
+    `error: the arguments for ${name} were cut off because your reply reached the output limit, so the call did not run. ` +
+    "Do not send it again whole: it will be cut off at the same place. Split the content into smaller calls, " +
+    "for example write the first part of a file with write_file and add the rest with edit_file."
+  );
+}
+
 function toolMessage(call: ToolCall, content: string): ChatMessage {
   return { role: "tool", tool_call_id: call.id, name: call.function.name, content };
 }
@@ -936,6 +997,7 @@ async function executeToolCall(
   ctx: ToolContext,
   call: ToolCall,
   emit: (event: AgentEvent) => void,
+  opts: { cutOff?: boolean } = {},
 ): Promise<string> {
   const name = call.function.name;
   const id = call.id;
@@ -943,7 +1005,11 @@ async function executeToolCall(
   try {
     args = call.function.arguments ? (JSON.parse(call.function.arguments) as Record<string, unknown>) : {};
   } catch {
-    return `error: invalid JSON arguments for ${name}`;
+    // Arguments that do not parse because the reply hit the output limit are
+    // not a typo: sent again whole, they are cut off at the same place, and a
+    // model told only "invalid JSON" does exactly that until the turn ends.
+    // Told why, it writes the content in parts.
+    return opts.cutOff ? cutOffArguments(name) : `error: invalid JSON arguments for ${name}`;
   }
   emit({ type: "tool_call", id, name, args });
 

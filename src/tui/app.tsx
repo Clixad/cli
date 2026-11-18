@@ -57,6 +57,7 @@ import { saveConfig, saveEffort, type CliConfig } from "../config.ts";
 import { CREDIT_MODEL_NOTICE_ID, creditModelNotice, withNoticeSeen } from "../announcements.ts";
 import { preferencesInstruction, sponsorPreference, type TurnPreferences } from "../preferences.ts";
 import { effortLabel, effortRaised, effortsOf, parseEffortArg, resolveEffort, savedEffort } from "../effort.ts";
+import { DEFAULT_MAX_STEPS, earlyStopLines, maxStepsOf, parseStepsArg, stepsSummary } from "../steps.ts";
 import { TERMS_NOTICE, TERMS_URL, parseLoginArgs, performLogin } from "../login.ts";
 import {
   compactBanner,
@@ -426,6 +427,15 @@ const BUY_TOO_SHORT =
  */
 const EXPAND_MAX_LINES = 400;
 
+/** Erase the screen and the scrollback, cursor home: `/clear`, and a redraw at a new width. */
+const CLEAR_SCREEN_AND_SCROLLBACK = "\x1b[2J\x1b[3J\x1b[H";
+/**
+ * How long the width has to stay put before the session is drawn again at it.
+ * A drag delivers a resize event every frame or two; this is long enough to
+ * see past those and short enough to feel like the end of the drag.
+ */
+export const RESIZE_REDRAW_MS = 150;
+
 /** Fallbacks for a stdout that reports no size — a pipe, or a very odd terminal. */
 const FALLBACK_ROWS = 24;
 const FALLBACK_COLS = 80;
@@ -697,30 +707,28 @@ export function App({
   const { rows, cols } = useTerminalSize();
   const root = process.cwd();
 
-  const [entries, setEntries] = useState<Entry[]>(() => [
-    {
-      id: 0,
-      kind: "banner",
-      // The width ink is actually laying out against. Read once, because a
-      // committed <Static> line is written to the scrollback and belongs to the
-      // terminal from then on — but "once" now means the width at mount rather
-      // than whatever `process.stdout` happened to say.
-      text: (cols >= MIN_BANNER_WIDTH ? welcomeBanner : compactBanner)({
-        width: cols,
-        name: config.login ?? config.email?.split("@")[0],
-        ...(newAccount ? { newAccount: true } : {}),
-        model: config.model,
-        // Undefined when the wallet could not be read: the banner says so
-        // rather than drawing "0 credits", which reads as an empty account.
-        balance: wallet?.balance,
-        adsToday: wallet?.ads_today ?? 0,
-        earnedUsdToday: wallet?.earned_usd_today ?? 0,
-        maxRewardUsd: wallet?.max_reward_usd_per_day ?? 0,
-        cwd: process.cwd(),
-        version: VERSION_LABEL,
-      }),
-    },
-  ]);
+  const [entries, setEntries] = useState<Entry[]>(() => {
+    // Drawn at whatever width the session is drawn at: the width ink is laying
+    // out against when the REPL opens, and again at each new width the
+    // terminal is resized to. What it says is fixed here, the tip included,
+    // so a redraw shows the same banner rather than a fresh one.
+    const opts = {
+      name: config.login ?? config.email?.split("@")[0],
+      ...(newAccount ? { newAccount: true } : {}),
+      model: config.model,
+      // Undefined when the wallet could not be read: the banner says so
+      // rather than drawing "0 credits", which reads as an empty account.
+      balance: wallet?.balance,
+      adsToday: wallet?.ads_today ?? 0,
+      earnedUsdToday: wallet?.earned_usd_today ?? 0,
+      maxRewardUsd: wallet?.max_reward_usd_per_day ?? 0,
+      cwd: process.cwd(),
+      version: VERSION_LABEL,
+      tipIndex: Math.floor(Math.random() * 1_000),
+    };
+    const draw = (width: number) => (width >= MIN_BANNER_WIDTH ? welcomeBanner : compactBanner)({ ...opts, width });
+    return [{ id: 0, kind: "banner", text: draw(cols), draw }];
+  });
 
   // Bumping this remounts <Static>, which is how the scrollback is actually
   // discarded: ink keeps every static line it has emitted in `fullStaticOutput`
@@ -1370,6 +1378,58 @@ export function App({
   const screenRef = useRef<{ epoch: number; rows: number; cols: number; printed: number; onScreen: number } | null>(
     null,
   );
+
+  /**
+   * After the terminal changes width, the whole session is drawn again at the
+   * new width, once the drag has settled.
+   *
+   * The duplicated rules around the input box came from here. Most terminals
+   * (iTerm2, Terminal.app, VS Code's, kitty, WezTerm, GNOME Terminal, Windows
+   * Terminal) rewrap what is already on screen when they get narrower, so the
+   * frame's full-width rules each become two rows. Ink then erases the frame
+   * by the number of rows it wrote, which is now too few, and the top rows of
+   * the old frame stay on screen above the new one: a second rule, a piece of
+   * the status line. A terminal that does not rewrap cuts the lines instead,
+   * so no count of rows to erase is right for both, and nothing tells us which
+   * kind this is. The first frame after a resize is also still the previous
+   * tree (see `useTerminalSize`), and a row of it one column too wide wraps on
+   * its own and is left behind the same way.
+   *
+   * So the screen and the scrollback are cleared and `<Static>` is remounted,
+   * which draws every committed entry again at the width it is now: answers
+   * rewrap, the banner is drawn for the new width, and tool output is cut to
+   * it. Ink already does this whenever a frame overflows; this does it at the
+   * one moment a width change needs it. The cost is the scrollback from before
+   * the REPL started, which `3J` clears with the rest, and it is the same cost
+   * `/clear` and ink's own overflow repaint have always had. A height change
+   * rewraps nothing and is left to ink.
+   *
+   * Every resize event restarts the wait, so a drag redraws once, at the end.
+   * Any width change counts, even one that ends at the width it started from:
+   * the residue was left on the way.
+   */
+  const writeRef = useRef(writeToStdout);
+  writeRef.current = writeToStdout;
+  useEffect(() => {
+    let seen = stdout.columns ?? FALLBACK_COLS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onResize = () => {
+      const now = stdout.columns ?? FALLBACK_COLS;
+      if (now === seen && timer === undefined) return;
+      seen = now;
+      if (timer !== undefined) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = undefined;
+        writeRef.current(CLEAR_SCREEN_AND_SCROLLBACK);
+        setStaticEpoch((n) => n + 1);
+      }, RESIZE_REDRAW_MS);
+    };
+    stdout.on("resize", onResize);
+    return () => {
+      stdout.off("resize", onResize);
+      if (timer !== undefined) clearTimeout(timer);
+    };
+  }, [stdout]);
 
   /**
    * Commit one entry to the scrollback and hand back the id it was given.
@@ -2418,6 +2478,10 @@ export function App({
           root,
           history,
           attachments: images,
+          // The ceiling on model calls this turn may make (`/steps`), read now
+          // for the same reason as the effort: a change takes effect on the
+          // next turn without waiting for a render.
+          maxSteps: maxStepsOf(config),
           // The mode is read at the moment the turn starts and appended to the
           // project context, so the model is told the rule instead of paying a
           // round-trip to discover it. Rebuilt per turn: shift+tab, `/mode` and
@@ -2485,14 +2549,34 @@ export function App({
           push({ kind: "notice", tone: "warn", text: "  (stopped)" });
           const w = await client.wallet().catch(() => undefined);
           if (w) setBalance(w.balance);
-        } else if (result.stopped === "max_steps") {
-          push({ kind: "notice", tone: "warn", text: "  (stopped: reached the step limit — ask me to continue)" });
+        } else if (result.stopped === "max_steps" || result.stopped === "repeating") {
+          // Why it stopped, that nothing is lost, and how to go on, in that
+          // order, then what the turn cost: a turn that ran to its limit is
+          // the one whose cost somebody most wants to see.
+          if (streamRef.current.streamed) finishStream();
+          push({
+            kind: "notice",
+            tone: "warn",
+            text: earlyStopLines(result.stopped, { steps: result.steps, limit: maxStepsOf(config), repl: true })
+              .map((line) => `  ${line}`)
+              .join("\n"),
+          });
+          push({ kind: "notice", text: `  ${turnMeta(result)}` });
         } else if (result.content) {
           // What is left of the answer, then the line that says what it cost.
           // An answer streamed into the scrollback is already there but for
           // its last lines; one that arrived in one piece goes in whole.
           finishStream(result.content);
           push({ kind: "assistant", text: "", meta: turnMeta(result), cont: true });
+          // An answer that ended because it reached the output limit, not
+          // because it was finished, is said to be one.
+          if (result.cutOff) {
+            push({
+              kind: "notice",
+              tone: "warn",
+              text: '  The answer reached the output limit and was cut off. Type "continue" for the rest.',
+            });
+          }
           // Said once per session, and only when it is news: the free allowance
           // ran out and turns now cost credits. The gateway records the same
           // transition in `free_tier_blocks`; this is the half the person at the
@@ -3398,7 +3482,7 @@ export function App({
           // cadence is a property of the install, not of the conversation.
           lastTurnRef.current = null;
           sessionRef.current = { id: newSessionId(), started: new Date().toISOString() };
-          writeToStdout("\x1b[2J\x1b[3J\x1b[H");
+          writeToStdout(CLEAR_SCREEN_AND_SCROLLBACK);
           push({ kind: "notice", text: "  cleared — new session, empty context" });
           return;
         case "mode": {
@@ -3677,6 +3761,23 @@ export function App({
             });
           });
           return;
+        // How many model calls one turn may make before it stops and asks to
+        // be continued (`steps.ts`). Saved for the install; the next turn
+        // runs with it.
+        case "steps": {
+          if (!arg) return void push({ kind: "notice", text: stepsSummary(config) });
+          const wanted = parseStepsArg(arg);
+          if ("error" in wanted) return void push({ kind: "notice", tone: "warn", text: `  ${wanted.error}` });
+          config.maxSteps = "reset" in wanted ? undefined : wanted.steps;
+          saveConfig(config);
+          const now = maxStepsOf(config);
+          return void push({
+            kind: "notice",
+            text:
+              `  A task may now make up to ${now} model calls before it stops` +
+              (now === DEFAULT_MAX_STEPS && config.maxSteps === undefined ? " (the default)." : "."),
+          });
+        }
         case "models":
           await runBusy(LOADING, async (signal) => {
             const ms = await client.models(signal);

@@ -110,6 +110,13 @@ export interface CliConfig {
    * whole map, or a second session would undo the first one's setting.
    */
   effort?: Record<string, string>;
+  /**
+   * Model calls one turn may make before it stops and asks to be continued
+   * (`/steps`, `steps.ts`). Absent is the default; a value outside the range
+   * `/steps` accepts is read as absent. Optional for `sponsor`'s reason, and a
+   * property of the install like `turns`.
+   */
+  maxSteps?: number;
 }
 
 const CONFIG_PATH = join(homedir(), ".clixad", "config.json");

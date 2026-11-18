@@ -380,7 +380,11 @@ describe("the step limit, on a model whose window cuts reads into parts", () => 
           message: {
             role: "assistant",
             content: null,
-            tool_calls: [{ id: `l${++id}`, type: "function", function: { name: "list_dir", arguments: "{}" } }],
+            // A different search every round, so it is the limit that stops it
+            // and not the repeat guard.
+            tool_calls: [
+              { id: `l${++id}`, type: "function", function: { name: "glob", arguments: JSON.stringify({ pattern: `none-${id}-*` }) } },
+            ],
           },
           finishReason: "tool_calls",
           creditsCharged: 1,

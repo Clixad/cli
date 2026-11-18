@@ -38,7 +38,7 @@ import {
 
 // /earn opens a browser; a test must not spawn one.
 vi.mock("../src/browser.ts", () => ({ openBrowser: () => undefined }));
-import { App, ASK_HINT, BUY_HINT, PLAN_HINT, statusLine } from "../src/tui/app.tsx";
+import { App, ASK_HINT, BUY_HINT, PLAN_HINT, RESIZE_REDRAW_MS, statusLine } from "../src/tui/app.tsx";
 import { pickHint } from "../src/tui/views.tsx";
 import type { CliConfig } from "../src/config.ts";
 import type { ChatMessage, ChatOptions, ChatTurn, GatewayClient, WalletInfo } from "../src/client.ts";
@@ -585,9 +585,10 @@ describe("hint rows", () => {
  * settled, nothing we draw is wider or taller than the terminal we are in, and
  * dragging a divider never cascades into clearing the screen.
  *
- * Already-committed scrollback is a separate matter and is not ours to fix: a
- * `<Static>` line is written to the terminal's history and reflows with it,
- * exactly as any other program's output does.
+ * Once a change of width has settled, the session is drawn again at the new
+ * width (`RESIZE_REDRAW_MS`), committed scrollback included: a terminal that
+ * rewraps what is on screen leaves pieces of the old frame behind otherwise.
+ * `resize-layout.test.tsx` replays that on a rewrapping terminal.
  */
 describe("resizing", () => {
   /** Rows drawn after the resize settled — the state the user is left looking at. */
@@ -662,19 +663,22 @@ describe("resizing", () => {
     for (const row of settledRows(term)) expect(visibleLength(row)).toBeLessThanOrEqual(44);
   });
 
-  it("repaints at most twice for one big jump, then stays quiet", async () => {
+  it("repaints at most three times for one big jump, then stays quiet", async () => {
     const term = fakeTerminal(40, 100);
     mount(term);
     await settle(180);
     term.clear();
 
     term.resize(14, 38);
-    await settle(250);
+    await settle(RESIZE_REDRAW_MS + 250);
     // Ink's stale paint, and the corrected one. The second is unavoidable on
     // its own: the frame that was on screen is taller than the new terminal, so
     // `shouldClearTerminalForFrame` has to start over whatever we draw next.
+    // The third is ours and deliberate: the width changed, so the session is
+    // drawn again at the new one once the resize settles (see
+    // `resize-layout.test.tsx` for why).
     const afterJump = clearCount(term);
-    expect(afterJump).toBeLessThanOrEqual(2);
+    expect(afterJump).toBeLessThanOrEqual(3);
 
     // And it settles: no further clearing while nothing changes.
     term.clear();

@@ -2,7 +2,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { runAgent, type AgentClient, type AgentEvent } from "../src/agent.ts";
+import { cutOffArguments, runAgent, type AgentClient, type AgentEvent } from "../src/agent.ts";
+import { DEFAULT_MAX_STEPS, REPEAT_LIMIT } from "../src/steps.ts";
 import { messageText } from "../src/client.ts";
 import type { ChatMessage, ChatOptions, ChatTurn } from "../src/client.ts";
 
@@ -160,6 +161,121 @@ describe("agent loop", () => {
     const res = await runAgent(loopClient, "loop forever", { model: "m", root, maxSteps: 3 });
     expect(res.steps).toBe(3);
     expect(res.stopped).toBe("max_steps");
+  });
+
+  it("goes past the old ceiling of 16 calls on its own", async () => {
+    // Twenty-four rounds, each looking at something different, then an answer:
+    // the shape of a medium task, which used to stop at 16 and ask to be
+    // continued.
+    const client = new ScriptedClient([
+      ...Array.from({ length: 24 }, (_, i) => toolTurn(`g${i}`, "glob", { pattern: `part-${i}-*` })),
+      { message: { role: "assistant", content: "All done." }, finishReason: "stop" },
+    ]);
+    const res = await runAgent(client, "a long task", { model: "m", root });
+    expect(res.stopped).toBeUndefined();
+    expect(res.content).toBe("All done.");
+    expect(res.steps).toBe(25);
+  });
+
+  it("runs up to DEFAULT_MAX_STEPS calls when no ceiling is given, and says so", async () => {
+    let n = 0;
+    const events: AgentEvent[] = [];
+    const client: AgentClient = {
+      async chatStream(): Promise<ChatTurn> {
+        n++;
+        return {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [{ id: `c${n}`, type: "function", function: { name: "glob", arguments: JSON.stringify({ pattern: `x${n}*` }) } }],
+          },
+          finishReason: "tool_calls",
+          creditsCharged: 1,
+          balance: 0,
+        };
+      },
+    };
+    const res = await runAgent(client, "never ends", { model: "m", root, onEvent: (e) => events.push(e) });
+    expect(n).toBe(DEFAULT_MAX_STEPS);
+    expect(res.stopped).toBe("max_steps");
+    expect(res.steps).toBe(DEFAULT_MAX_STEPS);
+    expect(events.at(-1)).toEqual({ type: "max_steps", steps: DEFAULT_MAX_STEPS, limit: DEFAULT_MAX_STEPS });
+    // Every call answered: the conversation can be continued as it stands.
+    const asked = res.messages.flatMap((m) => m.tool_calls ?? []).length;
+    expect(res.messages.filter((m) => m.role === "tool")).toHaveLength(asked);
+  });
+
+  it("stops an agent that repeats the same calls with the same results", async () => {
+    const events: AgentEvent[] = [];
+    const client = new ScriptedClient(
+      Array.from({ length: 30 }, (_, i) => toolTurn(`r${i}`, "list_dir", { path: "." })),
+    );
+    const res = await runAgent(client, "loop", { model: "m", root, onEvent: (e) => events.push(e) });
+    expect(res.stopped).toBe("repeating");
+    expect(client.sent).toHaveLength(REPEAT_LIMIT);
+    expect(res.steps).toBe(REPEAT_LIMIT);
+    expect(events.at(-1)).toEqual({ type: "repeating", steps: REPEAT_LIMIT });
+    expect(res.creditsCharged).toBe(10 * REPEAT_LIMIT);
+  });
+
+  it("does not count a repeated call whose result changed as going in circles", async () => {
+    // The same command three times with the file changing in between is work,
+    // not a loop: the results differ.
+    const writes = Array.from({ length: 6 }, (_, i) => [
+      toolTurn(`w${i}`, "write_file", { path: "n.txt", content: `v${i}` }),
+      toolTurn(`r${i}`, "read_file", { path: "n.txt" }),
+    ]).flat();
+    const client = new ScriptedClient([
+      ...writes,
+      { message: { role: "assistant", content: "done" }, finishReason: "stop" },
+    ]);
+    const res = await runAgent(client, "edit and check", { model: "m", root });
+    expect(res.stopped).toBeUndefined();
+    expect(res.content).toBe("done");
+  });
+
+  it("tells the model why a tool call cut off at the output limit did not run", async () => {
+    const client = new ScriptedClient([
+      {
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            { id: "w", type: "function", function: { name: "write_file", arguments: '{"path":"big.ts","content":"const a = ' } },
+          ],
+        },
+        finishReason: "length",
+      },
+      { message: { role: "assistant", content: "ok" }, finishReason: "stop" },
+    ]);
+    await runAgent(client, "write a big file", { model: "m", root });
+    const result = client.sent[1]!.find((m) => m.role === "tool");
+    expect(messageText(result!)).toBe(cutOffArguments("write_file"));
+    expect(messageText(result!)).toContain("reached the output limit");
+  });
+
+  it("still calls arguments that do not parse invalid when the reply was not cut off", async () => {
+    const client = new ScriptedClient([
+      {
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "x", type: "function", function: { name: "read_file", arguments: "{oops" } }],
+        },
+        finishReason: "tool_calls",
+      },
+      { message: { role: "assistant", content: "ok" }, finishReason: "stop" },
+    ]);
+    await runAgent(client, "read", { model: "m", root });
+    const result = client.sent[1]!.find((m) => m.role === "tool");
+    expect(messageText(result!)).toBe("error: invalid JSON arguments for read_file");
+  });
+
+  it("marks a final answer that reached the output limit", async () => {
+    const cut = new ScriptedClient([{ message: { role: "assistant", content: "The first half of" }, finishReason: "length" }]);
+    expect((await runAgent(cut, "explain", { model: "m", root })).cutOff).toBe(true);
+    const whole = new ScriptedClient([{ message: { role: "assistant", content: "All of it." }, finishReason: "stop" }]);
+    expect((await runAgent(whole, "explain", { model: "m", root })).cutOff).toBeUndefined();
   });
 
   it("continues an existing conversation", async () => {

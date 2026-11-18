@@ -29,6 +29,11 @@ export interface FakeTerminal extends EventEmitter {
   columns: number;
   rows: number;
   writes: string[];
+  /**
+   * Every write and every resize since the terminal was made, in order, with
+   * the size it started at. Never cleared: `rewrapScreenOf` replays all of it.
+   */
+  timeline: Array<string | { rows: number; columns: number }>;
   write(data: string): boolean;
   /** Change the size and fire the event, exactly as a real terminal does. */
   resize(rows: number, columns: number): void;
@@ -40,12 +45,14 @@ export interface FakeTerminal extends EventEmitter {
 class Terminal extends EventEmitter implements FakeTerminal {
   isTTY = true as const;
   writes: string[] = [];
+  timeline: Array<string | { rows: number; columns: number }>;
 
   constructor(
     public rows: number,
     public columns: number,
   ) {
     super();
+    this.timeline = [{ rows, columns }];
     // App and ink both size themselves from `process.stdout`; keep the two in
     // step so a test cannot accidentally measure two different terminals.
     this.setMaxListeners(0);
@@ -53,6 +60,7 @@ class Terminal extends EventEmitter implements FakeTerminal {
 
   write(data: string): boolean {
     this.writes.push(data);
+    this.timeline.push(data);
     return true;
   }
 
@@ -67,6 +75,7 @@ class Terminal extends EventEmitter implements FakeTerminal {
   resize(rows: number, columns: number): void {
     this.rows = rows;
     this.columns = columns;
+    this.timeline.push({ rows, columns });
     pinProcessStdout(rows, columns);
     this.emit("resize");
   }
@@ -235,153 +244,295 @@ export function screenOf(term: FakeTerminal): Screen {
 }
 
 export function emulate(output: string, height: number, width: number): Screen {
-  const blankRow = () => Array.from({ length: width }, () => " ");
-  let grid: string[][] = Array.from({ length: height }, blankRow);
-  let scrollback: string[] = [];
-  let row = 0;
-  let col = 0;
+  const screen = new Emulator(height, width);
+  screen.feed(output);
+  return screen.screen();
+}
+
+/**
+ * What a terminal that rewraps on resize would show after everything ink wrote
+ * and every resize, in order.
+ *
+ * `screenOf` replays at one size and cannot see the failure that needed this.
+ * When a terminal gets narrower, iTerm2, Terminal.app, VS Code's terminal
+ * (xterm.js), kitty, WezTerm, GNOME Terminal and Windows Terminal all rewrap
+ * the lines already on screen: a full-width rule written at 100 columns is two
+ * rows at 70. Ink erases its last frame by the number of rows it wrote, which
+ * after a rewrap is too few, and whatever it misses stays on screen. This
+ * replays the timeline the way those terminals do: rows that were wrapped by
+ * the terminal are joined back into lines, every line is wrapped again at the
+ * new width with the cursor carried along, and the viewport ends at the cursor
+ * or the last written row, whichever is lower.
+ */
+export function rewrapScreenOf(term: FakeTerminal): Screen {
+  const [first, ...rest] = term.timeline;
+  const start = first as { rows: number; columns: number };
+  const screen = new Emulator(start.rows, start.columns);
+  for (const event of rest) {
+    if (typeof event === "string") screen.feed(event);
+    else screen.resize(event.rows, event.columns);
+  }
+  return screen.screen();
+}
+
+interface Row {
+  cells: string[];
+  /** The terminal wrapped onto this row at the right edge: it continues the row above. */
+  wrapped: boolean;
+}
+
+class Emulator {
+  private grid: Row[];
+  private scrollback: Row[] = [];
+  private row = 0;
+  private col = 0;
   // A glyph written into the last column leaves the cursor there with a wrap
   // pending; only the next printable character actually moves to a new row.
-  let pendingWrap = false;
-  let saved = { row: 0, col: 0 };
+  private pendingWrap = false;
+  private saved = { row: 0, col: 0 };
 
-  const rowText = (cells: string[]) => cells.join("").replace(/\s+$/, "");
-  const lineFeed = () => {
-    if (row === height - 1) {
-      scrollback.push(rowText(grid[0]!));
-      grid = [...grid.slice(1), blankRow()];
-    } else {
-      row++;
-    }
-  };
-  const put = (glyph: string) => {
-    const w = stringWidth(glyph);
-    if (w === 0) return;
-    if (pendingWrap || col + w > width) {
-      col = 0;
-      lineFeed();
-      pendingWrap = false;
-    }
-    grid[row]![col] = glyph;
-    for (let k = 1; k < w; k++) grid[row]![col + k] = "";
-    col += w;
-    if (col >= width) {
-      col = width - 1;
-      pendingWrap = true;
-    }
-  };
-  const erase = (r: number, from: number, to: number) => {
-    for (let c = from; c < to; c++) grid[r]![c] = " ";
-  };
-
-  let i = 0;
-  while (i < output.length) {
-    const ch = output[i]!;
-    if (ch === ESC) {
-      const next = output[i + 1];
-      if (next === "[") {
-        let j = i + 2;
-        while (j < output.length && !/[@-~]/.test(output[j]!)) j++;
-        const params = output.slice(i + 2, j);
-        const final = output[j];
-        i = j + 1;
-        if (params.startsWith("?")) continue; // modes: cursor, paste, sync
-        const nums = params.split(";").map((p) => (p === "" ? undefined : Number(p)));
-        const n = nums[0] ?? 1;
-        switch (final) {
-          case "A":
-            row = Math.max(0, row - n);
-            pendingWrap = false;
-            break;
-          case "B":
-            row = Math.min(height - 1, row + n);
-            pendingWrap = false;
-            break;
-          case "C":
-            col = Math.min(width - 1, col + n);
-            pendingWrap = false;
-            break;
-          case "D":
-            col = Math.max(0, col - n);
-            pendingWrap = false;
-            break;
-          case "G":
-            col = Math.min(width - 1, Math.max(0, n - 1));
-            pendingWrap = false;
-            break;
-          case "H":
-          case "f":
-            row = Math.min(height - 1, Math.max(0, (nums[0] ?? 1) - 1));
-            col = Math.min(width - 1, Math.max(0, (nums[1] ?? 1) - 1));
-            pendingWrap = false;
-            break;
-          case "K": {
-            const mode = nums[0] ?? 0;
-            if (mode === 2) erase(row, 0, width);
-            else if (mode === 1) erase(row, 0, col + 1);
-            else erase(row, col, width);
-            break;
-          }
-          case "J": {
-            const mode = nums[0] ?? 0;
-            if (mode === 3) scrollback = [];
-            else if (mode === 2) grid = Array.from({ length: height }, blankRow);
-            else if (mode === 1) {
-              for (let r = 0; r < row; r++) erase(r, 0, width);
-              erase(row, 0, col + 1);
-            } else {
-              erase(row, col, width);
-              for (let r = row + 1; r < height; r++) erase(r, 0, width);
-            }
-            break;
-          }
-          default:
-            break; // SGR colours and anything else that does not move text
-        }
-        continue;
-      }
-      if (next === "]") {
-        // OSC, terminated by BEL or ST.
-        let j = i + 2;
-        while (j < output.length && output[j] !== "\u0007" && !(output[j] === ESC && output[j + 1] === "\\")) j++;
-        i = output[j] === "\u0007" ? j + 1 : j + 2;
-        continue;
-      }
-      if (next === "7") saved = { row, col };
-      if (next === "8") ({ row, col } = saved);
-      if (next === "c") {
-        grid = Array.from({ length: height }, blankRow);
-        scrollback = [];
-        row = 0;
-        col = 0;
-      }
-      i += 2;
-      continue;
-    }
-    if (ch === "\n") {
-      col = 0;
-      pendingWrap = false;
-      lineFeed();
-      i++;
-      continue;
-    }
-    if (ch === "\r") {
-      col = 0;
-      pendingWrap = false;
-      i++;
-      continue;
-    }
-    if (ch < " ") {
-      i++;
-      continue;
-    }
-    let j = i;
-    while (j < output.length && output[j] !== ESC && output[j]! >= " ") j++;
-    for (const { segment } of segmenter.segment(output.slice(i, j))) put(segment);
-    i = j;
+  constructor(
+    private height: number,
+    private width: number,
+  ) {
+    this.grid = Array.from({ length: height }, () => this.blankRow());
   }
 
-  return { rows: grid.map(rowText), scrollback, cursor: { row, col } };
+  private blankRow(): Row {
+    return { cells: Array.from({ length: this.width }, () => " "), wrapped: false };
+  }
+
+  private lineFeed(wrapped: boolean): void {
+    if (this.row === this.height - 1) {
+      this.scrollback.push(this.grid[0]!);
+      this.grid = [...this.grid.slice(1), this.blankRow()];
+    } else {
+      this.row++;
+    }
+    this.grid[this.row]!.wrapped = wrapped;
+  }
+
+  private put(glyph: string): void {
+    const w = stringWidth(glyph);
+    if (w === 0) return;
+    if (this.pendingWrap || this.col + w > this.width) {
+      this.col = 0;
+      this.lineFeed(true);
+      this.pendingWrap = false;
+    }
+    const cells = this.grid[this.row]!.cells;
+    cells[this.col] = glyph;
+    for (let k = 1; k < w; k++) cells[this.col + k] = "";
+    this.col += w;
+    if (this.col >= this.width) {
+      this.col = this.width - 1;
+      this.pendingWrap = true;
+    }
+  }
+
+  private erase(r: number, from: number, to: number): void {
+    const target = this.grid[r]!;
+    for (let c = from; c < to; c++) target.cells[c] = " ";
+    if (from === 0 && to >= this.width) target.wrapped = false;
+  }
+
+  feed(output: string): void {
+    const { width, height } = this;
+    let i = 0;
+    while (i < output.length) {
+      const ch = output[i]!;
+      if (ch === ESC) {
+        const next = output[i + 1];
+        if (next === "[") {
+          let j = i + 2;
+          while (j < output.length && !/[@-~]/.test(output[j]!)) j++;
+          const params = output.slice(i + 2, j);
+          const final = output[j];
+          i = j + 1;
+          if (params.startsWith("?")) continue; // modes: cursor, paste, sync
+          const nums = params.split(";").map((p) => (p === "" ? undefined : Number(p)));
+          const n = nums[0] ?? 1;
+          switch (final) {
+            case "A":
+              this.row = Math.max(0, this.row - n);
+              this.pendingWrap = false;
+              break;
+            case "B":
+              this.row = Math.min(height - 1, this.row + n);
+              this.pendingWrap = false;
+              break;
+            case "C":
+              this.col = Math.min(width - 1, this.col + n);
+              this.pendingWrap = false;
+              break;
+            case "D":
+              this.col = Math.max(0, this.col - n);
+              this.pendingWrap = false;
+              break;
+            case "G":
+              this.col = Math.min(width - 1, Math.max(0, n - 1));
+              this.pendingWrap = false;
+              break;
+            case "H":
+            case "f":
+              this.row = Math.min(height - 1, Math.max(0, (nums[0] ?? 1) - 1));
+              this.col = Math.min(width - 1, Math.max(0, (nums[1] ?? 1) - 1));
+              this.pendingWrap = false;
+              break;
+            case "K": {
+              const mode = nums[0] ?? 0;
+              if (mode === 2) this.erase(this.row, 0, width);
+              else if (mode === 1) this.erase(this.row, 0, this.col + 1);
+              else this.erase(this.row, this.col, width);
+              break;
+            }
+            case "J": {
+              const mode = nums[0] ?? 0;
+              if (mode === 3) this.scrollback = [];
+              else if (mode === 2) this.grid = Array.from({ length: height }, () => this.blankRow());
+              else if (mode === 1) {
+                for (let r = 0; r < this.row; r++) this.erase(r, 0, width);
+                this.erase(this.row, 0, this.col + 1);
+              } else {
+                this.erase(this.row, this.col, width);
+                for (let r = this.row + 1; r < height; r++) this.erase(r, 0, width);
+              }
+              break;
+            }
+            default:
+              break; // SGR colours and anything else that does not move text
+          }
+          continue;
+        }
+        if (next === "]") {
+          // OSC, terminated by BEL or ST.
+          let j = i + 2;
+          while (j < output.length && output[j] !== "\u0007" && !(output[j] === ESC && output[j + 1] === "\\")) j++;
+          i = output[j] === "\u0007" ? j + 1 : j + 2;
+          continue;
+        }
+        if (next === "7") this.saved = { row: this.row, col: this.col };
+        if (next === "8") ({ row: this.row, col: this.col } = this.saved);
+        if (next === "c") {
+          this.grid = Array.from({ length: height }, () => this.blankRow());
+          this.scrollback = [];
+          this.row = 0;
+          this.col = 0;
+        }
+        i += 2;
+        continue;
+      }
+      if (ch === "\n") {
+        this.col = 0;
+        this.pendingWrap = false;
+        this.lineFeed(false);
+        i++;
+        continue;
+      }
+      if (ch === "\r") {
+        this.col = 0;
+        this.pendingWrap = false;
+        i++;
+        continue;
+      }
+      if (ch < " ") {
+        i++;
+        continue;
+      }
+      let j = i;
+      while (j < output.length && output[j] !== ESC && output[j]! >= " ") j++;
+      for (const { segment } of segmenter.segment(output.slice(i, j))) this.put(segment);
+      i = j;
+    }
+  }
+
+  /** Change the size the way a rewrapping terminal does; see `rewrapScreenOf`. */
+  resize(height: number, width: number): void {
+    const all = [...this.scrollback, ...this.grid];
+    const cursorRow = this.scrollback.length + this.row;
+    const cursorCol = this.col + (this.pendingWrap ? 1 : 0);
+    let last = cursorRow;
+    for (let r = all.length - 1; r > last; r--) {
+      if (all[r]!.cells.some((c) => c !== " ")) {
+        last = r;
+        break;
+      }
+    }
+
+    // Join what the terminal wrapped back into lines, as glyphs with widths.
+    type Glyph = { g: string; w: number };
+    const lines: Glyph[][] = [];
+    let cursorLine = 0;
+    let cursorOffset = 0;
+    for (let r = 0; r <= last; r++) {
+      const source = all[r]!;
+      const continues = r + 1 <= last && all[r + 1]!.wrapped;
+      const cells = continues ? source.cells : trimBlank(source.cells);
+      if (!source.wrapped || lines.length === 0) lines.push([]);
+      const line = lines[lines.length - 1]!;
+      const before = line.reduce((n, x) => n + x.w, 0);
+      if (r === cursorRow) {
+        cursorLine = lines.length - 1;
+        cursorOffset = before + cursorCol;
+      }
+      for (const cell of cells) if (cell !== "") line.push({ g: cell, w: stringWidth(cell) });
+    }
+
+    // Wrap every line again at the new width.
+    this.height = height;
+    this.width = width;
+    const rows: Row[] = [];
+    let newCursor = { row: 0, col: 0 };
+    lines.forEach((line, index) => {
+      const first = rows.length;
+      let current = this.blankRow();
+      let at = 0;
+      for (const { g, w } of line) {
+        if (at + w > width) {
+          rows.push(current);
+          current = this.blankRow();
+          current.wrapped = true;
+          at = 0;
+        }
+        current.cells[at] = g;
+        for (let k = 1; k < w; k++) current.cells[at + k] = "";
+        at += w;
+      }
+      rows.push(current);
+      if (index === cursorLine) {
+        const r = Math.floor(cursorOffset / width);
+        while (rows.length - first <= r) {
+          const extra = this.blankRow();
+          extra.wrapped = true;
+          rows.push(extra);
+        }
+        newCursor = { row: first + r, col: cursorOffset % width };
+      }
+    });
+
+    const top = Math.max(0, rows.length - height, newCursor.row - height + 1);
+    this.scrollback = rows.slice(0, top);
+    this.grid = rows.slice(top, top + height);
+    while (this.grid.length < height) this.grid.push(this.blankRow());
+    this.row = newCursor.row - top;
+    this.col = Math.min(newCursor.col, width - 1);
+    this.pendingWrap = false;
+  }
+
+  screen(): Screen {
+    const rowText = (r: Row) => r.cells.join("").replace(/\s+$/, "");
+    return {
+      rows: this.grid.map(rowText),
+      scrollback: this.scrollback.map(rowText),
+      cursor: { row: this.row, col: this.col },
+    };
+  }
+}
+
+function trimBlank(cells: string[]): string[] {
+  let end = cells.length;
+  while (end > 0 && cells[end - 1] === " ") end--;
+  return cells.slice(0, end);
 }
 
 /** The last row of the screen with anything on it, or -1 for a blank screen. */

@@ -70,6 +70,7 @@ import { palette } from "./color.ts";
 import { clearTerminalTitle, setTerminalTitle } from "./title.ts";
 import { VERSION } from "./version.ts";
 import { effortRaised, resolveEffort, savedEffort } from "./effort.ts";
+import { earlyStopLines, maxStepsOf } from "./steps.ts";
 import { conversationTokens, estimateTokens } from "./compact.ts";
 import { rowTaskHint } from "./estimate.ts";
 
@@ -626,6 +627,8 @@ async function printCmd(client: GatewayClient, config: CliConfig, task: string) 
         (capabilities?.web_search ? "" : `\n\n${NO_SEARCH_INSTRUCTION}`),
       tools: () => toolSchemaFor("normal", [], { webSearch: capabilities?.web_search === true }),
       permit: denyAll,
+      // The REPL's `/steps` setting, so a long run gets as far here as there.
+      maxSteps: maxStepsOf(config),
       // Research works headlessly and is worth having here: the tools that need
       // a person — `ask_user`, and the permission dialog every write goes
       // through — are the ones a pipe cannot answer, and those already say so
@@ -729,7 +732,15 @@ function printAgentEvent(event: AgentEvent) {
       process.stdout.write("\n");
       break;
     case "max_steps":
-      console.log(c.yellow("  (stopped: reached max steps)"));
+    case "repeating":
+      console.log("");
+      for (const line of earlyStopLines(event.type, {
+        steps: event.steps,
+        limit: event.type === "max_steps" ? event.limit : 0,
+        repl: false,
+      })) {
+        console.log(c.yellow(`  ${line}`));
+      }
       break;
   }
 }

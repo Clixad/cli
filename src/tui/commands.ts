@@ -21,6 +21,9 @@ export const COMMANDS: SlashCommand[] = [
   // complete the command instead of running it, and the picker is the point.
   // `/effort low` still works when typed in full.
   { name: "effort", desc: "how long the model thinks (more thinking, more credits)" },
+  // No `args` either: `/steps` alone says what the limit is and how to change
+  // it, and `/steps 200` works typed in full.
+  { name: "steps", desc: "how many model calls a task may make before it stops" },
   { name: "mode", args: "[name]", desc: "permission mode (or press shift+tab)" },
   { name: "wallet", desc: "balance & ads today" },
   // Not "watch an ad": nothing on the wall is a video. CPX serves sign-up

@@ -70,6 +70,10 @@ before it changes anything. `shift+tab` cycles through the permission modes. Bey
   which files.
 - **Keeps a task list** on multi-step work, and **asks you** when guessing wrong would waste real
   work.
+- **Finishes long tasks on its own:** one message may run up to 100 model calls before the agent
+  stops and asks you to continue, and it stops sooner if it repeats the same tool calls with the
+  same results four times in a row. Either way it says why and what the turn cost. `/steps` shows
+  the limit and `/steps 200` raises it (10 to 500).
 - **Uses MCP servers** you configure in `.mcp.json` or `~/.clixad/mcp.json`; `/mcp` shows their
   status. Every tool a server offers is put to you before it runs. A server from a project's
   `.mcp.json` or `.clixad/mcp.json` starts only after you approve it (asked once per project, and

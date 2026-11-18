@@ -174,12 +174,25 @@ describe("task", () => {
   it("says the answer may be incomplete when the sub-agent runs out of steps", async () => {
     const client = new TwoLevelClient({
       parent: [toolTurn("t1", "task", { description: "loop", prompt: "loop" }), say("done")],
-      // More tool turns than SUBAGENT_MAX_STEPS, so it never gets to answer.
-      sub: Array.from({ length: 20 }, (_, i) => toolTurn(`s${i}`, "list_dir", { path: "." })),
+      // More tool turns than SUBAGENT_MAX_STEPS, so it never gets to answer,
+      // each a different search so the repeat guard does not stop it first.
+      sub: Array.from({ length: 20 }, (_, i) => toolTurn(`s${i}`, "glob", { pattern: `nothing-${i}-*` })),
     });
     await runAgent(client, "go", { model: "m", root });
     const result = client.of("parent").at(-1)!.messages.find((m) => m.role === "tool");
     expect(messageText(result!)).toContain("step limit");
+  });
+
+  it("says the answer may be incomplete when the sub-agent goes in circles", async () => {
+    const client = new TwoLevelClient({
+      parent: [toolTurn("t1", "task", { description: "loop", prompt: "loop" }), say("done")],
+      sub: Array.from({ length: 20 }, (_, i) => toolTurn(`s${i}`, "list_dir", { path: "." })),
+    });
+    await runAgent(client, "go", { model: "m", root });
+    const result = client.of("parent").at(-1)!.messages.find((m) => m.role === "tool");
+    expect(messageText(result!)).toContain("stopped for repeating the same calls");
+    // Stopped at the fourth identical round, not at the sub-agent's ceiling.
+    expect(client.of("sub")).toHaveLength(4);
   });
 
   it("inherits the gateway's search key, rather than being told to use a tool that is gone", async () => {
