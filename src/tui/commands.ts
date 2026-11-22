@@ -45,6 +45,11 @@ export const COMMANDS: SlashCommand[] = [
   // *no* `args` hint, for `/model`'s reason: an arg hint makes enter complete
   // the command instead of running it, and the pack picker is the point.
   { name: "buy", desc: "buy a credit pack (optional — offers are free)" },
+  // The limit valve: carrying on without Clixad's credits. No `args` hints,
+  // for `/model`'s reason: `/key` alone says what to do, and `/key sk-or-…`,
+  // `/key off` and `/local off` work typed in full.
+  { name: "key", desc: "carry on with your own OpenRouter key (no credits)" },
+  { name: "local", desc: "carry on with a model on your machine (no credits)" },
   // Reachable from inside the REPL because that is where the 401 is printed.
   // "Run `clixad login` first" is not a runnable instruction at this prompt —
   // anything without a leading slash is a prompt, so it went to the model and

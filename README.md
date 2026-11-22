@@ -74,6 +74,11 @@ before it changes anything. `shift+tab` cycles through the permission modes. Bey
   stops and asks you to continue, and it stops sooner if it repeats the same tool calls with the
   same results four times in a row. Either way it says why and what the turn cost. `/steps` shows
   the limit and `/steps 200` raises it (10 to 500).
+- **Keeps going when your credits run out:** carry on with your own OpenRouter key (`/key sk-or-…`,
+  the same model billed to your OpenRouter account) or with a model running on your machine
+  (`/local`, for Ollama, LM Studio or any OpenAI-compatible server at `CLIXAD_LOCAL_URL`). Those
+  requests go from your machine to that provider and not through Clixad; afterwards the agent tells
+  Clixad only how many requests and tokens they took. `/key off` and `/local off` switch back.
 - **Uses MCP servers** you configure in `.mcp.json` or `~/.clixad/mcp.json`; `/mcp` shows their
   status. Every tool a server offers is put to you before it runs. A server from a project's
   `.mcp.json` or `.clixad/mcp.json` starts only after you approve it (asked once per project, and

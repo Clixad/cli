@@ -31,6 +31,9 @@ import {
 } from "../src/client.ts";
 import { frameIn, frameWith, waitFor } from "./helpers/wait.ts";
 
+/** No local model server, whatever runs on the machine running the suite. */
+const noLocal = async () => [];
+
 const config = (): CliConfig => ({
   gatewayUrl: "http://127.0.0.1:8787",
   dashboardUrl: "http://127.0.0.1:8788",
@@ -112,7 +115,7 @@ describe("a task cut off by a server error", () => {
     it(`is saved and can be resumed after a restart (${name})`, async () => {
       expect(existsSync(join(cwd, "CLIXAD.md"))).toBe(false);
       const { client } = gateway(["read", "list", error()]);
-      const first = render(<App client={client} config={config()} />);
+      const first = render(<App client={client} config={config()} localProbe={noLocal} />);
       await submit(first.stdin, TASK);
       await frameIn(first.lastFrame, { has: [KEPT] });
       first.unmount();
@@ -123,7 +126,7 @@ describe("a task cut off by a server error", () => {
       expect(saved?.messages.map((m) => m.role)).toEqual(["user", "assistant", "tool", "assistant", "tool"]);
       expect(saved?.messages[2]?.content).toContain("alpha");
 
-      const second = render(<App client={gateway([]).client} config={config()} />);
+      const second = render(<App client={gateway([]).client} config={config()} localProbe={noLocal} />);
       await submit(second.stdin, "/resume");
       const frame = await frameWith(second.lastFrame, "Resume a session");
       second.unmount();
@@ -134,7 +137,7 @@ describe("a task cut off by a server error", () => {
 
   it("keeps the work in the conversation, so the next message carries on from it", async () => {
     const { client, sent } = gateway(["read", new MaintenanceError(DOWN), "answer"]);
-    const { stdin, lastFrame, unmount } = render(<App client={client} config={config()} />);
+    const { stdin, lastFrame, unmount } = render(<App client={client} config={config()} localProbe={noLocal} />);
     await submit(stdin, TASK);
     await frameIn(lastFrame, { has: [KEPT] });
     await submit(stdin, "continue");
@@ -155,7 +158,7 @@ describe("a task cut off by a server error", () => {
 
   it("is saved while it is still running, round by round", async () => {
     const { client } = gateway(["read", "list", "hang"]);
-    const { stdin, unmount } = render(<App client={client} config={config()} />);
+    const { stdin, unmount } = render(<App client={client} config={config()} localProbe={noLocal} />);
     await submit(stdin, TASK);
     // The turn is waiting on the third call: a terminal closed now would
     // still leave the first two rounds to resume.
@@ -170,7 +173,7 @@ describe("a task cut off by a server error", () => {
 describe("what did not change", () => {
   it("a request refused before it did anything is not saved and not kept", async () => {
     const { client, sent } = gateway([new Error("chat failed: 500"), "answer"]);
-    const { stdin, lastFrame, unmount } = render(<App client={client} config={config()} />);
+    const { stdin, lastFrame, unmount } = render(<App client={client} config={config()} localProbe={noLocal} />);
     await submit(stdin, TASK);
     const frame = await frameWith(lastFrame, "chat failed: 500");
     expect(frame.replace(/\s+/g, " ")).not.toContain(KEPT);
@@ -185,7 +188,7 @@ describe("what did not change", () => {
 
   it("a paywall after some work keeps the work and says only what the paywall says", async () => {
     const { client } = gateway(["read", new PaywallError(5, 1190, 51_000)]);
-    const { stdin, lastFrame, unmount } = render(<App client={client} config={config()} />);
+    const { stdin, lastFrame, unmount } = render(<App client={client} config={config()} localProbe={noLocal} />);
     await submit(stdin, TASK);
     const frame = await frameWith(lastFrame, "Press enter");
     unmount();
@@ -195,7 +198,7 @@ describe("what did not change", () => {
 
   it("a turn that finishes is saved once it ends, as before", async () => {
     const { client } = gateway(["read", "answer"]);
-    const { stdin, lastFrame, unmount } = render(<App client={client} config={config()} />);
+    const { stdin, lastFrame, unmount } = render(<App client={client} config={config()} localProbe={noLocal} />);
     await submit(stdin, TASK);
     await frameWith(lastFrame, "ANSWERED");
     unmount();

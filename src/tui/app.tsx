@@ -50,6 +50,22 @@ import {
   type StreakInfo,
   type WalletInfo,
 } from "../client.ts";
+import {
+  DirectClient,
+  directMeta,
+  directStartLine,
+  directSwitchLine,
+  localBackend,
+  looksLikeOpenRouterKey,
+  maskKey,
+  ownKeyBackend,
+  ownKeyOf,
+  probeLocal,
+  savedDirectBackend,
+  valveLine,
+  VALVE_HELP,
+  type DirectBackend,
+} from "../direct.ts";
 import { loadMcpConfig, McpHub, type McpPendingServer, type McpStatus } from "../mcp.ts";
 import { TodoList } from "../todos.ts";
 import { shells } from "../shells.ts";
@@ -515,6 +531,11 @@ export interface AppProps {
   client: GatewayClient;
   config: CliConfig;
   /**
+   * How the limit valve looks for local model servers (`probeLocal`); a test
+   * passes its own so nothing on the machine running it changes the answer.
+   */
+  localProbe?: typeof probeLocal;
+  /**
    * Anything `loadConfig` had to say about the config file, from
    * `takeConfigNotices`.
    *
@@ -651,6 +672,10 @@ interface PickerItem {
  * for one of them to impersonate the wall.
  */
 const EARN_ROW = "\u0000earn";
+/** The limit valve's rows in the paywall chooser (`direct.ts`). */
+const OWN_KEY_ROW = "\u0000own-key";
+const LOCAL_ROW = "\u0000local:";
+const VALVE_HELP_ROW = "\u0000valve-help";
 
 /** The premium chooser's "buy a pack" row, `EARN_ROW`'s rule for `EARN_ROW`'s reason. */
 const BUY_ROW = "\u0000buy";
@@ -683,6 +708,7 @@ const PICKER_DELETE_CONFIRM = "Press d again to delete it for good · any other 
 export function App({
   client,
   config,
+  localProbe = probeLocal,
   wallet,
   streak,
   session,
@@ -830,7 +856,39 @@ export function App({
   const modelRef = useRef(config.model);
   const [mode, setMode] = useState<PermissionMode>("normal");
   /** Move the model: the ref first, so a turn started in this tick sees it. */
+  /**
+   * The limit valve (2026-11-21): the turn runs on the user's own OpenRouter
+   * key or a local model instead of Clixad's credits (`direct.ts`). A ref for
+   * what a turn reads, state for what is drawn, `modelRef`'s rule. Kept in
+   * config.json (the key apart) so it survives a restart, and said when the
+   * REPL opens, so nobody runs up their own bill without knowing.
+   */
+  const directRef = useRef<DirectBackend | null>(savedDirectBackend(config));
+  const [direct, setDirectState] = useState<DirectBackend | null>(directRef.current);
+  const balanceNowRef = useRef<number | undefined>(wallet?.balance);
+  balanceNowRef.current = balance;
+  const setDirect = useCallback((next: DirectBackend | null) => {
+    directRef.current = next;
+    setDirectState(next);
+    config.direct = next
+      ? { kind: next.kind, model: next.model, ...(next.kind === "local" ? { baseUrl: next.baseUrl } : {}), contextTokens: next.contextTokens }
+      : undefined;
+    saveConfig(config);
+  }, [config]);
+  // Said once when the REPL opens on the user's own key or a local model.
+  const directSaidRef = useRef(false);
+  useEffect(() => {
+    if (directSaidRef.current || !directRef.current) return;
+    directSaidRef.current = true;
+    push({ kind: "notice", tone: "warn", text: `  ${directStartLine(directRef.current)}` });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const switchModel = useCallback((id: string) => {
+    // Picking one of Clixad's models is going back to Clixad.
+    if (directRef.current) {
+      const was = directRef.current;
+      setDirect(null);
+      push({ kind: "notice", text: `  back on Clixad (was ${was.label})` });
+    }
     modelRef.current = id;
     setModel(id);
     // Auto mode belongs to the models it is offered on. Leaving it on across a
@@ -844,7 +902,7 @@ export function App({
     // Kept with the account too, so the browser's chat starts on it. Not
     // awaited, and it never throws: config.json has it whatever the gateway says.
     void client.saveSettings?.({ model: id });
-  }, [client]);
+  }, [client, setDirect]);
   const [hist, setHist] = useState<string[]>(() => loadHistory());
   const [histIdx, setHistIdx] = useState(-1);
   const [sel, setSel] = useState(0);
@@ -1060,6 +1118,12 @@ export function App({
    * wrong about it.
    */
   const pendingPremiumRef = useRef<PremiumLockedError | null>(null);
+  /**
+   * The limit valve (2026-11-21): the local model servers that answered when
+   * the last refusal arrived, asked in the background so the chooser is
+   * ready by the time enter is pressed.
+   */
+  const pendingLocalRef = useRef<{ name: string; baseUrl: string; models: string[] }[]>([]);
   /**
    * Whether premium models are open to this account, and what a premium call
    * may spend: state, since the cost preview draws from it, with a ref beside
@@ -2468,8 +2532,13 @@ export function App({
           messages: conversation,
         });
       };
+      // The limit valve: a turn on the user's own key or a local model goes
+      // there directly, never through the gateway, and charges nothing here.
+      const directNow = directRef.current;
+      const directClient = directNow ? new DirectClient(directNow, () => balanceNowRef.current ?? 0) : undefined;
+      const searchNow = directNow ? false : searchRef.current;
       try {
-        const result = await runAgent(client, task, {
+        const result = await runAgent(directClient ?? client, task, {
           model,
           // Read now rather than from the render, for `modelRef`'s reason: a
           // setting chosen in the same tick as this turn starts is in `config`
@@ -2491,7 +2560,7 @@ export function App({
           // paragraph explaining that it does not.
           systemPrompt:
             `${contextRef.current.systemPrompt}\n\n${modeInstruction(permRef.current.mode)}` +
-            (searchRef.current ? "" : `\n\n${NO_SEARCH_INSTRUCTION}`) +
+            (searchNow ? "" : `\n\n${NO_SEARCH_INSTRUCTION}`) +
             // The account's name and instructions, set in the
             // browser or on the account page, said on every turn.
             (preferencesText ? `\n\n${preferencesText}` : ""),
@@ -2505,7 +2574,9 @@ export function App({
           // Bound here rather than passed as the client: the tool takes a
           // function, so a test can drive the agent loop without a gateway.
           webSearch: (query, options) => client.webSearch(query, options),
-          webSearchAvailable: searchRef.current,
+          // A search goes through the gateway and costs credits, so a turn on
+          // the user's own key or a local model has none.
+          webSearchAvailable: searchNow,
           todos: todosRef.current,
           mcp: mcpRef.current,
           // Asked per model call, not once: approving a plan restores the write
@@ -2513,14 +2584,14 @@ export function App({
           // connecting mid-turn brings its tools with it.
           tools: () =>
             toolSchemaFor(permRef.current.mode, mcpRef.current.toolSchemas(), {
-              webSearch: searchRef.current,
+              webSearch: searchNow,
             }),
           signal: ac.signal,
           // The window the conversation is kept inside, at the start of the
           // turn and part way through: compaction happens in the run, so a
           // long task carries on instead of stopping at the line, and a large
           // new message on a long session is weighed with what came before it.
-          contextTokens: contextWindow(model),
+          contextTokens: directNow?.contextTokens ?? contextWindow(model),
           onEvent: (event) => {
             // Compacted before the turn's first call: that is the history now,
             // whatever happens to the turn, as it was when the REPL compacted
@@ -2536,6 +2607,14 @@ export function App({
           onCheckpoint: (conversation) => persist(conversation.slice(1)),
         });
 
+        // A turn that ran without Clixad says so on its meta line, and the
+        // gateway is told how much it used, a count with no account kept.
+        const directUsed = directClient?.takeUsage();
+        if (directNow && directUsed && directUsed.calls > 0) {
+          void client.reportExternal?.(directNow.kind, directNow.model, directUsed);
+        }
+        const metaOf = (r: Parameters<typeof turnMeta>[0]) =>
+          directNow && directUsed ? directMeta(directNow.kind, directUsed) : turnMeta(r);
         // Drop the system prompt: it is rebuilt per run and may change.
         const next = result.messages.slice(1);
         setMessages(next);
@@ -2561,13 +2640,13 @@ export function App({
               .map((line) => `  ${line}`)
               .join("\n"),
           });
-          push({ kind: "notice", text: `  ${turnMeta(result)}` });
+          push({ kind: "notice", text: `  ${metaOf(result)}` });
         } else if (result.content) {
           // What is left of the answer, then the line that says what it cost.
           // An answer streamed into the scrollback is already there but for
           // its last lines; one that arrived in one piece goes in whole.
           finishStream(result.content);
-          push({ kind: "assistant", text: "", meta: turnMeta(result), cont: true });
+          push({ kind: "assistant", text: "", meta: metaOf(result), cont: true });
           // An answer that ended because it reached the output limit, not
           // because it was finished, is said to be one.
           if (result.cutOff) {
@@ -2757,6 +2836,12 @@ export function App({
         } else if (err instanceof PaywallError) {
           pendingTaskRef.current = { task, images };
           pendingFreeRef.current = err.freeModels;
+          // The limit valve: which local model servers answer, asked now so
+          // the chooser has them by the time enter is pressed.
+          pendingLocalRef.current = [];
+          void localProbe().then((found) => {
+            pendingLocalRef.current = found;
+          });
           pendingGrantRef.current = err.grantPerAd;
           pendingBalanceRef.current = err.balance;
           // Two notices, because there are two different situations and one
@@ -2791,7 +2876,7 @@ export function App({
               : `  ${shortfallHeadline(err, model)}\n` +
                 own +
                 ad +
-                `  Press enter to open the ad wall — offers pay ${grantLabel(err.grantPerAd)}.\n` +
+                `  Press enter to choose: the ad wall (offers pay ${grantLabel(err.grantPerAd)}), your own key or a local model.\n` +
                 `  I'll continue automatically. Offers you are screened out of pay nothing;\n` +
                 `  that is normal, just start another.\n` +
                 // A wallet that is short rather than empty has a third way on,
@@ -2808,6 +2893,9 @@ export function App({
                 // smallest pack is what fits that.
                 `  /buy is there too${packsFromClause(err.cheapestPackUsd)}, if you would rather pay than do an offer.`,
           });
+          // The way on that needs no credits at all, said every time: nobody
+          // is stopped without one.
+          push({ kind: "notice", text: `  ${valveLine(ownKeyOf(config) !== undefined)}` });
         } else if (err instanceof AuthError) {
           push({ kind: "notice", tone: "error", text: NOT_SIGNED_IN });
         } else if (err instanceof MaintenanceError) {
@@ -3173,7 +3261,29 @@ export function App({
    */
   const runPaywallChoice = useCallback(() => {
     const free = pendingFreeRef.current.filter((m) => m.id !== EARN_ROW);
-    if (free.length === 0) return void runAdWall();
+    // The limit valve (2026-11-21): the user's own OpenRouter key on the same
+    // model, and the local models that answered, each one row and one enter
+    // away. Always at least one of them, so nobody is stopped without a way
+    // on that needs no credits.
+    const key = ownKeyOf(config);
+    const info = catalogRef.current.find((m) => m.id === model);
+    const ownKey = key && info ? ownKeyBackend(key, info) : undefined;
+    const locals = pendingLocalRef.current.flatMap((srv) => srv.models.slice(0, 3).map((m) => ({ srv, m })));
+    const valveRows: PickerItem[] = [
+      ...(ownKey
+        ? [{ value: OWN_KEY_ROW, label: "your OpenRouter key", hint: `${model} on your OpenRouter account, no Clixad credits` }]
+        : []),
+      // Labels no wider than the wall's, so its figure is never the part cut.
+      ...locals.map(({ srv, m }) => ({
+        value: `${LOCAL_ROW}${srv.baseUrl}|${m}`,
+        label: m.length > 13 ? `local: ${m.slice(0, 12)}…` : `local: ${m}`,
+        hint: `${m} on ${srv.name}, on your machine, no credits`,
+      })),
+      ...(!ownKey && locals.length === 0
+        ? [{ value: VALVE_HELP_ROW, label: "own key or local", hint: "how to carry on without Clixad credits" }]
+        : []),
+    ];
+    if (free.length === 0 && valveRows.length === 0) return void runAdWall();
     const items: PickerItem[] = [
       ...free.map((m) => ({
         value: m.id,
@@ -3181,6 +3291,7 @@ export function App({
         hint: `free: ~${m.turnsLeft} turn${m.turnsLeft === 1 ? "" : "s"} left today`,
         current: m.id === model,
       })),
+      ...valveRows,
       {
         value: EARN_ROW,
         label: "earn credits instead",
@@ -3192,10 +3303,27 @@ export function App({
     setPickerSel(0);
     setPicker({
       title: (pendingBalanceRef.current ?? 0) > 0 ? "Not enough credits" : "Out of credits",
-      subtitle: "Pick a free model to carry on with, or earn credits at the wall.",
+      subtitle: free.length
+        ? "Pick a free model to carry on with, your own key or a local model, or earn credits at the wall."
+        : "Carry on with your own key or a local model, or earn credits at the wall.",
       items,
       onPick: (choice) => {
         if (choice.value === EARN_ROW) return void runAdWall();
+        if (choice.value === VALVE_HELP_ROW) return void push({ kind: "notice", text: VALVE_HELP });
+        if (choice.value === OWN_KEY_ROW || choice.value.startsWith(LOCAL_ROW)) {
+          const backend =
+            choice.value === OWN_KEY_ROW
+              ? ownKey
+              : localBackend(choice.value.slice(LOCAL_ROW.length).split("|")[0]!, choice.value.split("|").slice(1).join("|"));
+          if (!backend) return;
+          const pending = pendingTaskRef.current;
+          pendingTaskRef.current = null;
+          pendingFreeRef.current = [];
+          setDirect(backend);
+          push({ kind: "notice", tone: "good", text: `  ${directSwitchLine(backend)} — continuing where you left off` });
+          if (pending) void runTurn(pending.task, pending.images);
+          return;
+        }
         const pending = pendingTaskRef.current;
         pendingTaskRef.current = null;
         pendingFreeRef.current = [];
@@ -3214,7 +3342,7 @@ export function App({
         if (pending) void runTurn(pending.task, pending.images);
       },
     });
-  }, [config, model, push, runAdWall, runTurn, switchModel]);
+  }, [config, model, push, runAdWall, runTurn, setDirect, switchModel]);
 
   /**
    * `/buy` — the pack picker, and the only purchase surface the CLI has.
@@ -3697,6 +3825,99 @@ export function App({
         // the gateway's rule, and says so. Every figure about cost stays in
         // words: what a setting costs depends on the task, and the meta line
         // under each turn already shows what it did cost.
+        // The limit valve (2026-11-21): the user's own OpenRouter key. `/key`
+        // alone says what is set; `/key sk-or-…` saves it and carries on with
+        // the same model on it; `/key off` goes back to Clixad and keeps the key.
+        case "key": {
+          if (arg === "off") {
+            if (directRef.current?.kind === "own_key") {
+              setDirect(null);
+              return void push({ kind: "notice", tone: "good", text: `  back on Clixad: ${model}` });
+            }
+            return void push({ kind: "notice", text: "  not on your own key; nothing to switch off" });
+          }
+          if (arg === "forget") {
+            delete config.ownKey;
+            saveConfig(config);
+            if (directRef.current?.kind === "own_key") setDirect(null);
+            return void push({ kind: "notice", text: "  your OpenRouter key is no longer kept here" });
+          }
+          if (arg && !looksLikeOpenRouterKey(arg)) {
+            return void push({ kind: "notice", tone: "warn", text: "  that does not look like an OpenRouter key (they start with sk-or-)" });
+          }
+          if (arg) {
+            config.ownKey = arg;
+            saveConfig(config);
+          }
+          const key = ownKeyOf(config);
+          if (!key) return void push({ kind: "notice", text: VALVE_HELP });
+          await runBusy(LOADING, async (signal) => {
+            const models = catalogRef.current.length ? catalogRef.current : await client.models(signal);
+            catalogRef.current = models;
+            const info = models.find((m) => m.id === model);
+            const backend = info ? ownKeyBackend(key, info) : undefined;
+            if (!backend) {
+              return void push({ kind: "notice", tone: "warn", text: `  this gateway does not say ${model}'s OpenRouter name; pick another model with /model first` });
+            }
+            setDirect(backend);
+            push({ kind: "notice", tone: "good", text: `  ${directSwitchLine(backend)} (key ${maskKey(key)}). /key off goes back to Clixad.` });
+            const pending = pendingTaskRef.current;
+            if (pending) {
+              pendingTaskRef.current = null;
+              pendingFreeRef.current = [];
+              await runTurn(pending.task, pending.images);
+            }
+          });
+          return;
+        }
+        // A model on this machine: the local servers that answer, and their
+        // models in the picker. `/local off` goes back to Clixad.
+        case "local":
+          if (arg === "off") {
+            if (directRef.current?.kind === "local") {
+              setDirect(null);
+              return void push({ kind: "notice", tone: "good", text: `  back on Clixad: ${model}` });
+            }
+            return void push({ kind: "notice", text: "  not on a local model; nothing to switch off" });
+          }
+          await runBusy(LOADING, async () => {
+            const found = await localProbe();
+            if (!found.length) {
+              return void push({
+                kind: "notice",
+                text:
+                  "  No local model server answered (Ollama on port 11434, LM Studio on 1234).\n" +
+                  "  Start one and run /local again, or set CLIXAD_LOCAL_URL to another OpenAI-compatible server.",
+              });
+            }
+            const items: PickerItem[] = found.flatMap((srv) =>
+              srv.models.map((m) => ({
+                value: `${srv.baseUrl}|${m}`,
+                label: m,
+                hint: `${srv.name}, on your machine, no credits`,
+                current: directRef.current?.kind === "local" && directRef.current.model === m,
+              })),
+            );
+            setPickerSel(0);
+            setPicker({
+              title: "Local models",
+              subtitle: "Runs on your machine and uses no credits. /local off goes back to Clixad.",
+              items,
+              onPick: (choice) => {
+                const [baseUrl, ...rest] = choice.value.split("|");
+                const backend = localBackend(baseUrl!, rest.join("|"));
+                setDirect(backend);
+                push({ kind: "notice", tone: "good", text: `  ${directSwitchLine(backend)}. /local off goes back to Clixad.` });
+                const pending = pendingTaskRef.current;
+                if (pending) {
+                  pendingTaskRef.current = null;
+                  pendingFreeRef.current = [];
+                  void runTurn(pending.task, pending.images);
+                }
+              },
+            });
+          });
+          return;
         case "effort":
           await runBusy(LOADING, async (signal) => {
             const models = catalogRef.current.length ? catalogRef.current : await client.models(signal);
@@ -4277,7 +4498,9 @@ export function App({
       // already waiting for is the worst moment this could pick, and `turnCount`
       // has moved for each of the turns that just ran — so the cadence is
       // measured against the last of them, not the first.
-      if (lastTurnRef.current && turnCountRef.current % FEEDBACK_TURN_INTERVAL === 0) {
+      // Not on the user's own key or a local model: the rating names a Clixad
+      // model, and the answer came from somewhere else.
+      if (lastTurnRef.current && !directRef.current && turnCountRef.current % FEEDBACK_TURN_INTERVAL === 0) {
         await askFeedback();
       }
     },
@@ -5316,8 +5539,10 @@ export function App({
   const statusText = fitRow(
     `  ${statusLine(
       {
-        model,
-        ...(effortNow ? { effort: effortNow } : {}),
+        // On the user's own key or a local model the row says so where the
+        // model goes, and drops what is about Clixad's credits.
+        model: direct ? direct.label : model,
+        ...(effortNow && !direct ? { effort: effortNow } : {}),
         balance,
         ...(usable ? { usable } : {}),
         spent,
@@ -5326,8 +5551,8 @@ export function App({
         // Only while a free model is selected: on a premium one the allowance
         // is real but irrelevant, and a countdown that has nothing to do with
         // the next turn is a number that teaches people to stop reading the row.
-        ...(freeTier?.models.includes(model) ? { freeLeft: freeTier.credits_left } : {}),
-        ...(estimate ? { estimate: estimate.variants } : {}),
+        ...(freeTier?.models.includes(model) && !direct ? { freeLeft: freeTier.credits_left } : {}),
+        ...(estimate && !direct ? { estimate: estimate.variants } : {}),
       },
       Math.max(1, cols - visibleLength(modeText) - 2),
     )}`,

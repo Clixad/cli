@@ -5,6 +5,7 @@
  */
 import { gzipSync } from "node:zlib";
 import type { CliConfig } from "./config.ts";
+import { VERSION } from "./version.ts";
 import { parseTaskShape, type TaskShape } from "./estimate.ts";
 import { EXTRA_AD_FORMATS, type AdFormat, type ExtraAdFormat } from "./sponsor/formats.ts";
 import { parseDirectLines, parseFallbackLines, parseMeasure, type DirectAnswer, type LinkMode } from "./sponsor/direct.ts";
@@ -64,6 +65,11 @@ export interface ModelInfo {
   ad_fundable: boolean;
   /** Context window in tokens; the REPL compacts before it fills up. */
   context_window?: number;
+  /**
+   * The model's name at OpenRouter, so a turn at the limit can carry on with
+   * the same model on the user's own OpenRouter key. Absent on older gateways.
+   */
+  openrouter_slug?: string;
   credits_per_mtoken_input: number;
   credits_per_mtoken_output: number;
   est_credits_per_task: number;
@@ -1451,7 +1457,7 @@ function networkCode(err: unknown): string | undefined {
  */
 export async function gatewayFetch(url: string | URL, init?: RequestInit): Promise<Response> {
   try {
-    return await fetch(url, init);
+    return await fetch(url, withClientHeader(init));
   } catch (err) {
     const aborted = init?.signal?.aborted || (err as { name?: unknown })?.name === "AbortError";
     if (aborted || !(err instanceof TypeError)) throw err;
@@ -1463,6 +1469,26 @@ export async function gatewayFetch(url: string | URL, init?: RequestInit): Promi
     }
     throw new GatewayUnreachableError(host, networkCode(err));
   }
+}
+
+/**
+ * Every request to the gateway says it comes from this program, and which
+ * release: `X-Clixad-Client: cli/<version>`. The gateway keeps only the kind
+ * of client (this agent, the website, anything else), so it can tell how much
+ * of the free usage runs in the agent it exists for.
+ */
+export const CLIENT_HEADER = "X-Clixad-Client";
+
+function withClientHeader(init?: RequestInit): RequestInit {
+  const value = `cli/${VERSION}`;
+  const headers = init?.headers;
+  if (headers instanceof Headers) {
+    const copy = new Headers(headers);
+    if (!copy.has(CLIENT_HEADER)) copy.set(CLIENT_HEADER, value);
+    return { ...init, headers: copy };
+  }
+  if (Array.isArray(headers)) return { ...init, headers: [...headers, [CLIENT_HEADER, value]] };
+  return { ...init, headers: { [CLIENT_HEADER]: value, ...(headers ?? {}) } };
 }
 
 export class AuthError extends Error {
@@ -1710,6 +1736,34 @@ export class GatewayClient {
       return parseAccountSettings(await res.json());
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * After a turn that ran on the user's own key or a local model: how many
+   * calls and tokens it took and the model's name, nothing else. The gateway
+   * adds it to a daily total that keeps no account. Best-effort and never
+   * throws: a count that does not arrive changes nothing for anybody.
+   */
+  async reportExternal(
+    kind: "own_key" | "local",
+    model: string,
+    used: { calls: number; inputTokens: number; outputTokens: number },
+  ): Promise<void> {
+    try {
+      await gatewayFetch(`${this.config.gatewayUrl}/v1/usage/external`, {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify({
+          kind,
+          model: /^[A-Za-z0-9._:/@+-]{1,64}$/.test(model) ? model : "other",
+          calls: used.calls,
+          input_tokens: used.inputTokens,
+          output_tokens: used.outputTokens,
+        }),
+      });
+    } catch {
+      // Nothing to do: the turn is over and nothing depends on this.
     }
   }
 
@@ -2598,7 +2652,7 @@ interface StreamFrame {
   clixad?: ClixadMeta;
 }
 
-interface ToolCallDelta {
+export interface ToolCallDelta {
   index?: number;
   id?: string;
   type?: "function";
@@ -2610,7 +2664,7 @@ interface ToolCallDelta {
  * each call complete in a single frame, but OpenAI-style providers split the
  * arguments across frames — concatenating handles both.
  */
-function accumulateToolCall(calls: Map<number, ToolCall>, part: ToolCallDelta, fallbackIndex: number): void {
+export function accumulateToolCall(calls: Map<number, ToolCall>, part: ToolCallDelta, fallbackIndex: number): void {
   const index = part.index ?? fallbackIndex;
   const current = calls.get(index) ?? { id: "", type: "function" as const, function: { name: "", arguments: "" } };
   if (part.id) current.id = part.id;
@@ -2651,7 +2705,7 @@ export function mergeReasoningDetails(acc: ReasoningDetail[], delta: unknown): v
 }
 
 /** Parse a fetch ReadableStream of Server-Sent Events into `data:` payloads. */
-async function* parseSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+export async function* parseSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";

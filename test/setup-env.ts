@@ -44,6 +44,8 @@ export const CLI_ENV = [
   "CLIXAD_DASHBOARD_URL",
   "CLIXAD_MCP_TIMEOUT",
   "CLIXAD_KIMI_BIN",
+  // The limit valve: a local server of the user's own.
+  "CLIXAD_LOCAL_URL",
 ] as const;
 
 for (const name of CLI_ENV) delete process.env[name];

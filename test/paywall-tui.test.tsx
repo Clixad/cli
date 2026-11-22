@@ -127,7 +127,8 @@ const ARROW_DOWN = "\x1b[B";
 
 /** Type the task and run it, which the stub refuses. */
 async function runIntoThePaywall(script: Script) {
-  const view = render(<App client={stubClient(script)} config={config()} wallet={wallet} />);
+  // No local model server, whatever runs on the machine running the suite.
+  const view = render(<App client={stubClient(script)} config={config()} wallet={wallet} localProbe={async () => []} />);
   view.stdin.write(TASK);
   await tick();
   view.stdin.write("\r");
@@ -187,10 +188,11 @@ describe("the paywall offers a free model", () => {
 
     // Taking it goes to the wall, and the interrupted task is still waiting
     // behind it — the wall path was not changed, only reached differently.
-    stdin.write(ARROW_DOWN);
-    await tick();
-    stdin.write(ARROW_DOWN);
-    await tick();
+    // Below the two free models and the row on carrying on without credits.
+    for (let i = 0; i < 3; i++) {
+      stdin.write(ARROW_DOWN);
+      await tick();
+    }
     stdin.write("\r");
     await frameIn(lastFrame, { has: ["waiting for the offer…"] });
     expect(strip(lastFrame() ?? "")).toContain("waiting for the offer…");
@@ -276,23 +278,28 @@ describe("the paywall names a short ad when the gateway offers one (2026-11-02)"
 });
 
 describe("with nothing free left, the old path is untouched", () => {
-  it("goes straight to the wall on enter, with no chooser in between", async () => {
-    // The gateway has already applied the pause switch, the global budget and
-    // this account's own day, so an empty list means there is genuinely nothing
-    // to offer — and a chooser with one row is a dialog asking somebody to
-    // confirm the only thing they can do.
+  it("opens a chooser with the ways on that need no credits, and the wall", async () => {
+    // Since the limit valve (2026-11-21) a spent day is never a dead end: the
+    // chooser always has a way on without credits, so it has two rows at
+    // least, and the wall is one of them rather than the only thing enter does.
     const script: Script = { free: [], calls: [] };
     const { stdin, lastFrame } = await runIntoThePaywall(script);
 
     const notice = strip(lastFrame() ?? "");
-    expect(notice).toContain("Press enter to open the ad wall");
+    expect(notice).toContain("Press enter to choose: the ad wall");
     expect(notice).toContain("offers pay ~51,000 credits on completion (median)");
+    expect(notice).toContain("No credits needed either");
     expect(notice).not.toContain("still free today");
 
     stdin.write("\r");
-    await frameIn(lastFrame, { has: ["waiting for the offer…"], hasNot: ["Pick a free model"] });
-    const out = strip(lastFrame() ?? "");
-    expect(out).not.toContain("Pick a free model");
-    expect(out).toContain("waiting for the offer…");
+    await frameIn(lastFrame, { has: ["own key or local", "earn credits instead"] });
+    expect(strip(lastFrame() ?? "")).not.toContain("Pick a free model");
+
+    stdin.write(ARROW_DOWN);
+    await tick();
+    stdin.write("\r");
+    await frameIn(lastFrame, { has: ["waiting for the offer…"] });
+    expect(strip(lastFrame() ?? "")).toContain("waiting for the offer…");
   });
+
 });

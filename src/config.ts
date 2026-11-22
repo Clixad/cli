@@ -62,6 +62,18 @@ export interface CliConfig {
   tokenGateway?: string;
   model: string;
   /**
+   * The user's own OpenRouter key, saved with `/key` (2026-11-21). Sent to
+   * OpenRouter and nowhere else; this file is readable by its owner only.
+   * Optional for `sponsor`'s reason.
+   */
+  ownKey?: string;
+  /**
+   * The REPL runs its turns on the user's own key or a local model instead of
+   * Clixad's credits, until `/key off`, `/local off` or a Clixad model is
+   * picked (`direct.ts`). The key is not repeated here.
+   */
+  direct?: { kind: "own_key" | "local"; model: string; baseUrl?: string; contextTokens?: number };
+  /**
    * Show the Clixad line under the spinner while a model call runs. Default on.
    *
    * Optional rather than `boolean` so an existing config.json — every install
