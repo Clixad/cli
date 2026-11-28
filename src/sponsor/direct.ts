@@ -1,21 +1,21 @@
 /**
- * Direct campaigns: a line a business booked for one of the three slots, for a
- * week, served by our own gateway rather than by ADtention.
+ * What fills the three terminal places, as the gateway answers it.
  *
- * Once per model call the CLI asks `POST /v1/sponsor/direct`, naming the slots
- * that fit the terminal right now. For each slot the answer may carry a line to
- * show (with a signed token to report it with and a link to send a click
- * through), or `hold` (the slot is booked and this account has seen it enough
- * today: show no network line in it), or nothing (nothing booked: ask
- * ADtention as always). Until the first week is sold the answer is always
- * nothing, and the ask is what measures the inventory a week is priced on.
+ * Once per turn the CLI asks `POST /v1/sponsor/direct`, naming the slots that
+ * fit the terminal right now. For each slot the answer may carry a line a
+ * business booked for the week (with a signed token to report it with and a
+ * link to send a click through), or `hold` (the slot is booked and this
+ * account has seen it enough today: show nothing else in it), or nothing.
  *
- * The same answer may carry `fallbacks`: for each place nothing is booked in,
- * a line from our own list of referral programs, shown only where ADtention
- * then has nothing either. So a place is filled in one order: a booked line,
- * then ADtention, then a fallback. A fallback is an advertisement like the
- * other two and is marked as one; nobody pays for it being shown, so it earns
- * nothing, and it is reported after the turn only to be counted.
+ * Where nothing is booked the answer may carry a network ad (`gravity`), and
+ * a fallback line from our own list of referral programs for each place. The
+ * order on screen is a booked line, then the network ad, then a fallback. The
+ * network ad has two rules of its own: it is the only advertisement on screen
+ * while it is up, so the other places stay empty and no fallback is drawn,
+ * and it is drawn whole or not at all.
+ *
+ * Every one of them is an advertisement and is marked as one. None of the
+ * three earns the person who sees it anything but a booked line.
  *
  * The contract is the gateway's; this file is its reader, deliberately not an
  * import, because this program is bundled for npm and may import nothing but
@@ -23,10 +23,14 @@
  */
 import { isAdFormat, type AdFormat } from "./formats.ts";
 
-/** How long a model call waits for the answer before asking ADtention anyway. */
-export const DIRECT_ASK_TIMEOUT_MS = 1_500;
+/**
+ * How long a turn waits for the answer. The house tip is on screen meanwhile,
+ * so the cost of waiting is only that an ad arrives later. Long enough for the
+ * gateway to ask the ad network, which it bounds at two and a half seconds.
+ */
+export const DIRECT_ASK_TIMEOUT_MS = 4_000;
 
-/** The longest line we accept from the gateway, before the row cuts it to fit. */
+/** The longest line we accept from the gateway. */
 const MAX_TEXT = 200;
 
 /** A line to show, with the token it is reported with and the address a click goes to. */
@@ -54,19 +58,35 @@ export type LinkMode = "link" | "address" | "none";
 
 export type DirectLine = ServedDirectLine | { format: AdFormat; hold: true };
 
+/**
+ * A network ad for the top bar. Every address is a path on the gateway, which
+ * passes impressions and clicks on to the network: this program fetches
+ * nothing from anybody else.
+ */
+export interface GravityLine {
+  text: string;
+  /** Fetched once, when the line is first drawn. */
+  impressionPath: string;
+  /** Where a click goes, on the gateway. Absent when the ad has no link. */
+  clickPath?: string;
+  /** The network's own short address, printed where a terminal cannot link. */
+  shortUrl?: string;
+}
+
 export interface DirectAnswer {
   /** False when the gateway does not know the route: stop asking this session. */
   supported: boolean;
   lines: DirectLine[];
   /**
-   * The line for each place nothing is booked in, to show only where
-   * ADtention has nothing. Absent from an older gateway.
+   * The line for each place nothing is booked in, to show only where there is
+   * no network ad. Absent from an older gateway.
    */
   fallbacks?: ServedDirectLine[];
+  /** A network ad for the top bar, when nothing is booked. */
+  gravity?: GravityLine;
   /**
    * The ask did not get an answer (a timeout, a 5xx, a broken body): nothing
-   * is known about bookings this turn, which the caller treats as nothing
-   * booked except where the last answer it had said there was.
+   * is known about bookings this turn, so nothing but our own tip is drawn.
    */
   failed?: boolean;
   /**
@@ -75,6 +95,29 @@ export interface DirectAnswer {
    * Absent from an older gateway, and then nothing is reported.
    */
   measure?: string;
+}
+
+/** A path on the gateway the proxy serves, printable ASCII, of sane length. */
+function gatewayTrackPath(raw: unknown): string | undefined {
+  return typeof raw === "string" && raw.length <= 4000 && /^\/gravity\/[\x21-\x7e]+$/.test(raw) ? raw : undefined;
+}
+
+/**
+ * The answer's network ad, or undefined: read like a booked line, and dropped
+ * whole when any part of it is not what it should be. An ad without an
+ * impression address could never be counted, so it is not drawn either.
+ */
+export function parseGravityLine(body: unknown): GravityLine | undefined {
+  const raw = (body as { gravity?: unknown } | null)?.gravity;
+  if (!raw || typeof raw !== "object") return undefined;
+  const e = raw as Record<string, unknown>;
+  if (typeof e.text !== "string") return undefined;
+  const text = sanitizeAdText(e.text);
+  const impressionPath = gatewayTrackPath(e.impression_path);
+  if (!text || text.length > MAX_TEXT || !impressionPath) return undefined;
+  const clickPath = gatewayTrackPath(e.click_path);
+  const shortUrl = typeof e.short_url === "string" && shortLinkText(e.short_url) ? e.short_url : undefined;
+  return { text, impressionPath, ...(clickPath ? { clickPath } : {}), ...(shortUrl ? { shortUrl } : {}) };
 }
 
 /** The answer's measure token, or undefined: a string of sane length and nothing else. */

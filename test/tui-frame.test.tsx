@@ -44,7 +44,7 @@ import type { CliConfig } from "../src/config.ts";
 import type { ChatMessage, ChatOptions, ChatTurn, GatewayClient, WalletInfo } from "../src/client.ts";
 import { BANNER_TIPS, compactBanner, MIN_BANNER_WIDTH, visibleLength, welcomeBanner } from "../src/banner.ts";
 import { AD_MIN_COLS, SPONSOR_MARKER } from "../src/sponsor/render.ts";
-import type { ServedLine } from "../src/sponsor/network.ts";
+import type { DirectAnswer } from "../src/sponsor/direct.ts";
 
 const config: CliConfig = {
   gatewayUrl: "http://127.0.0.1:8787",
@@ -885,33 +885,30 @@ describe("a permission dialog with a very long summary", () => {
  * App reads the width off the stdout ink was handed, which here is a terminal
  * whose width the test actually controls.
  *
- * Two fences, answering two different failures. The serve path refuses first,
- * because a serve is what ADtention bills (`sponsor.test.ts` counts the
- * requests). The fill refuses second, because the terminal can narrow while the
- * request is in flight, and a line that arrives with nowhere to go was not
- * seen — so it is neither painted nor reported.
+ * Two fences, answering two different failures. The ask refuses first: a
+ * place the terminal cannot hold is never named to the gateway. The fill
+ * refuses second, because the terminal can narrow while the request is in
+ * flight, and a line that arrives with nowhere to go was not seen, so it is
+ * neither painted nor told.
  */
 describe("an advertisement that will not fit", () => {
-  const servedLine: ServedLine = {
-    id: "c_acme",
-    text: "Acme Deploys — ship on Friday",
-    impressionId: "imp_0001",
-    billable: true,
-    fromCache: false,
-    credit: 0.00005,
+  const AD = "Acme Deploys — ship on Friday";
+  const withAd: DirectAnswer = {
+    supported: true,
+    lines: [],
+    gravity: { text: AD, impressionPath: "/gravity/api.trygravity.ai/track/imp?p=1" },
   };
 
-  /** A client that hangs mid-turn and records every impression reported. */
+  /** A client that hangs mid-turn and records every impression told. */
   const watchingClient = () => {
-    const reported: string[] = [];
+    const told: string[] = [];
     let release: () => void = () => {};
     const client = {
       models: async () => catalog,
       wallet: async () => wallet,
-      sponsorConfig: async () => null,
-      reportImpression: async (r: { impressionId: string }) => {
-        reported.push(r.impressionId);
-        return 0;
+      networkImpression: async (path: string) => {
+        told.push(path);
+        return true;
       },
       async chatStream(): Promise<ChatTurn> {
         await new Promise<void>((r) => {
@@ -925,72 +922,72 @@ describe("an advertisement that will not fit", () => {
         } as ChatTurn;
       },
     } as unknown as GatewayClient;
-    return { client, reported, release: () => release() };
+    return { client, told, release: () => release() };
   };
 
   it("is never asked for when the terminal is already too narrow", async () => {
     const term = fakeTerminal(24, AD_MIN_COLS - 1);
-    const { client, reported, release } = watchingClient();
-    let serves = 0;
+    const { client, told, release } = watchingClient();
+    let asks = 0;
     mount(term, {
       client,
       initialTask: "go",
-      sponsorServe: async () => {
-        serves++;
-        return servedLine;
+      sponsorDirect: async () => {
+        asks++;
+        return withAd;
       },
     });
     await settle(250);
 
-    expect(serves).toBe(0);
-    // Our own line is unaffected — it is not billed and costs nobody anything.
+    expect(asks).toBe(0);
+    // Our own line is unaffected: it is not an advertisement.
     expect(plain(term.output())).toContain(SPONSOR_MARKER);
 
     release();
     await settle(150);
-    expect(reported).toEqual([]);
+    expect(told).toEqual([]);
   });
 
-  it("is asked for, and shown, one column wider", async () => {
+  it("is asked for, and shown whole, one column wider", async () => {
     const term = fakeTerminal(24, AD_MIN_COLS);
     const { client, release } = watchingClient();
-    let serves = 0;
+    let asks = 0;
     mount(term, {
       client,
       initialTask: "go",
-      sponsorServe: async () => {
-        serves++;
-        return servedLine;
+      sponsorDirect: async () => {
+        asks++;
+        return withAd;
       },
     });
     await settle(250);
 
-    expect(serves).toBe(1);
-    expect(plain(term.output())).toContain(servedLine.text); // whole, not cut
+    expect(asks).toBe(1);
+    expect(plain(term.output())).toContain(AD); // whole, not cut
     release();
     await settle(120);
   });
 
-  it("is dropped rather than reported when the terminal narrows mid-flight", async () => {
+  it("is dropped rather than told when the terminal narrows mid-flight", async () => {
     const term = fakeTerminal(24, 100);
-    const { client, reported, release } = watchingClient();
-    let land: (v: ServedLine) => void = () => {};
-    const inFlight = new Promise<ServedLine>((r) => {
+    const { client, told, release } = watchingClient();
+    let land: (v: DirectAnswer) => void = () => {};
+    const inFlight = new Promise<DirectAnswer>((r) => {
       land = r;
     });
-    mount(term, { client, initialTask: "go", sponsorServe: () => inFlight });
+    mount(term, { client, initialTask: "go", sponsorDirect: () => inFlight });
     await settle(150);
 
     // Wide enough when the request went out; too narrow when it lands.
     term.resize(24, AD_MIN_COLS - 1);
     await settle(80);
     term.clear();
-    land(servedLine);
+    land(withAd);
     await settle(200);
 
-    expect(plain(term.output())).not.toContain(servedLine.text);
+    expect(plain(term.output())).not.toContain(AD);
     release();
     await settle(200);
-    expect(reported).toEqual([]);
+    expect(told).toEqual([]);
   });
 });

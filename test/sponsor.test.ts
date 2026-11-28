@@ -17,16 +17,11 @@
  */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { visibleLength } from "../src/banner.ts";
 import { AD_MARK, AD_TEXT, MANGO, MANGO_BRIGHT, MODE_STYLE, SLATE } from "../src/tui/views.tsx";
 import { HOUSE_LINES, LINE_BUDGET } from "../src/sponsor/lines.ts";
-import {
-  adtentionSource,
-  houseSource,
-  sponsorSource,
-  SPONSOR_PROVIDERS,
-} from "../src/sponsor/provider.ts";
+import { houseSource, sponsorSource, SPONSOR_PROVIDERS } from "../src/sponsor/provider.ts";
 import {
   AD_FULL_PREFIX_MIN_COLS,
   AD_LABEL,
@@ -42,20 +37,9 @@ import {
   sponsorText,
   SPONSOR_MARKER,
   SPONSOR_SIGIL,
+  wholeAdRow,
 } from "../src/sponsor/render.ts";
-import { createSponsorSlot, sponsorLineText } from "../src/sponsor/network.ts";
 import { createTally, recordImpression, tallyReport } from "../src/sponsor/counter.ts";
-import type { Sponsor } from "@adtention/sdk";
-import type { ImpressionReport } from "../src/client.ts";
-
-/** One impression's receipt, as the SDK reports it. */
-const IMPRESSION: ImpressionReport = {
-  impressionId: "imp_0001",
-  adId: "c_acme",
-  billable: true,
-  fromCache: false,
-  credit: 0.0002,
-};
 
 /** Both figures in hand, i.e. a fully-fetched session. */
 const FACTS = {
@@ -254,89 +238,10 @@ describe("figures", () => {
 });
 
 describe("provider", () => {
-  it("has one local implementation and one remote one", () => {
-    expect(SPONSOR_PROVIDERS).toEqual(["house", "adtention"]);
+  it("has one implementation, our own", () => {
+    expect(SPONSOR_PROVIDERS).toEqual(["house"]);
     expect(sponsorSource().provider).toBe("house");
     expect(sponsorSource("house").provider).toBe("house");
-  });
-
-  it("carries the receipt along with the line", async () => {
-    // The impression rides with the line rather than being reported by whoever
-    // fetched it, because only the caller knows whether it was ever painted: a
-    // line that loses the race against the end of a turn is dropped, and
-    // reporting it would bill an advertiser for something nobody saw.
-    const source = adtentionSource(async () => ({
-      id: "c_acme",
-      text: "  Acme ships faster  ",
-      impression: IMPRESSION,
-    }));
-    await expect(source.fetch()).resolves.toEqual({
-      id: "c_acme",
-      text: "Acme ships faster",
-      impression: IMPRESSION,
-    });
-  });
-
-  it("answers null for every way there is no line, without distinguishing them", async () => {
-    // No inventory, no publisher configured, an older gateway, an unreachable
-    // one, the network itself refusing: all the same event to a caller, which is
-    // "keep showing the house line". A caller that could tell them apart would
-    // have nothing to do with the difference.
-    await expect(adtentionSource(async () => null).fetch()).resolves.toBeNull();
-    // A blank line would render as the marker and nothing else, which reads as a
-    // bug in our own TUI rather than as an empty ad slot.
-    await expect(
-      adtentionSource(async () => ({ id: "c_x", text: "   ", impression: IMPRESSION })).fetch(),
-    ).resolves.toBeNull();
-  });
-
-  it("never rejects, however the fetcher fails", async () => {
-    // Stronger than "should not". The caller starts this with `void` and does
-    // not await it, so a rejection is an unhandled one — a Node process exiting
-    // over a status line nobody asked for. It matters more since the fetcher
-    // became an ad network's SDK rather than one of our own routes.
-    await expect(
-      adtentionSource(async () => {
-        throw new Error("network down");
-      }).fetch(),
-    ).resolves.toBeNull();
-    // And a fetcher that throws *synchronously* never returns the promise a
-    // `.catch()` would have been attached to, which is why this is a try/catch.
-    await expect(
-      adtentionSource((() => {
-        throw new Error("thrown before the promise");
-      }) as unknown as () => Promise<null>).fetch(),
-    ).resolves.toBeNull();
-  });
-});
-
-describe("serving from the CLI", () => {
-  // The serve moved here because the network's SDK is built for client-side
-  // serving. What did not move is the money: the gateway decides what an impression is worth and
-  // whether to credit it, so nothing in this file has to be trusted.
-
-  it("truncates ad text rather than passing on whatever arrives", () => {
-    const long = "x".repeat(500);
-    expect(sponsorLineText({ text: long } as Sponsor)!.length).toBe(200);
-    expect(sponsorLineText({ text: "  Acme  " } as Sponsor)).toBe("Acme");
-    expect(sponsorLineText({ text: "   " } as Sponsor)).toBeUndefined();
-    expect(sponsorLineText({} as Sponsor)).toBeUndefined();
-  });
-
-  it("locks the slot to serving, so an install can never mint an earning account", () => {
-    // `serveOnly` is what stops a fleet of CLIs self-registering publisher
-    // accounts nobody can log into. The SDK enforces it at construction, so this
-    // asserts the wiring reaches it — and that a slot is built at all, since
-    // construction throws without a publisher id.
-    const slot = createSponsorSlot({ publisherId: "pub_1", category: "devops" });
-    expect(typeof slot.serve).toBe("function");
-  });
-
-  it("drops a category it does not recognise rather than serving with it", () => {
-    // An older CLI against a gateway that has learned a seventh category. An
-    // unknown value would be rejected per serve and look exactly like empty
-    // inventory; dropping it falls back to `general`, which always fills.
-    expect(() => createSponsorSlot({ publisherId: "pub_1", category: "quantum" })).not.toThrow();
   });
 });
 
@@ -636,58 +541,40 @@ describe("how narrow an advertisement may go", () => {
 });
 
 /**
- * The refusal has to happen before the request, not before the paint.
- *
- * A serve is the billable event on ADtention's side — the impression id comes
- * back from it — so an advertisement fetched into a terminal too narrow to show
- * it is charged to an advertiser and read by nobody. Fetching and then
- * discarding would be the exact failure the floor exists to prevent, carried
- * out one step later.
- *
- * Driven through the SDK's own `fetch` seam, so what is asserted is whether an
- * HTTP request was made at all rather than whether a helper returned null.
+ * The network's ad is never cut (its rules say so), so its row is the whole
+ * line or nothing, where `sponsorRow` would shorten the copy.
  */
-describe("the serve is refused, not the render", () => {
-  const realFetch = globalThis.fetch;
-  afterEach(() => {
-    globalThis.fetch = realFetch;
-  });
+describe("the network's ad, whole or not at all", () => {
+  const AD = "Northwind: free CI minutes for open source";
 
-  /** Counts requests. Stubbed on `globalThis`, which is where the SDK looks. */
-  const countRequests = () => {
-    const calls: string[] = [];
-    globalThis.fetch = (async (input: unknown) => {
-      calls.push(String(input));
-      return new Response(
-        JSON.stringify({
-          impression_id: "imp_1",
-          ad_id: "c_1",
-          text: "Globex: plan sprints in 5 min",
-          billable: true,
-          credit: 0.00005,
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
-    }) as typeof globalThis.fetch;
-    return calls;
-  };
-
-  it("makes no request at all below the floor", async () => {
-    const calls = countRequests();
-    const slot = createSponsorSlot({ publisherId: "pub_test", category: "devops" });
-    for (const cols of [0, 1, 24, 30, AD_MIN_COLS - 1]) {
-      expect(await slot.serve(cols), `cols=${cols}`).toBeNull();
+  it("draws the whole line, marked, wherever it fits", () => {
+    for (const cols of [AD_MIN_COLS + 30, 80, 120]) {
+      const row = wholeAdRow(AD, cols);
+      expect(row?.body, String(cols)).toBe(AD);
+      expect(row?.label).toBe(`${AD_LABEL} · `);
+      expect(visibleLength(joinSponsorRow(row!))).toBeLessThanOrEqual(cols);
     }
-    expect(calls).toEqual([]);
   });
 
-  it("makes one at the floor and above", async () => {
-    const calls = countRequests();
-    const slot = createSponsorSlot({ publisherId: "pub_test", category: "devops" });
-    const served = await slot.serve(AD_MIN_COLS);
-    expect(served?.text).toBe("Globex: plan sprints in 5 min");
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toContain("/v1/serve");
+  it("draws nothing one column short of the whole line, where the other row would cut it", () => {
+    const fits = [...Array(200).keys()].find((cols) => wholeAdRow(AD, cols) !== null)!;
+    expect(wholeAdRow(AD, fits - 1)).toBeNull();
+    expect(sponsorRow(AD, fits - 1, "network")?.body.endsWith("…")).toBe(true);
+    expect(visibleLength(joinSponsorRow(wholeAdRow(AD, fits)!))).toBe(fits);
+  });
+
+  it("adds the short address only when both fit whole", () => {
+    const LINK = "trygravity.ai/c/k3p9";
+    expect(wholeAdRow(AD, 120, LINK)?.link).toBe(LINK);
+    const tight = [...Array(200).keys()].find((cols) => wholeAdRow(AD, cols) !== null)!;
+    const row = wholeAdRow(AD, tight, LINK);
+    expect(row?.body).toBe(AD);
+    expect(row?.link).toBeNull();
+  });
+
+  it("refuses below the advertisement floor whatever the copy", () => {
+    expect(wholeAdRow("Acme", AD_MIN_COLS - 1)).toBeNull();
+    expect(wholeAdRow("", 120)).toBeNull();
   });
 });
 

@@ -6,16 +6,18 @@
  * rather than of any function — so every one is asserted against what ink
  * actually wrote to a terminal it believed was real:
  *
- *  - a format is served only when the gateway hands it out, so with the switch
- *    off a session is exactly what it was;
+ *  - a place is asked about only where the terminal can hold it;
  *  - the card sits beside the working line and costs no row, so the input box
  *    does not move when it arrives;
  *  - the status bar is a row under the status line, and the first thing given
  *    up when rows run short;
  *  - a dialog is what the person is reading, and the two newer slots give way
  *    to it;
- *  - an impression is reported only if its row was drawn, and the three are
- *    reported one after another, each under its own format.
+ *  - a line is reported only if its row was drawn, after the turn, all
+ *    three in one report, each under its own format.
+ *
+ * The lines here are booked ones, because a booked week is what fills all
+ * three places at once.
  */
 import React from "react";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -38,9 +40,9 @@ import {
 vi.mock("../src/browser.ts", () => ({ openBrowser: () => undefined }));
 import { App } from "../src/tui/app.tsx";
 import type { CliConfig } from "../src/config.ts";
-import type { ChatTurn, GatewayClient, ImpressionReport, WalletInfo } from "../src/client.ts";
-import type { ServedLine } from "../src/sponsor/network.ts";
-import type { AdFormat, ExtraAdFormat } from "../src/sponsor/formats.ts";
+import type { ChatTurn, GatewayClient, WalletInfo } from "../src/client.ts";
+import type { DirectAnswer, ServedDirectLine } from "../src/sponsor/direct.ts";
+import type { AdFormat } from "../src/sponsor/formats.ts";
 import { AD_LABEL, SIDEBAR_CARD_COLS, SIDEBAR_MIN_COLS, SPONSOR_SIGIL } from "../src/sponsor/render.ts";
 
 const config: CliConfig = {
@@ -62,56 +64,33 @@ const wallet: WalletInfo = {
 
 const catalog = [{ id: "gemini-2.5-flash-lite", tier: "cheap", est_ads_per_task: 1.2 }];
 
-const LINES: Record<AdFormat, ServedLine> = {
-  top_bar: {
-    id: "c_top",
-    text: "Globex: plan sprints in 5 min",
-    impressionId: "imp_top",
-    billable: true,
-    fromCache: false,
-    credit: 0.00005,
-  },
-  sidebar_card: {
-    id: "c_side",
-    text: "Nimbus: catch the error first",
-    impressionId: "imp_side",
-    billable: true,
-    fromCache: false,
-    credit: 0.00005,
-  },
-  status_bar: {
-    id: "c_status",
-    text: "Acme Deploys — ship on Friday",
-    impressionId: "imp_status",
-    billable: true,
-    fromCache: false,
-    credit: 0.00005,
-  },
+const line = (format: AdFormat, text: string): ServedDirectLine => ({
+  format,
+  text,
+  serveToken: `tok_${format}`,
+  clickUrl: "https://app.clixad.io/go?c=x",
+});
+
+const LINES: Record<AdFormat, ServedDirectLine> = {
+  top_bar: line("top_bar", "Globex: plan sprints in 5 min"),
+  sidebar_card: line("sidebar_card", "Nimbus: catch the error first"),
+  status_bar: line("status_bar", "Acme Deploys — ship on Friday"),
 };
 
-const BOTH: readonly ExtraAdFormat[] = ["sidebar_card", "status_bar"];
+type Report = { format: AdFormat; serveToken: string };
 
-/**
- * A client whose turn hangs until released, recording every report — and how
- * many were in flight at once, since "one after another" is a claim too.
- */
+/** A client whose turn hangs until released, recording every report call. */
 function watchingClient(turn?: () => Promise<ChatTurn>) {
-  const reported: ImpressionReport[] = [];
-  let inFlight = 0;
-  let maxInFlight = 0;
+  const reported: Report[][] = [];
   let release: () => void = () => {};
   const client = {
     models: async () => catalog,
     wallet: async () => wallet,
-    sponsorConfig: async () => null,
-    reportImpression: async (r: ImpressionReport) => {
-      inFlight++;
-      maxInFlight = Math.max(maxInFlight, inFlight);
-      await settle(5);
-      reported.push(r);
-      inFlight--;
+    reportDirectImpressions: async (items: Report[]) => {
+      reported.push(items);
       return 0;
     },
+    reportSponsorViews: async () => 0,
     chatStream:
       turn ??
       (async (): Promise<ChatTurn> => {
@@ -126,14 +105,17 @@ function watchingClient(turn?: () => Promise<ChatTurn>) {
         } as ChatTurn;
       }),
   } as unknown as GatewayClient;
-  return { client, reported, maxInFlight: () => maxInFlight, release: () => release() };
+  return { client, reported, release: () => release() };
 }
 
-/** A serve that answers every format it is asked for, and remembers which. */
-function servingAll(asked: AdFormat[]) {
-  return async (_cols: number, _signal?: AbortSignal, format: AdFormat = "top_bar") => {
-    asked.push(format);
-    return LINES[format];
+/**
+ * An ask that books a line in each place it is asked about, out of `booked`,
+ * and remembers what it was asked.
+ */
+function bookingAll(asked: AdFormat[][] = [], booked: readonly AdFormat[] = ["top_bar", "sidebar_card", "status_bar"]) {
+  return async (formats: readonly AdFormat[]): Promise<DirectAnswer> => {
+    asked.push([...formats]);
+    return { supported: true, lines: formats.filter((f) => booked.includes(f)).map((f) => LINES[f]) };
   };
 }
 
@@ -165,46 +147,22 @@ const lastFrame = (term: FakeTerminal): string[] => {
 
 const rowIndex = (rows: string[], text: string) => rows.findIndex((r) => r.includes(text));
 
-describe("which formats a session serves", () => {
-  it("serves the top bar alone while the gateway hands out nothing else", async () => {
-    // The switch on the gateway is off until ADtention confirms, and this is
-    // what every session looks like until then: exactly what it was.
-    const term = fakeTerminal(30, 120);
-    const { client, reported, release } = watchingClient();
-    const asked: AdFormat[] = [];
-    mount(term, { client, initialTask: "go", sponsorServe: servingAll(asked) });
-    await settle(250);
-
-    expect(asked).toEqual(["top_bar"]);
-    const rows = lastFrame(term);
-    expect(rowIndex(rows, LINES.sidebar_card.text)).toBe(-1);
-    expect(rowIndex(rows, LINES.status_bar.text)).toBe(-1);
-
-    release();
-    await settle(150);
-    // And the report is byte for byte what a published CLI sends: no format.
-    expect(reported).toHaveLength(1);
-    expect(reported[0]!.impressionId).toBe("imp_top");
-    expect(reported[0]!.format).toBeUndefined();
-  });
-
+describe("which places a session asks about", () => {
   it("never asks for a card on a terminal too narrow to draw one", async () => {
-    // A serve is the billable event, so the width is refused before the
-    // network is asked — the top bar's rule, at the card's own floor.
     const narrow = fakeTerminal(30, SIDEBAR_MIN_COLS - 1);
-    const askedNarrow: AdFormat[] = [];
-    mount(narrow, { initialTask: "go", sponsorServe: servingAll(askedNarrow), sponsorFormats: BOTH });
+    const asked: AdFormat[][] = [];
+    mount(narrow, { initialTask: "go", sponsorDirect: bookingAll(asked) });
     await settle(250);
-    expect(askedNarrow.sort()).toEqual(["status_bar", "top_bar"]);
+    expect(asked).toEqual([["top_bar", "status_bar"]]);
     expect(plain(narrow.output())).not.toContain(LINES.sidebar_card.text);
   });
 
   it("asks for a card one column wider", async () => {
     const wide = fakeTerminal(30, SIDEBAR_MIN_COLS);
-    const asked: AdFormat[] = [];
-    mount(wide, { initialTask: "go", sponsorServe: servingAll(asked), sponsorFormats: BOTH });
+    const asked: AdFormat[][] = [];
+    mount(wide, { initialTask: "go", sponsorDirect: bookingAll(asked) });
     await settle(250);
-    expect(asked.sort()).toEqual(["sidebar_card", "status_bar", "top_bar"]);
+    expect(asked).toEqual([["top_bar", "sidebar_card", "status_bar"]]);
     expect(plain(wide.output())).toContain(LINES.sidebar_card.text);
   });
 });
@@ -213,7 +171,7 @@ describe("where each format is drawn", () => {
   it("puts all three on screen at once, each in its place", async () => {
     const term = fakeTerminal(30, 120);
     const { client, release } = watchingClient();
-    mount(term, { client, initialTask: "go", sponsorServe: servingAll([]), sponsorFormats: BOTH });
+    mount(term, { client, initialTask: "go", sponsorDirect: bookingAll() });
     await settle(250);
 
     const rows = lastFrame(term);
@@ -244,9 +202,9 @@ describe("where each format is drawn", () => {
   });
 
   it("costs no row: the input box stays where it was when a card arrives", async () => {
-    const heightWith = async (formats: readonly ExtraAdFormat[]) => {
+    const heightWith = async (booked: readonly AdFormat[]) => {
       const term = fakeTerminal(30, 120);
-      mount(term, { initialTask: "go", sponsorServe: servingAll([]), sponsorFormats: formats });
+      mount(term, { initialTask: "go", sponsorDirect: bookingAll([], booked) });
       await settle(250);
       const rows = lastFrame(term);
       for (const app of mounted.splice(0)) app.unmount();
@@ -254,7 +212,7 @@ describe("where each format is drawn", () => {
       return { rows: rows.length, prompt: rows.length - rowIndex(rows, "❯") };
     };
     // Same frame, same distance from the prompt to the bottom, card or no card.
-    expect(await heightWith(["status_bar", "sidebar_card"])).toEqual(await heightWith(["status_bar"]));
+    expect(await heightWith(["top_bar", "status_bar", "sidebar_card"])).toEqual(await heightWith(["top_bar", "status_bar"]));
   });
 
   it("gives the status bar up first when rows run short, and never overflows", async () => {
@@ -262,7 +220,7 @@ describe("where each format is drawn", () => {
     // top bar, and nothing more. The card costs no row, so it stays.
     const term = fakeTerminal(9, 120);
     const { client, reported, release } = watchingClient();
-    mount(term, { client, initialTask: "go", sponsorServe: servingAll([]), sponsorFormats: BOTH });
+    mount(term, { client, initialTask: "go", sponsorDirect: bookingAll() });
     await settle(250);
 
     const rows = lastFrame(term);
@@ -274,8 +232,8 @@ describe("where each format is drawn", () => {
 
     release();
     await settle(150);
-    // Served, filled, never drawn: not an impression, so not reported.
-    expect(reported.map((r) => r.impressionId).sort()).toEqual(["imp_side", "imp_top"]);
+    // Answered, never drawn: not seen, so not reported.
+    expect(reported.flat().map((r) => r.format).sort()).toEqual(["sidebar_card", "top_bar"]);
   });
 
   it("fits every terminal it is drawn in", async () => {
@@ -287,7 +245,7 @@ describe("where each format is drawn", () => {
       [7, 120],
     ] as const) {
       const term = fakeTerminal(height, width);
-      mount(term, { initialTask: "go", sponsorServe: servingAll([]), sponsorFormats: BOTH });
+      mount(term, { initialTask: "go", sponsorDirect: bookingAll() });
       await settle(200);
       expect(clearCount(term), `${width}x${height}`).toBe(0);
       expect(tallestFrameRows(term), `${width}x${height}`).toBeLessThanOrEqual(height);
@@ -325,18 +283,18 @@ describe("a dialog is what the person is reading", () => {
     try {
       const term = fakeTerminal(30, 120);
       const { client, reported } = editTurn();
-      // The two newer slots fill only once the dialog is already up.
+      // The answer lands only once the dialog is already up.
       let land: () => void = () => {};
       const later = new Promise<void>((r) => {
         land = r;
       });
+      const book = bookingAll();
       const { stdin } = mount(term, {
         client,
         initialTask: "write it",
-        sponsorFormats: BOTH,
-        sponsorServe: async (_c, _s, format = "top_bar") => {
-          if (format !== "top_bar") await later;
-          return LINES[format];
+        sponsorDirect: async (formats) => {
+          await later;
+          return book(formats);
         },
       });
       await settle(300);
@@ -353,7 +311,7 @@ describe("a dialog is what the person is reading", () => {
       // Esc stops the turn with the dialog still up.
       stdin.send("\u001b");
       await settle(200);
-      expect(reported.map((r) => r.impressionId)).toEqual(["imp_top"]);
+      expect(reported.flat().map((r) => r.format)).toEqual(["top_bar"]);
     } finally {
       process.chdir(cwd);
       rmSync(dir, { recursive: true, force: true });
@@ -362,20 +320,21 @@ describe("a dialog is what the person is reading", () => {
 });
 
 describe("reporting three formats", () => {
-  it("reports each drawn format after the turn, under its own format, one at a time", async () => {
+  it("reports each drawn line after the turn, under its own format, in one report", async () => {
     const term = fakeTerminal(30, 120);
-    const { client, reported, maxInFlight, release } = watchingClient();
-    mount(term, { client, initialTask: "go", sponsorServe: servingAll([]), sponsorFormats: BOTH });
+    const { client, reported, release } = watchingClient();
+    mount(term, { client, initialTask: "go", sponsorDirect: bookingAll() });
     await settle(250);
     // Nothing while the call is in flight: the gateway has not settled it.
     expect(reported).toEqual([]);
 
     release();
     await settle(200);
-    const byId = Object.fromEntries(reported.map((r) => [r.impressionId, r.format]));
-    expect(byId).toEqual({ imp_top: undefined, imp_side: "sidebar_card", imp_status: "status_bar" });
-    // Sequential, because the gateway decides each report against the ones
-    // before it.
-    expect(maxInFlight()).toBe(1);
+    expect(reported).toHaveLength(1);
+    expect(Object.fromEntries(reported[0]!.map((r) => [r.format, r.serveToken]))).toEqual({
+      top_bar: "tok_top_bar",
+      sidebar_card: "tok_sidebar_card",
+      status_bar: "tok_status_bar",
+    });
   });
 });

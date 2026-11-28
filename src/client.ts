@@ -7,8 +7,8 @@ import { gzipSync } from "node:zlib";
 import type { CliConfig } from "./config.ts";
 import { VERSION } from "./version.ts";
 import { parseTaskShape, type TaskShape } from "./estimate.ts";
-import { EXTRA_AD_FORMATS, type AdFormat, type ExtraAdFormat } from "./sponsor/formats.ts";
-import { parseDirectLines, parseFallbackLines, parseMeasure, type DirectAnswer, type LinkMode } from "./sponsor/direct.ts";
+import type { AdFormat } from "./sponsor/formats.ts";
+import { parseDirectLines, parseFallbackLines, parseGravityLine, parseMeasure, type DirectAnswer, type LinkMode } from "./sponsor/direct.ts";
 import {
   EdgeBlockedError,
   EdgeOutageError,
@@ -449,73 +449,6 @@ export const LEDGER_REASONS: Record<string, string> = {
 /** A ledger reason as a human sentence fragment, falling back to the raw value. */
 export function ledgerReasonLabel(reason: string): string {
   return LEDGER_REASONS[reason] ?? reason.replace(/_/g, " ");
-}
-
-/**
- * The parameters a session serves sponsored lines with, from
- * `GET /v1/sponsor/config`.
- *
- * The publisher id is here rather than in this program's source because a value
- * we fetch can be rotated without a release and stops being handed out the
- * moment an account is closed. The subject arrives already hashed by the
- * gateway, so the salt that scopes it never ships.
- *
- * `null` for "this gateway has no ad network", which is a supported state and
- * answers 200: the CLI keeps its own house inventory and has lost nothing.
- */
-export interface SponsorConfigInfo {
-  /** The top bar's publisher id. */
-  publisherId: string;
-  category?: string;
-  subject?: string;
-  dwellMs?: number;
-  /**
-   * The publisher id of every other format this gateway serves. Absent on a
-   * gateway older than the formats, and without an entry for a format that is
-   * switched off there — in both cases that slot is never served.
-   */
-  formats?: Partial<Record<ExtraAdFormat, string>>;
-}
-
-/**
- * The extra formats' publisher ids out of `/v1/sponsor/config`'s `formats`.
- *
- * Read defensively, row by row, for the paywall's `free_models` reason: a
- * malformed entry costs that format, never the top bar that every session
- * already serves. A format this build does not know is skipped — a newer
- * gateway may well have a fourth, and this CLI has nowhere to draw it.
- */
-function extraFormatIds(raw: unknown): Partial<Record<ExtraAdFormat, string>> {
-  const out: Partial<Record<ExtraAdFormat, string>> = {};
-  if (typeof raw !== "object" || raw === null) return out;
-  for (const format of EXTRA_AD_FORMATS) {
-    const entry = (raw as Record<string, unknown>)[format];
-    if (typeof entry !== "object" || entry === null) continue;
-    const id = (entry as Record<string, unknown>).publisher_id;
-    if (typeof id === "string" && id.trim()) out[format] = id.trim();
-  }
-  return out;
-}
-
-/**
- * One impression, reported to `POST /v1/sponsor/impression`.
- *
- * Everything on it is what the SDK said, forwarded as it came. None of it is
- * trusted: the gateway decides what an impression is worth and whether to
- * credit it at all, so reporting `billable: false` honestly costs nothing.
- */
-export interface ImpressionReport {
-  impressionId: string;
-  /**
-   * The slot it was shown in. Absent means the top bar, which is what the
-   * gateway reads a missing field as — so a top-bar report stays byte for byte
-   * what every published CLI has always sent.
-   */
-  format?: AdFormat;
-  adId?: string;
-  billable: boolean;
-  fromCache: boolean;
-  credit: number;
 }
 
 /**
@@ -1695,7 +1628,7 @@ export class GatewayClient {
    * might be somebody's first contact today — a login, the REPL opening,
    * `wallet` — claim without coordinating.
    *
-   * **Never throws.** Like `sponsorConfig`, every caller is decorating something
+   * **Never throws.** Like `directSponsor`, every caller is decorating something
    * that already works: a gateway too old to have the route, a cold start, a
    * dropped connection and an expired token all mean the same thing here, which
    * is "say nothing about a streak". A missed grant is claimed by the next
@@ -2040,109 +1973,23 @@ export class GatewayClient {
   }
 
   /**
-   * Ask the gateway for a sponsored line, or `null` if it has none.
-   *
-   * **This never throws and never reports a failure to anybody.** Every caller is
-   * painting a row of dim chrome that already has a house line in it, so there is
-   * no state a user could act on and nothing a message would improve — a 404 from
-   * a gateway older than the route, a 401, a cold start, a dropped connection and
-   * an empty inventory are all the same event here, which is "keep showing ours".
-   * That is the opposite of every other method on this client, and it is why the
-   * catch is this broad rather than a list of statuses.
-   */
-  /**
-   * The serve parameters for this session, or `null` for "no ad network".
-   *
-   * Fetched once per session rather than per model call: the publisher id and
-   * the subject are stable for the life of an account, and the SDK's slot holds
-   * its own dwell cache. This route used to be `GET /v1/sponsor/line`, and used
-   * to be asked before every single call.
-   *
-   * Never throws, for the reason `sponsorLine` never threw: the caller starts it
-   * beside a turn that is already running, and a status line must not be able to
-   * take a session with it. A 404 (an older gateway that still serves lines
-   * itself) and a 401 both land on `null`, which means the house line — the
-   * correct outcome in both cases.
-   */
-  async sponsorConfig(signal?: AbortSignal): Promise<SponsorConfigInfo | null> {
-    try {
-      // `direct=1`: this CLI asks for booked lines first and keeps ADtention
-      // out of a booked slot itself, so the gateway need not leave that slot
-      // out of the config, which it does for CLIs that cannot.
-      const res = await gatewayFetch(`${this.config.gatewayUrl}/v1/sponsor/config?direct=1`, {
-        headers: this.headers(),
-        ...(signal ? { signal } : {}),
-      });
-      if (!res.ok) return null;
-      const body = (await res.json()) as Record<string, unknown>;
-      const publisherId = typeof body.publisher_id === "string" ? body.publisher_id.trim() : "";
-      // `provider: "house"` is a successful answer meaning "use your own", and
-      // it carries no publisher. Only an id is a configuration.
-      if (!publisherId) return null;
-      const formats = extraFormatIds(body.formats);
-      return {
-        publisherId,
-        ...(typeof body.category === "string" ? { category: body.category } : {}),
-        ...(typeof body.subject === "string" ? { subject: body.subject } : {}),
-        ...(typeof body.dwell_ms === "number" ? { dwellMs: body.dwell_ms } : {}),
-        ...(Object.keys(formats).length > 0 ? { formats } : {}),
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Report one impression, and answer what it was credited.
-   *
-   * Fire-and-forget from the caller's point of view — the number comes back for
-   * the session tally and for tests, and nothing on screen depends on it. Like
-   * `sponsorConfig` it never throws: this is called from a `void`, and an
-   * unhandled rejection there is a Node process exiting over a line of chrome
-   * nobody asked for.
-   *
-   * **Call this after the model call the line was shown during has finished.**
-   * The gateway credits an impression only once that call has been settled, so
-   * a report that arrives while the call is still in flight is refused every
-   * time, and silently, since a refused grant is a 200 with `credited: 0`. That
-   * is the shape this shipped in once. `reportSponsor` in `app.tsx` is the
-   * caller, and it fires from `runTurn`'s `finally` for exactly this reason.
-   */
-  async reportImpression(report: ImpressionReport, signal?: AbortSignal): Promise<number> {
-    try {
-      const res = await gatewayFetch(`${this.config.gatewayUrl}/v1/sponsor/impression`, {
-        method: "POST",
-        headers: this.headers(),
-        ...(signal ? { signal } : {}),
-        body: JSON.stringify({
-          impression_id: report.impressionId,
-          ...(report.format && report.format !== "top_bar" ? { format: report.format } : {}),
-          ...(report.adId ? { ad_id: report.adId } : {}),
-          billable: report.billable,
-          from_cache: report.fromCache,
-          credit: report.credit,
-        }),
-      });
-      if (!res.ok) return 0;
-      const body = (await res.json()) as { credited?: unknown };
-      return typeof body.credited === "number" ? body.credited : 0;
-    } catch {
-      return 0;
-    }
-  }
-
-  /**
    * Ask for booked lines (step 2): one ask per model call, naming the slots
    * that fit the terminal now. See `sponsor/direct.ts` for the contract.
    *
-   * Never throws, for `sponsorConfig`'s reason. A 404 means a gateway that
-   * does not know the route, so `supported: false` tells the caller to stop
-   * asking for the rest of the session; every other failure (a timeout, a 429,
-   * a 5xx, a malformed body) is simply "nothing booked" this time.
+   * Never throws: the caller starts it beside a turn that is already
+   * running, and a row of chrome must not be able to take a session with it.
+   * A 404 means a gateway that does not know the route, so `supported: false`
+   * tells the caller to stop asking for the rest of the session; every other
+   * failure (a timeout, a 429, a 5xx, a malformed body) is simply "nothing
+   * booked" this time.
+   *
+   * `gravity=1` says this CLI can draw a network ad by the rules that come
+   * with it (alone on screen, never cut), so the gateway may ask for one when
+   * nothing is booked. A CLI without it is never asked an ad for.
    */
   async directSponsor(formats: readonly AdFormat[], cols: number, signal?: AbortSignal): Promise<DirectAnswer> {
     try {
-      const res = await gatewayFetch(`${this.config.gatewayUrl}/v1/sponsor/direct`, {
+      const res = await gatewayFetch(`${this.config.gatewayUrl}/v1/sponsor/direct?gravity=1`, {
         method: "POST",
         headers: this.headers(),
         ...(signal ? { signal } : {}),
@@ -2153,11 +2000,13 @@ export class GatewayClient {
       const body = await res.json();
       const fallbacks = parseFallbackLines(body);
       const measure = parseMeasure(body);
+      const gravity = parseGravityLine(body);
       return {
         supported: true,
         lines: parseDirectLines(body),
         ...(fallbacks.length > 0 ? { fallbacks } : {}),
         ...(measure ? { measure } : {}),
+        ...(gravity ? { gravity } : {}),
       };
     } catch {
       return { supported: true, lines: [], failed: true };
@@ -2165,8 +2014,28 @@ export class GatewayClient {
   }
 
   /**
+   * Tell the gateway a network ad was drawn, the moment it was: a GET on the
+   * impression address the answer carried, which the gateway passes on to the
+   * network. It credits nobody anything. Only a path on this gateway is ever
+   * fetched, so this program still talks to nobody else.
+   *
+   * Never throws, and answers whether the gateway took it, for tests.
+   */
+  async networkImpression(path: string, signal?: AbortSignal): Promise<boolean> {
+    if (!path.startsWith("/")) return false;
+    try {
+      const res = await gatewayFetch(`${this.config.gatewayUrl}${path}`, {
+        headers: { "user-agent": "clixad-cli" },
+        ...(signal ? { signal } : {}),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Report the booked lines a turn drew, in one call, after the turn is over.
-   * Never to `/v1/sponsor/impression`, which would credit them as ADtention's.
    * Never throws; answers what was credited, for the tally and for tests.
    */
   async reportDirectImpressions(

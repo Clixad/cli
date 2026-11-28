@@ -42,11 +42,9 @@ import {
   type CreditPackInfo,
   type GatewayClient,
   type ImageAttachment,
-  type ImpressionReport,
   type ModelInfo,
   type PremiumAccess,
   type Spendable,
-  type SponsorConfigInfo,
   type StreakInfo,
   type WalletInfo,
 } from "../client.ts";
@@ -148,10 +146,17 @@ import {
   type StoredSession,
 } from "../session.ts";
 import { createTally, recordImpression } from "../sponsor/counter.ts";
-import { adtentionSource, sponsorSource, type RemotePick, type SponsorFacts } from "../sponsor/provider.ts";
-import { createSponsorSlot, type ServedLine } from "../sponsor/network.ts";
-import { AD_FORMATS, EXTRA_AD_FORMATS, type AdFormat, type ExtraAdFormat } from "../sponsor/formats.ts";
-import { DIRECT_ASK_TIMEOUT_MS, shortLinkText, type DirectAnswer, type DirectLine, type LinkMode, type ServedDirectLine } from "../sponsor/direct.ts";
+import { sponsorSource, type SponsorFacts } from "../sponsor/provider.ts";
+import { AD_FORMATS, type AdFormat, type ExtraAdFormat } from "../sponsor/formats.ts";
+import {
+  DIRECT_ASK_TIMEOUT_MS,
+  shortLinkText,
+  type DirectAnswer,
+  type DirectLine,
+  type GravityLine,
+  type LinkMode,
+  type ServedDirectLine,
+} from "../sponsor/direct.ts";
 import { placeKey, VisibilityClock } from "../sponsor/visibility.ts";
 import { hyperlinksEnabled, osc8 } from "../sponsor/hyperlink.ts";
 import {
@@ -162,6 +167,7 @@ import {
   sidebarCard,
   sponsorEnabled,
   sponsorRow,
+  wholeAdRow,
   type SponsorOrigin,
   type SponsorRow,
 } from "../sponsor/render.ts";
@@ -573,33 +579,18 @@ export interface AppProps {
   /** Task to run immediately, e.g. `clixad agent "…"`. */
   initialTask?: string | undefined;
   /**
-   * Serve a sponsored line, instead of building an ADtention slot from the
-   * gateway's configuration.
-   *
-   * A seam, for one property that has no other alarm: an impression is recorded
-   * when the line is painted and reported only once the turn is **over**, and
-   * getting that backwards is invisible everywhere except in production. It
-   * shipped backwards once: the report fired before the model call had been
-   * settled, so no impression could ever credit. Driving it needs a served line,
-   * and a served line needs a network, so the network is what a test replaces.
-   */
-  sponsorServe?:
-    | ((cols: number, signal?: AbortSignal, format?: AdFormat) => Promise<ServedLine | null>)
-    | undefined;
-  /**
-   * The extra formats a gateway would hand out, for a test driving
-   * `sponsorServe`. Without it the seam serves the top bar alone — which is
-   * what every test written before there were three formats means, and what a
-   * gateway with the switch off answers.
-   */
-  sponsorFormats?: readonly ExtraAdFormat[] | undefined;
-  /**
-   * Ask for booked lines, instead of `client.directSponsor`. A seam for the
-   * same reason as `sponsorServe`: the gateway answers "nothing booked" until
-   * the first week is sold, so a booked line, a hold, and their reports are
-   * only reachable from a test through here.
+   * Ask for booked lines, instead of `client.directSponsor`. A seam because
+   * the gateway answers "nothing booked" until a week is sold and has no
+   * network ad without a key, so a booked line, a hold, a network ad and their
+   * reports are only reachable from a test through here.
    */
   sponsorDirect?: ((formats: readonly AdFormat[], cols: number, signal?: AbortSignal) => Promise<DirectAnswer>) | undefined;
+  /**
+   * Tell the gateway a network ad was drawn, instead of
+   * `client.networkImpression`. A seam for `sponsorDirect`'s reason: what has
+   * to be tested is *when* it fires, once and only after the row was drawn.
+   */
+  sponsorImpression?: ((path: string) => Promise<boolean>) | undefined;
   /**
    * Whether to suggest `/init` in this session, decided by `main.ts`.
    *
@@ -614,7 +605,7 @@ export interface AppProps {
    */
   initHint?: { returning: boolean } | undefined;
   /**
-   * Run `/update`, instead of npm on this machine. A seam for `sponsorServe`'s
+   * Run `/update`, instead of npm on this machine. A seam for `sponsorDirect`'s
    * reason: what is tested is how the REPL words every outcome, and the real
    * thing replaces the CLI a test is running from.
    */
@@ -715,9 +706,8 @@ export function App({
   newAccount,
   initialTask,
   notices,
-  sponsorServe,
-  sponsorFormats,
   sponsorDirect,
+  sponsorImpression,
   initHint,
   preferences,
   update,
@@ -951,6 +941,7 @@ export function App({
   // the line, for every terminal, where the gateway's address is short enough.
   // `linkRequired` marks a booked line whose printed address is the only way
   // to open it (a terminal without links): the copy gives way to the address.
+  // `whole` marks the network's ad, which is drawn whole or not at all.
   const [sponsor, setSponsor] = useState<{
     text: string;
     origin: SponsorOrigin;
@@ -958,10 +949,11 @@ export function App({
     link?: string;
     linkText?: string;
     linkRequired?: boolean;
+    whole?: boolean;
   } | null>(null);
-  // The other two formats. Network only — there is no house card and no house
-  // status bar, so an empty slot is simply not drawn — and, like the top bar,
-  // only for the model call they were fetched for.
+  // The other two formats. Advertisements only (there is no house card and no
+  // house status bar, so an empty slot is simply not drawn) and, like the top
+  // bar, only for the model call they were asked for.
   const [adSlots, setAdSlots] = useState<
     Partial<Record<ExtraAdFormat, { text: string; impressionId: string; link?: string; linkText?: string; linkRequired?: boolean }>>
   >({});
@@ -1285,31 +1277,26 @@ export function App({
   const sponsorRef = useRef(sponsorSource());
   const sponsorIdxRef = useRef(0);
   const sponsorPrevRef = useRef<string | undefined>(undefined);
-  // Which model call the line on screen belongs to. A network line arrives a few
-  // hundred milliseconds after the house line is painted, by which time the turn
-  // may have ended or a queued one may have started — and a late answer painted
-  // onto either is an ad appearing over a finished conversation. Every fill is
+  // Which model call the line on screen belongs to. An advertisement arrives a
+  // moment after the house line is painted, by which time the turn may have
+  // ended or a queued one may have started, and a late answer painted onto
+  // either is an ad appearing over a finished conversation. Every fill is
   // stamped with the counter it was asked for and dropped if that has moved.
   const sponsorCallRef = useRef(0);
-  // The impression for each network line currently on screen, stamped with the
-  // call it belongs to, waiting for that turn to finish. One per format, since
-  // each slot is filled and reported on its own. See `reportSponsor`.
-  const pendingImpressionRef = useRef(new Map<AdFormat, { call: number; impression: ImpressionReport }>());
-  // The booked line drawn in each slot this turn, the same three moments as a
-  // network line: held when painted, reported when the turn is over, and only
-  // if `drawnRef` saw it. `drawnId` is what the frame records it under.
+  // The booked line drawn in each slot this turn: held when painted, reported
+  // when the turn is over, and only if `drawnRef` saw it. `drawnId` is what
+  // the frame records it under.
   const pendingDirectRef = useRef(new Map<AdFormat, { call: number; serveToken: string; drawnId: string }>());
-  // The same for a fallback line, drawn where ADtention had nothing. Reported
-  // to a route of its own, only to be counted: it earns nothing.
+  // The same for a fallback line, drawn where nothing else was. Reported to a
+  // route of its own, only to be counted: it earns nothing.
   const pendingFallbackRef = useRef(new Map<AdFormat, { call: number; serveToken: string; drawnId: string }>());
+  // The network's ad in the top bar this turn. Its impression is told to the
+  // gateway the moment the frame first draws it, once (`fired`), which is
+  // what the network counts an impression as. It earns nobody anything.
+  const pendingGravityRef = useRef<{ call: number; drawnId: string; path: string; fired: boolean } | null>(null);
   // False once a gateway has answered 404 to the ask: an older gateway that
   // will not know the route for the rest of this session either.
   const directSupportedRef = useRef(true);
-  // The slots a successful ask said were booked (a line or a hold), most
-  // recently. When an ask fails, ADtention is still asked for every other
-  // slot but not for these: a slot somebody paid to have alone this week
-  // must not show somebody else's ad because one request timed out.
-  const knownBookedRef = useRef(new Set<AdFormat>());
   // The impression ids the render has actually put on screen this turn.
   //
   // Filled from an effect, i.e. after a commit, never from the fill: a line can
@@ -1331,33 +1318,13 @@ export function App({
   // the places it asked about: reported after the turn with how long each
   // place stayed on screen, measured from that answer on.
   const measureRef = useRef<{ call: number; token: string; answeredAt: number; formats: AdFormat[] } | null>(null);
-  // The network provider. Held in a ref for the reason the house source is:
-  // `nextSponsor` is a callback with its own dependency list, and a source
-  // rebuilt on every render would be a new object in it every time.
-  //
-  // The serve happens **here**, in this process, against ADtention directly,
-  // because their SDK is built for client-side serving. What the gateway still
-  // owns is the account (the
-  // publisher id and the subject arrive from `/v1/sponsor/config`) and the money
-  // (it decides what an impression is worth and whether to credit it). See
-  // `sponsor/network.ts`.
-  //
-  // The slot is built lazily on the first model call rather than at mount, so a
-  // session that never runs one — `/help`, `/wallet`, a mistyped command and an
-  // exit — makes no request to an ad network at all.
-  //
-  // One slot per format: each is its own publisher id with its own dwell cache.
-  const sponsorSlotRef = useRef(
-    new Map<AdFormat, { serve(cols: number, signal?: AbortSignal): Promise<ServedLine | null> }>(),
-  );
   /**
    * The terminal width, readable from a closure that was built at mount.
    *
-   * The fetcher below lives in a `useRef` initialiser, so it captures the first
-   * render's scope and keeps it for the session — a `cols` read there would be
-   * the width the terminal had when the REPL opened, forever. The serve gate
-   * and the fill check both have to see the width the terminal has *now*, so
-   * they go through this.
+   * The fills below run in callbacks that outlive the render they were made
+   * in, so a `cols` read there could be a width the terminal no longer has.
+   * The fill checks have to see the width the terminal has *now*, so they go
+   * through this.
    */
   const colsRef = useRef(cols);
   colsRef.current = cols;
@@ -1370,66 +1337,6 @@ export function App({
    * that arrives too wide is: not held, never drawn, never reported.
    */
   const modalOpenRef = useRef(false);
-  const sponsorConfigRef = useRef<Promise<SponsorConfigInfo | null> | null>(null);
-  /**
-   * Serve one format, or `null` when this session does not serve it.
-   *
-   * A format is served only when the gateway handed out a publisher for it —
-   * the top bar whenever there is a publisher at all, the other two only while
-   * the gateway's switch lists them. Nothing here decides that a format is on:
-   * a CLI that could switch one on would be a CLI that decides when an
-   * advertisement appears, and that belongs to the deployment.
-   */
-  const serveFormat = async (format: AdFormat, signal?: AbortSignal): Promise<RemotePick | null> => {
-    // One fetch per session, memoised as the *promise* rather than the result:
-    // two model calls can start close enough together that the second would
-    // otherwise ask again before the first has answered — and three formats
-    // start together every time.
-    let served: ServedLine | null;
-    if (sponsorServe) {
-      if (format !== "top_bar" && !sponsorFormats?.includes(format)) return null;
-      served = await sponsorServe(colsRef.current, signal, format);
-    } else {
-      sponsorConfigRef.current ??= client.sponsorConfig(signal);
-      const conf = await sponsorConfigRef.current;
-      if (!conf) return null;
-      const publisherId = format === "top_bar" ? conf.publisherId : conf.formats?.[format];
-      if (!publisherId) return null;
-      let slot = sponsorSlotRef.current.get(format);
-      if (!slot) {
-        // The format's own publisher, and everything else shared: one subject,
-        // one category, one dwell. The subject is the gateway's, already
-        // hashed — the same person behind all three, which is what ADtention
-        // is supposed to see.
-        slot = createSponsorSlot({ ...conf, publisherId }, format);
-        sponsorSlotRef.current.set(format, slot);
-      }
-      served = await slot.serve(colsRef.current, signal);
-    }
-    if (!served) return null;
-    return {
-      id: served.id,
-      text: served.text,
-      impression: {
-        impressionId: served.impressionId,
-        ...(format === "top_bar" ? {} : { format }),
-        adId: served.id,
-        billable: served.billable,
-        fromCache: served.fromCache,
-        credit: served.credit,
-      },
-    };
-  };
-  // `adtentionSource` per format, for its one guarantee: a fetch that never
-  // rejects. Built once, in a ref, for the house source's reason.
-  const remoteSponsorRef = useRef(
-    Object.fromEntries(
-      (["top_bar", ...EXTRA_AD_FORMATS] as const).map((format) => [
-        format,
-        adtentionSource((signal) => serveFormat(format, signal)),
-      ]),
-    ) as Record<AdFormat, ReturnType<typeof adtentionSource>>,
-  );
   const tallyRef = useRef(createTally());
   // Rendered height per committed entry at the current width. The layout
   // reduce walks every entry there has ever been, and `entryHeight` re-renders
@@ -1868,45 +1775,33 @@ export function App({
   /**
    * Advance the sponsored line for a model call that is about to start.
    *
-   * Two sources, in a deliberate order. The **house line is picked and painted
-   * synchronously**, exactly as it always was, and only then is the gateway
-   * asked for a network one; if it answers with a line for *this* call, it
-   * replaces ours. That ordering is the whole design:
+   * Our own tip is **picked and painted synchronously**, and only then is the
+   * gateway asked what else this turn shows. That ordering is the design:
    *
-   *  - The slot is never empty. Waiting for the network before painting anything
-   *    would leave a blank row for as long as the request takes, on a gateway
-   *    whose free tier can cold-start for the better part of a minute.
-   *  - Nothing degrades. An unreachable gateway, an older one without the route,
-   *    a deployment with no publisher id and an empty inventory all look
-   *    identical from here — the house line simply stays. `sponsorLine` answers
-   *    `null` for every one of them rather than throwing, because there is no
-   *    state a user could act on.
-   *  - The cost is a visible swap a few hundred milliseconds in. Accepted: the
-   *    region is dim chrome under a call that runs for seconds, and the
-   *    alternative trades a swap for a blank.
+   *  - The top bar is never empty. Waiting for the gateway before painting
+   *    anything would leave a blank row for as long as the request takes.
+   *  - Nothing degrades. An unreachable gateway, an older one without the
+   *    route and an answer with nothing in it all look identical from here:
+   *    the house tip simply stays.
+   *  - The cost is a visible swap a moment in, which is accepted: the region is
+   *    dim chrome under a call that runs for seconds.
+   *
+   * One ask per turn, and the answer fills the places in one order: a booked
+   * line, then the network's ad, then a fallback. **The network's ad is alone
+   * on screen while it is up**: it goes in the top bar, nothing is drawn in the
+   * other two places that turn, and no fallback either. It is only asked for
+   * where nothing is booked, and it is drawn whole or not at all, in which
+   * case the fallbacks are drawn as if it had never come.
    *
    * The gate is re-read every time rather than cached at mount: `NO_COLOR` and
-   * the config file can both change under a long-lived session, and the cost of
-   * asking is two string comparisons. It is also what decides whether to ask the
-   * gateway at all — a serve nobody could see is an impression the network is
-   * billed for and a user never gets.
+   * the config file can both change under a long-lived session. It is also what
+   * decides whether to ask the gateway at all: a place nobody could see is not
+   * asked about.
    *
    * Every figure a *house* line can carry is read out of what the CLI already
-   * fetched — the wallet's observed grant range, the catalog's per-task
-   * estimate — and formatted by the same two helpers the wallet and the `/model`
-   * picker use, so the "on completion" label travels with the number and no
-   * figure originates here. Anything not in hand yet leaves its line
-   * unresolvable, and the rotation skips it. A network line carries no figure of
-   * ours at all; it is somebody else's copy, and the gateway has already bounded
-   * and sanitised it.
-   *
-   * **The other two formats follow the top bar's network half and have no house
-   * half.** Each is asked for its own line alongside the top bar's, under the
-   * same call counter and the same width rule, and an empty answer leaves its
-   * slot undrawn. Starting all three at once rather than one after another is
-   * what a person would see anyway — three slots filling within the same few
-   * hundred milliseconds — and serially it would be three round trips before
-   * the last one appeared.
+   * fetched and formatted by the same two helpers the wallet and the `/model`
+   * picker use, so no figure originates here. An advertisement carries no
+   * figure of ours at all.
    */
   const nextSponsor = useCallback(
     (modelId: string) => {
@@ -1915,11 +1810,9 @@ export function App({
       visibilityRef.current.reset();
       linkModeRef.current = new Map();
       measureRef.current = null;
+      pendingGravityRef.current = null;
       // `stdout.isTTY`, not `process.stdout.isTTY`: the row is drawn on the
       // stream ink was handed, so that is the stream the gate has to ask about.
-      // They are the same object in production, which is why the old reading
-      // worked — and it is the wrong one on principle, and it made the width
-      // rules below impossible to test, exactly as `useTerminalSize` was.
       if (
         !sponsorEnabled({
           isTTY: stdout.isTTY,
@@ -1947,66 +1840,9 @@ export function App({
         setSponsor(null);
       }
 
-      // Too narrow for an advertisement: the house line stays and the network
-      // is not asked. `serve()` refuses the same width from the inside, so this
-      // is the cheap half of a decision that is enforced further down — it
-      // saves the round trip and the gateway's config call, and the guarantee
-      // that nothing is billed lives in `network.ts`. The same holds per format:
-      // each is asked only where it could be drawn.
-      const fetchNetwork = (format: AdFormat, fallback?: ServedDirectLine) => {
-        void remoteSponsorRef.current[format].fetch().then((line) => {
-          // The counter has moved: this line was asked for on a call that has
-          // since ended or been superseded. Dropped, not painted.
-          if (call !== sponsorCallRef.current) return;
-          // ADtention has nothing for this place: the fallback, if the gateway
-          // sent one, is drawn instead. Last in the order, after a booked line
-          // and after ADtention, so it never takes a place either could fill.
-          if (!line) {
-            if (fallback) paintFallback(fallback);
-            return;
-          }
-          // The terminal may have narrowed while the request was in flight. A
-          // row that cannot be drawn was not seen, so it is not recorded and
-          // never reported — an advertiser is already charged for the serve,
-          // and claiming the impression on top of that would be claiming
-          // something that did not happen.
-          if (!adFitsFormat(format, colsRef.current)) return;
-          // And a dialog may have opened: the card and the status bar give way
-          // to one, so a line landing now would be held for a slot that is not
-          // on screen and would first appear in the frame after the dialog
-          // closed — which, when esc closes it, is the frame the turn ends in.
-          if (format !== "top_bar" && modalOpenRef.current) return;
-          if (format === "top_bar") {
-            if (!sponsorRow(line.text, colsRef.current, "network")) return;
-            sponsorPrevRef.current = line.id;
-            setSponsor({ text: line.text, origin: "network", impressionId: line.impression.impressionId });
-          } else {
-            setAdSlots((slots) => ({
-              ...slots,
-              [format]: { text: line.text, impressionId: line.impression.impressionId },
-            }));
-          }
-          recordImpression(tallyRef.current, line.id);
-          // **Held here, reported when the turn ends, and only if it was
-          // drawn** — three moments, and none of them may collapse into
-          // another. Holding it here stamps it with the call it belongs to, so
-          // a fill dropped by the counter above leaves nothing behind.
-          // `drawnRef` is what says it reached a screen: the fill arriving is
-          // not the same event as the row being drawn, and only the second is
-          // an impression.
-          //
-          // Reporting is a separate moment because the gateway credits an
-          // impression only once the model call it was shown during has been
-          // settled, and at this instant the call has just started. Reported
-          // from here, no impression could ever credit. See `runTurn`'s finally.
-          pendingImpressionRef.current.set(format, { call, impression: line.impression });
-        });
-      };
-
-      // A booked line for the slot, painted where ADtention's would have been.
-      // The same fences as a network fill: the call it was asked for, the
-      // width, a dialog. Marked as an advertisement exactly as a network line
-      // is, because it is one.
+      // A booked line for the slot. The fences every fill passes: the call it
+      // was asked for, the width, a dialog. Marked as an advertisement, because
+      // it is one.
       const paintDirect = (line: Extract<DirectLine, { text: string }>) => {
         const { format } = line;
         if (call !== sponsorCallRef.current) return;
@@ -2030,9 +1866,9 @@ export function App({
         pendingDirectRef.current.set(format, { call, serveToken: line.serveToken, drawnId });
       };
 
-      // A fallback line, drawn where neither a booked line nor ADtention
-      // filled the place. The same fences as a booked line, the same `Ad`
-      // mark, and the short address printed after the line where it fits.
+      // A fallback line, drawn where nothing else filled the place. The same
+      // fences as a booked line, the same `Ad` mark, and the short address
+      // printed after the line where it fits.
       const paintFallback = (line: ServedDirectLine) => {
         const { format } = line;
         if (call !== sponsorCallRef.current) return;
@@ -2051,79 +1887,98 @@ export function App({
         pendingFallbackRef.current.set(format, { call, serveToken: line.serveToken, drawnId });
       };
 
-      // Booked lines first, then ADtention for every slot nothing is booked
-      // in, then a fallback where ADtention had nothing. The ask waits at most `DIRECT_ASK_TIMEOUT_MS`, and the house line is
-      // already on screen while it does, so the cost of asking is that a
-      // network line arrives one round trip later. A slot answered with `hold`
-      // gets no network line at all: it is booked, and this account has seen
-      // the booking enough for today.
+      // The network's ad, in the top bar and alone, or false when it cannot be
+      // drawn whole at this width. Its addresses are paths on the gateway; the
+      // link is made absolute against the gateway this session talks to.
+      const paintGravity = (ad: GravityLine): boolean => {
+        if (call !== sponsorCallRef.current) return false;
+        const linkable = hyperlinksEnabled({ isTTY: stdout.isTTY, env: process.env });
+        const linkText = !linkable && ad.shortUrl ? shortLinkText(ad.shortUrl) : undefined;
+        if (!wholeAdRow(ad.text, colsRef.current, linkText)) return false;
+        let link: string | undefined;
+        try {
+          link = ad.clickPath ? new URL(ad.clickPath, config.gatewayUrl).toString() : undefined;
+        } catch {
+          link = undefined;
+        }
+        const drawnId = `gravity:${call}`;
+        setAdSlots({});
+        setSponsor({
+          text: ad.text,
+          origin: "network",
+          impressionId: drawnId,
+          whole: true,
+          ...(link ? { link } : {}),
+          ...(linkText ? { linkText } : {}),
+        });
+        pendingGravityRef.current = { call, drawnId, path: ad.impressionPath, fired: false };
+        return true;
+      };
+
+      // Booked lines first; where nothing is booked, the network's ad, alone;
+      // failing that, a fallback in every place that has one. The ask waits at
+      // most `DIRECT_ASK_TIMEOUT_MS`, and the house line is on screen while it
+      // does. A slot answered with `hold` stays empty: it is booked, and this
+      // account has seen the booking enough for today.
       const fitting = AD_FORMATS.filter((format) => adFitsFormat(format, colsRef.current));
+      if (!directSupportedRef.current || fitting.length === 0) return;
       void (async () => {
-        let direct: DirectLine[] = [];
-        let fallbacks: ServedDirectLine[] = [];
-        let failed = false;
-        if (directSupportedRef.current && fitting.length > 0) {
-          const ask = sponsorDirect ?? ((formats, cols, signal) => client.directSponsor(formats, cols, signal));
-          // A `try` and not a `.catch()`: an asker that throws synchronously
-          // never returns the promise `.catch` would attach to, and this runs
-          // from a `void`, where a rejection is a Node process exiting.
-          let answer: DirectAnswer = { supported: true, lines: [] };
-          try {
-            answer = await ask(fitting, colsRef.current, AbortSignal.timeout(DIRECT_ASK_TIMEOUT_MS));
-          } catch {
-            answer = { supported: true, lines: [], failed: true };
-          }
-          if (!answer.supported) directSupportedRef.current = false;
-          failed = answer.failed === true;
-          direct = answer.lines;
-          fallbacks = answer.fallbacks ?? [];
-          // The places are measured from this moment: it is when a booked
-          // line would have been painted.
-          if (answer.measure && call === sponsorCallRef.current) {
-            measureRef.current = { call, token: answer.measure, answeredAt: Date.now(), formats: [...fitting] };
-          }
-          if (!failed) knownBookedRef.current = new Set(direct.map((line) => line.format));
+        const ask = sponsorDirect ?? ((formats, cols, signal) => client.directSponsor(formats, cols, signal));
+        // A `try` and not a `.catch()`: an asker that throws synchronously
+        // never returns the promise `.catch` would attach to, and this runs
+        // from a `void`, where a rejection is a Node process exiting.
+        let answer: DirectAnswer;
+        try {
+          answer = await ask(fitting, colsRef.current, AbortSignal.timeout(DIRECT_ASK_TIMEOUT_MS));
+        } catch {
+          answer = { supported: true, lines: [], failed: true };
+        }
+        if (!answer.supported) directSupportedRef.current = false;
+        // An ask that failed carries nothing, so nothing but our own tip is
+        // drawn this turn: a place somebody booked is never filled by guesswork.
+        const direct = answer.lines;
+        const fallbacks = answer.fallbacks ?? [];
+        // The places are measured from this moment: it is when a booked line
+        // would have been painted.
+        if (answer.measure && call === sponsorCallRef.current) {
+          measureRef.current = { call, token: answer.measure, answeredAt: Date.now(), formats: [...fitting] };
         }
         if (call !== sponsorCallRef.current) return;
-        for (const format of ["top_bar", ...EXTRA_AD_FORMATS] as const) {
+        // The gateway sends the network's ad only when nothing is booked; the
+        // check is repeated here, since a booked line on screen beside it is
+        // the one thing its rules forbid outright.
+        if (answer.gravity && direct.length === 0 && paintGravity(answer.gravity)) return;
+        for (const format of AD_FORMATS) {
           if (!adFitsFormat(format, colsRef.current)) continue;
           const booked = direct.find((line) => line.format === format);
           if (booked && "hold" in booked) continue;
           if (booked) paintDirect(booked);
-          // An ask that failed is "nothing booked" except where the last
-          // answer said there was a booking: that slot stays empty this turn.
-          else if (failed && knownBookedRef.current.has(format)) continue;
-          else fetchNetwork(format, fallbacks.find((line) => line.format === format));
+          else {
+            const fallback = fallbacks.find((line) => line.format === format);
+            if (fallback) paintFallback(fallback);
+          }
         }
       })();
     },
-    [config.sponsor, stdout, wallet, client, sponsorDirect],
+    [config.sponsor, config.gatewayUrl, stdout, wallet, client, sponsorDirect],
   );
 
   /**
-   * Report the impression for the line this turn showed, now that it is over.
+   * Report the booked and fallback lines this turn showed, now that it is over.
    *
-   * **The timing is the whole point, and it was wrong once.** The gateway
-   * credits an impression only once the model call it was shown during has
-   * been settled, which happens when that call finishes, so a report sent while
-   * the call is still in flight can never credit. In production that was a
-   * report sent at paint time: the whole chain worked, every log line looked
-   * healthy, and the grant was refused every single time.
-   *
-   * Reporting here also makes the claim *stronger*, not weaker. At paint time
-   * the line has been on screen for zero milliseconds and the turn may end in
-   * the next one; by the time this runs it was displayed for the duration of the
-   * turn, which is what an impression is supposed to mean.
+   * **The timing is the whole point.** The gateway credits a booked line only
+   * once the model call it was shown during has been settled, which happens
+   * when that call finishes, so a report sent while the call is still in
+   * flight could never credit. Reporting here also makes the claim stronger:
+   * by the time this runs the line was on screen for as long as it was, which
+   * is what the report says.
    *
    * Called from `runTurn`'s `finally`, so it covers the ordinary end, an error,
-   * and esc alike — the line was on screen in all three. What happens next is
-   * the gateway's to decide: an aborted turn or a 402 may leave no settled call
-   * at all, and then nothing credits, which is the rule working rather than
-   * failing. Cleared as it fires so one line can only ever be reported once,
-   * and the gateway counts an impression id once whatever arrives.
+   * and esc alike. Cleared as it fires so one line can only ever be reported
+   * once. The network's ad is not reported here: its impression is told the
+   * moment it is drawn (see the effect beside `drawnRef`).
    */
   const reportSponsor = useCallback(() => {
-    const pending = [...pendingImpressionRef.current.values()];
     const pendingDirect = [...pendingDirectRef.current.entries()];
     const pendingFallback = [...pendingFallbackRef.current.entries()];
     const drawn = drawnRef.current;
@@ -2131,15 +1986,15 @@ export function App({
     const linkModes = linkModeRef.current;
     const measure = measureRef.current;
     const at = Date.now();
-    pendingImpressionRef.current = new Map();
     pendingDirectRef.current = new Map();
     pendingFallbackRef.current = new Map();
+    pendingGravityRef.current = null;
     drawnRef.current = new Set();
     measureRef.current = null;
-    // Booked lines go in one call to their own route, under the same two
-    // filters as a network line: this turn's call, and actually drawn. Each
-    // says how long it stayed on screen in one stretch and how it could be
-    // opened; the gateway counts none under ten seconds.
+    // Booked lines go in one call to their own route, under two filters: this
+    // turn's call, and actually drawn. Each says how long it stayed on screen
+    // in one stretch and how it could be opened; the gateway counts none
+    // under ten seconds.
     const directReports = pendingDirect
       .filter(([, p]) => p.call === sponsorCallRef.current && drawn.has(p.drawnId))
       .map(([format, p]) => ({
@@ -2165,25 +2020,6 @@ export function App({
       .filter(([, p]) => p.call === sponsorCallRef.current && drawn.has(p.drawnId))
       .map(([format, p]) => ({ format, serveToken: p.serveToken }));
     if (fallbackReports.length > 0) void client.reportAffiliateImpressions(fallbackReports);
-    const reports = pending
-      // A line for a superseded call was dropped rather than painted, so there
-      // is no impression to report — the counter is bumped in the same
-      // `finally`, so this compares against the call this turn owned.
-      .filter((p) => p.call === sponsorCallRef.current)
-      // And a line that arrived but was never drawn — a dialog was up, the rows
-      // ran out, the terminal narrowed — was not seen by anybody.
-      .filter((p) => drawn.has(p.impression.impressionId))
-      .map((p) => p.impression);
-    if (reports.length === 0) return;
-    // **One after another, not all at once.** The gateway decides each report
-    // against the ones before it, so they go in the order they were drawn.
-    // Sequential costs nothing anybody waits for — the turn is over and this
-    // is not awaited — and
-    // `reportImpression` swallows every failure, so one refused report cannot
-    // stop the next.
-    void (async () => {
-      for (const report of reports) await client.reportImpression(report);
-    })();
   }, [client]);
 
   // ---- permissions --------------------------------------------------------
@@ -4996,7 +4832,11 @@ export function App({
   // draws. The `Ad ·` mark on a network line costs five of those columns and
   // takes them out of the ad copy's share, never out of the row's height.
   const sponsorLine =
-    busy && sponsor ? sponsorRow(sponsor.text, cols, sponsor.origin, sponsor.linkText, sponsor.linkRequired === true) : null;
+    busy && sponsor
+      ? sponsor.whole
+        ? wholeAdRow(sponsor.text, cols, sponsor.linkText)
+        : sponsorRow(sponsor.text, cols, sponsor.origin, sponsor.linkText, sponsor.linkRequired === true)
+      : null;
   // Whether the accent may be painted. Refusing it does not refuse the mark:
   // the row still says `Ad ·`, in the same dim as everything else.
   const adColor = adColorEnabled({ isTTY: stdout.isTTY, env: process.env });
@@ -5153,6 +4993,17 @@ export function App({
   useEffect(() => {
     for (const id of drawnKey.split(" ")) if (id) drawnRef.current.add(id);
     visibilityRef.current.observe([...drawnKey.split(" "), ...placesKey.split(" ")].filter(Boolean), Date.now());
+    // The network's ad, the first time a frame draws it: its impression is
+    // told now, once, which is when the network counts one. A line that never
+    // reached a frame is never told.
+    const gravity = pendingGravityRef.current;
+    if (gravity && !gravity.fired && gravity.call === sponsorCallRef.current && drawnRef.current.has(gravity.drawnId)) {
+      gravity.fired = true;
+      const fire = sponsorImpression ?? ((path: string) => client.networkImpression(path));
+      void Promise.resolve()
+        .then(() => fire(gravity.path))
+        .catch(() => false);
+    }
   }, [drawnKey, placesKey]);
   // The completion menu is chrome too, and each of its rows is fitted below so
   // that `menu.length` is a row count rather than an item count.
@@ -5873,7 +5724,7 @@ export function App({
         )}
 
         {/*
-          The status bar: ADtention's third format, a row of its own under the
+          The status bar: the third place, a row of its own under the
           status line rather than a clause inside it. The status line is the
           person's own reference material — mode, model, balance — and cutting
           a clause of that to make room for somebody else's copy would be the

@@ -483,52 +483,40 @@ describe("what a web search cost", () => {
   });
 });
 
-describe("the sponsor config and report, with three formats", () => {
-  const ok = (body: unknown) => respond(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
-
-  it("reads each extra format's publisher, row by row", async () => {
-    ok({
-      provider: "adtention",
-      publisher_id: "pub_top",
-      category: "devops",
-      subject: "s",
-      dwell_ms: 15_000,
-      formats: {
-        top_bar: { publisher_id: "pub_top" },
-        sidebar_card: { publisher_id: "pub_side" },
-        status_bar: { publisher_id: 7 }, // malformed: costs this row only
-        banner: { publisher_id: "pub_banner" }, // a format this build cannot draw
-      },
-    });
-    const conf = await new GatewayClient(config).sponsorConfig();
-    expect(conf).toMatchObject({ publisherId: "pub_top", subject: "s" });
-    expect(conf!.formats).toEqual({ sidebar_card: "pub_side" });
-  });
-
-  it("reads a gateway older than the formats as the top bar alone", async () => {
-    ok({ provider: "adtention", publisher_id: "pub_top", category: "devops", subject: "s" });
-    const conf = await new GatewayClient(config).sponsorConfig();
-    expect(conf!.publisherId).toBe("pub_top");
-    expect(conf!.formats).toBeUndefined();
-  });
-
-  it("sends a top-bar report exactly as before, and names any other format", async () => {
-    const bodies: Record<string, unknown>[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_url: string, init: RequestInit) => {
-        bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
-        return new Response(JSON.stringify({ credited: 5 }), { status: 200 });
-      }),
+describe("the network's ad", () => {
+  it("is asked for by naming the capability, and read off the answer", async () => {
+    const fetchSpy = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            lines: [],
+            gravity: { text: "Northwind: free CI", impression_path: "/gravity/api.trygravity.ai/track/imp?p=1" },
+          }),
+          { status: 200 },
+        ),
     );
+    vi.stubGlobal("fetch", fetchSpy);
+    const answer = await new GatewayClient(config).directSponsor(["top_bar"], 80);
+    expect(answer.gravity).toEqual({ text: "Northwind: free CI", impressionPath: "/gravity/api.trygravity.ai/track/imp?p=1" });
+    const [url] = fetchSpy.mock.calls[0] as unknown as [string];
+    expect(url).toBe(`${config.gatewayUrl}/v1/sponsor/direct?gravity=1`);
+  });
+
+  it("tells its impression to the gateway only, without the account's token, and never throws", async () => {
+    const fetchSpy = vi.fn(async () => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchSpy);
     const client = new GatewayClient(config);
-    const base = { billable: true, fromCache: false, credit: 0.00005 };
-    await client.reportImpression({ impressionId: "imp_1", ...base });
-    await client.reportImpression({ impressionId: "imp_2", format: "top_bar", ...base });
-    await client.reportImpression({ impressionId: "imp_3", format: "status_bar", ...base });
-    expect("format" in bodies[0]!).toBe(false);
-    expect("format" in bodies[1]!).toBe(false);
-    expect(bodies[2]!.format).toBe("status_bar");
+    expect(await client.networkImpression("/gravity/api.trygravity.ai/track/imp?p=1")).toBe(true);
+    const [url, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe(`${config.gatewayUrl}/gravity/api.trygravity.ai/track/imp?p=1`);
+    expect(JSON.stringify(init.headers ?? {})).not.toContain("adg_");
+    // Anything that is not a path on the gateway is never fetched.
+    expect(await client.networkImpression("https://api.trygravity.ai/track/imp")).toBe(false);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new TypeError("fetch failed");
+    }));
+    expect(await client.networkImpression("/gravity/x.trygravity.ai/track/imp")).toBe(false);
   });
 });
 
@@ -572,8 +560,7 @@ describe("asking for booked lines", () => {
   });
 
   it("reads every other failure as nothing known this time, never as a throw", async () => {
-    // `failed`: the caller keeps ADtention out of a slot the last answer said
-    // was booked, rather than reading a timeout as "nothing booked".
+    // `failed`: the caller draws nothing but its own tip that turn.
     respond("upstream", { status: 503 });
     expect(await ask()).toEqual({ supported: true, lines: [], failed: true });
     respond("{not json", { status: 200 });
@@ -584,14 +571,6 @@ describe("asking for booked lines", () => {
     expect(await ask()).toEqual({ supported: true, lines: [], failed: true });
   });
 
-  it("asks for the sponsor config as a CLI that shows booked lines", async () => {
-    const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ provider: "house" }), { status: 200 }));
-    vi.stubGlobal("fetch", fetchSpy);
-    expect(await new GatewayClient(config).sponsorConfig()).toBeNull();
-    const [url] = fetchSpy.mock.calls[0] as unknown as [string];
-    expect(url).toBe(`${config.gatewayUrl}/v1/sponsor/config?direct=1`);
-  });
-
   it("sends the slots and the width, and reads the lines", async () => {
     const fetchSpy = vi.fn(async () =>
       new Response(JSON.stringify({ lines: [{ format: "top_bar", hold: true }] }), { status: 200 }),
@@ -599,7 +578,7 @@ describe("asking for booked lines", () => {
     vi.stubGlobal("fetch", fetchSpy);
     expect(await ask()).toEqual({ supported: true, lines: [{ format: "top_bar", hold: true }] });
     const [url, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toBe(`${config.gatewayUrl}/v1/sponsor/direct`);
+    expect(url).toBe(`${config.gatewayUrl}/v1/sponsor/direct?gravity=1`);
     expect(JSON.parse(String(init.body))).toEqual({ formats: ["top_bar"], cols: 80 });
   });
 

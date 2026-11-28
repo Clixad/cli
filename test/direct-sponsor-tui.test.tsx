@@ -8,15 +8,16 @@
  *
  *  - the ask names only the slots that fit the terminal, and is not made with
  *    the sponsored line switched off;
- *  - a booked line replaces ADtention in its slot (ADtention is not asked
- *    there, because a serve is billed), marked as an advertisement;
- *  - a `hold` leaves the slot without a network line;
- *  - nothing booked, or an older gateway, is exactly the session before;
+ *  - a booked line takes its slot, marked as an advertisement;
+ *  - a `hold` leaves the slot without an advertisement;
+ *  - nothing booked, or an older gateway, leaves our own tip;
  *  - a booked line is reported once, after the turn, to its own route, and
  *    only if it was drawn;
- *  - a fallback line is drawn only where neither a booked line nor ADtention
- *    filled the place, marked as an advertisement, with its short address
- *    after it where everything fits, and reported to its own route.
+ *  - the network's ad goes in the top bar alone, whole or not at all, and its
+ *    impression is told once, when it is first drawn, through the gateway;
+ *  - a fallback line is drawn only where nothing else filled the place,
+ *    marked as an advertisement, with its short address after it where
+ *    everything fits, and reported to its own route.
  */
 import React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -26,15 +27,16 @@ import { clearCount, fakeStdin, fakeTerminal, isFrame, plain, restoreProcessStdo
 vi.mock("../src/browser.ts", () => ({ openBrowser: () => undefined }));
 import { App } from "../src/tui/app.tsx";
 import type { CliConfig } from "../src/config.ts";
-import type { ChatTurn, GatewayClient, ImpressionReport, WalletInfo } from "../src/client.ts";
-import type { ServedLine } from "../src/sponsor/network.ts";
-import type { AdFormat, ExtraAdFormat } from "../src/sponsor/formats.ts";
+import type { ChatTurn, GatewayClient, WalletInfo } from "../src/client.ts";
+import type { AdFormat } from "../src/sponsor/formats.ts";
 import {
   parseDirectLines,
   parseFallbackLines,
+  parseGravityLine,
   sanitizeAdText,
   shortLinkText,
   type DirectAnswer,
+  type GravityLine,
   type ServedDirectLine,
 } from "../src/sponsor/direct.ts";
 import { AD_LABEL, SIDEBAR_MIN_COLS } from "../src/sponsor/render.ts";
@@ -58,14 +60,7 @@ const wallet: WalletInfo = {
 
 const catalog = [{ id: "gemini-2.5-flash-lite", tier: "cheap", est_ads_per_task: 1.2 }];
 
-const NETWORK: Record<AdFormat, ServedLine> = {
-  top_bar: { id: "c_top", text: "Globex: plan sprints in 5 min", impressionId: "imp_top", billable: true, fromCache: false, credit: 0.00005 },
-  sidebar_card: { id: "c_side", text: "Nimbus: catch the error first", impressionId: "imp_side", billable: true, fromCache: false, credit: 0.00005 },
-  status_bar: { id: "c_status", text: "Acme Deploys: ship on Friday", impressionId: "imp_status", billable: true, fromCache: false, credit: 0.00005 },
-};
-
 const BOOKED_TEXT = "Rehearsal GmbH: deploy previews in one click";
-const BOTH: readonly ExtraAdFormat[] = ["sidebar_card", "status_bar"];
 
 /**
  * A client whose turn hangs until released, recording both kinds of report.
@@ -78,7 +73,7 @@ const BOTH: readonly ExtraAdFormat[] = ["sidebar_card", "status_bar"];
  * test's own reading of the model it had just saved.
  */
 function watchingClient() {
-  const network: ImpressionReport[] = [];
+  const impressions: string[] = [];
   const direct: Array<Array<{ format: AdFormat; serveToken: string; visibleMs?: number; link?: string }>> = [];
   const fallback: Array<Array<{ format: AdFormat; serveToken: string }>> = [];
   const views: Array<{ measure: string; places: Array<{ format: AdFormat; visibleMs: number }> }> = [];
@@ -86,10 +81,9 @@ function watchingClient() {
   const client = {
     models: async () => catalog,
     wallet: async () => wallet,
-    sponsorConfig: async () => null,
-    reportImpression: async (r: ImpressionReport) => {
-      network.push(r);
-      return 0;
+    networkImpression: async (path: string) => {
+      impressions.push(path);
+      return true;
     },
     reportDirectImpressions: async (items: Array<{ format: AdFormat; serveToken: string }>) => {
       direct.push(items);
@@ -110,14 +104,7 @@ function watchingClient() {
       throw new Error("turn over");
     },
   } as unknown as GatewayClient;
-  return { client, network, direct, fallback, views, release: () => release() };
-}
-
-function servingAll(asked: AdFormat[]) {
-  return async (_cols: number, _signal?: AbortSignal, format: AdFormat = "top_bar") => {
-    asked.push(format);
-    return NETWORK[format];
-  };
+  return { client, impressions, direct, fallback, views, release: () => release() };
 }
 
 /** An asker that records what it was asked and answers `answer`. */
@@ -159,7 +146,7 @@ describe("the ask", () => {
   it("names only the slots that fit, with the width", async () => {
     const asks: Array<{ formats: readonly AdFormat[]; cols: number }> = [];
     const term = fakeTerminal(30, SIDEBAR_MIN_COLS - 1);
-    mount(term, { initialTask: "go", sponsorServe: servingAll([]), sponsorDirect: asking({ supported: true, lines: [] }, asks) });
+    mount(term, { initialTask: "go", sponsorDirect: asking({ supported: true, lines: [] }, asks) });
     await settle(250);
     expect(asks).toEqual([{ formats: ["top_bar", "status_bar"], cols: SIDEBAR_MIN_COLS - 1 }]);
   });
@@ -167,22 +154,19 @@ describe("the ask", () => {
   it("is not made with the sponsored line switched off", async () => {
     process.env.CLIXAD_SPONSOR = "0";
     const asks: Array<{ formats: readonly AdFormat[]; cols: number }> = [];
-    mount(fakeTerminal(30, 120), { initialTask: "go", sponsorServe: servingAll([]), sponsorDirect: asking({ supported: true, lines: [] }, asks) });
+    mount(fakeTerminal(30, 120), { initialTask: "go", sponsorDirect: asking({ supported: true, lines: [] }, asks) });
     await settle(250);
     expect(asks).toEqual([]);
   });
 });
 
 describe("a booked line", () => {
-  it("takes the slot, marked as an advertisement, and ADtention is not asked for it", async () => {
+  it("takes the slot, marked as an advertisement", async () => {
     const term = fakeTerminal(30, 120);
-    const { client, network, direct, release } = watchingClient();
-    const served: AdFormat[] = [];
+    const { client, impressions, direct, release } = watchingClient();
     mount(term, {
       client,
       initialTask: "go",
-      sponsorServe: servingAll(served),
-      sponsorFormats: BOTH,
       sponsorDirect: asking({ supported: true, lines: [booked("top_bar")] }, []),
     });
     await settle(300);
@@ -191,27 +175,24 @@ describe("a booked line", () => {
     const top = rows.findIndex((r) => r.includes(BOOKED_TEXT));
     expect(top).toBeGreaterThan(-1);
     expect(rows[top]).toContain(`${AD_LABEL} ·`);
-    expect(served.sort()).toEqual(["sidebar_card", "status_bar"]);
     expect(clearCount(term)).toBe(0);
 
     release();
     await settle(150);
-    // Its own route, once, with its token; never as an ADtention impression.
-    // With how long it stayed on screen in one stretch, and how it could be
-    // opened: here neither, a test terminal understands no links and the line
-    // carries no short address.
+    // Its own route, once, with its token. With how long it stayed on screen
+    // in one stretch, and how it could be opened: here neither, a test
+    // terminal understands no links and the line carries no short address.
     expect(direct).toEqual([[{ format: "top_bar", serveToken: "tok_top_bar", visibleMs: expect.any(Number), link: "none" }]]);
     expect(direct[0]![0]!.visibleMs).toBeGreaterThan(200);
-    expect(network.map((r) => r.impressionId).sort()).toEqual(["imp_side", "imp_status"]);
+    expect(impressions).toEqual([]);
   });
 
-  it("fills the card and the status bar too, without the gateway handing out ADtention there", async () => {
+  it("fills the card and the status bar too", async () => {
     const term = fakeTerminal(30, 120);
     const { client, direct, release } = watchingClient();
     mount(term, {
       client,
       initialTask: "go",
-      sponsorServe: servingAll([]),
       sponsorDirect: asking({ supported: true, lines: [booked("sidebar_card"), booked("status_bar")] }, []),
     });
     await settle(300);
@@ -228,7 +209,7 @@ describe("a booked line", () => {
     const { client, direct } = watchingClient();
     let answer: (a: DirectAnswer) => void = () => {};
     const slow = () => new Promise<DirectAnswer>((r) => (answer = r));
-    const app = mount(term, { client, initialTask: "go", sponsorServe: servingAll([]), sponsorDirect: slow });
+    const app = mount(term, { client, initialTask: "go", sponsorDirect: slow });
     await settle(100);
     app.unmount();
     answer({ supported: true, lines: [booked("top_bar")] });
@@ -238,38 +219,40 @@ describe("a booked line", () => {
 });
 
 describe("hold, nothing booked, and an older gateway", () => {
-  it("a hold leaves the slot without a network line", async () => {
+  it("a hold leaves the slot without an advertisement, and no fallback either", async () => {
     const term = fakeTerminal(30, 120);
-    const served: AdFormat[] = [];
+    const { client, fallback, release } = watchingClient();
     mount(term, {
+      client,
       initialTask: "go",
-      sponsorServe: servingAll(served),
-      sponsorFormats: BOTH,
-      sponsorDirect: asking({ supported: true, lines: [{ format: "top_bar", hold: true }] }, []),
+      sponsorDirect: asking({ supported: true, lines: [{ format: "top_bar", hold: true }], fallbacks: ALL_FALLBACKS.slice(1) }, []),
     });
     await settle(300);
-    expect(served.sort()).toEqual(["sidebar_card", "status_bar"]);
-    expect(plain(term.output())).not.toContain(NETWORK.top_bar.text);
+    const top = lastFrame(term).find((r) => r.includes("✦ clixad ·"));
+    expect(top).toBeTruthy();
+    expect(top).not.toContain(`${AD_LABEL} ·`);
+    release();
+    await settle(150);
+    expect(fallback.flat().map((f) => f.format).sort()).toEqual(["sidebar_card", "status_bar"]);
   });
 
-  it("nothing booked is the session it always was", async () => {
+  it("nothing booked and nothing else leaves our own tip, and no advertisement anywhere", async () => {
     const term = fakeTerminal(30, 120);
-    const served: AdFormat[] = [];
-    mount(term, { initialTask: "go", sponsorServe: servingAll(served), sponsorDirect: asking({ supported: true, lines: [] }, []) });
+    mount(term, { initialTask: "go", sponsorDirect: asking({ supported: true, lines: [] }, []) });
     await settle(300);
-    expect(served).toEqual(["top_bar"]);
-    expect(plain(term.output())).toContain(NETWORK.top_bar.text);
+    const out = plain(term.output());
+    expect(out).toContain("✦ clixad ·");
+    expect(out).not.toContain(`${AD_LABEL} ·`);
   });
 
   it("an asker that throws is nothing booked, not a crash", async () => {
     const term = fakeTerminal(30, 120);
-    const served: AdFormat[] = [];
     const throwing = () => {
       throw new Error("boom");
     };
-    mount(term, { initialTask: "go", sponsorServe: servingAll(served), sponsorDirect: throwing as never });
+    mount(term, { initialTask: "go", sponsorDirect: throwing as never });
     await settle(300);
-    expect(served).toEqual(["top_bar"]);
+    expect(plain(term.output())).toContain("✦ clixad ·");
   });
 });
 
@@ -283,7 +266,6 @@ describe("a booked line's link", () => {
     const term = fakeTerminal(30, 120);
     mount(term, {
       initialTask: "go",
-      sponsorServe: servingAll([]),
       sponsorDirect: asking({ supported: true, lines: [booked("top_bar"), booked("status_bar")] }, []),
     });
     await settle(300);
@@ -297,7 +279,7 @@ describe("a booked line's link", () => {
   it("is plain text everywhere else", async () => {
     process.env.FORCE_HYPERLINK = "0";
     const term = fakeTerminal(30, 120);
-    mount(term, { initialTask: "go", sponsorServe: servingAll([]), sponsorDirect: asking({ supported: true, lines: [booked("top_bar")] }, []) });
+    mount(term, { initialTask: "go", sponsorDirect: asking({ supported: true, lines: [booked("top_bar")] }, []) });
     await settle(300);
     expect(term.output()).not.toContain("\u001b]8;;");
     expect(lastFrame(term).some((r) => r.includes(BOOKED_TEXT))).toBe(true);
@@ -315,7 +297,7 @@ describe("measured the way the market measures it (2026-11-07)", () => {
     process.env.FORCE_HYPERLINK = "0";
     const term = fakeTerminal(30, 120);
     const { client, direct, release } = watchingClient();
-    mount(term, { client, initialTask: "go", sponsorServe: servingAll([]), sponsorDirect: asking({ supported: true, lines: [withShort("top_bar")] }, []) });
+    mount(term, { client, initialTask: "go", sponsorDirect: asking({ supported: true, lines: [withShort("top_bar")] }, []) });
     await settle(300);
     const row = lastFrame(term).find((r) => r.includes("Rehearsal GmbH"))!;
     expect(row).toContain("app.clixad.io/a/k3p9xq");
@@ -329,7 +311,7 @@ describe("measured the way the market measures it (2026-11-07)", () => {
   it("keeps the address at 80 columns, cutting the copy to make room for it", async () => {
     process.env.FORCE_HYPERLINK = "0";
     const term = fakeTerminal(30, 80);
-    mount(term, { initialTask: "go", sponsorServe: servingAll([]), sponsorDirect: asking({ supported: true, lines: [withShort("top_bar")] }, []) });
+    mount(term, { initialTask: "go", sponsorDirect: asking({ supported: true, lines: [withShort("top_bar")] }, []) });
     await settle(300);
     const row = lastFrame(term).find((r) => r.includes("Rehearsal"))!;
     expect(row).toContain("app.clixad.io/a/k3p9xq");
@@ -341,7 +323,7 @@ describe("measured the way the market measures it (2026-11-07)", () => {
     process.env.FORCE_HYPERLINK = "1";
     const term = fakeTerminal(30, 120);
     const { client, direct, release } = watchingClient();
-    mount(term, { client, initialTask: "go", sponsorServe: servingAll([]), sponsorDirect: asking({ supported: true, lines: [withShort("top_bar")] }, []) });
+    mount(term, { client, initialTask: "go", sponsorDirect: asking({ supported: true, lines: [withShort("top_bar")] }, []) });
     await settle(300);
     expect(plain(term.output())).not.toContain("app.clixad.io/a/k3p9xq");
     release();
@@ -355,7 +337,6 @@ describe("measured the way the market measures it (2026-11-07)", () => {
     mount(term, {
       client,
       initialTask: "go",
-      sponsorServe: servingAll([]),
       sponsorDirect: asking({ supported: true, lines: [booked("top_bar")], measure: "measure_1" }, []),
     });
     await settle(300);
@@ -372,7 +353,7 @@ describe("measured the way the market measures it (2026-11-07)", () => {
   it("reports no measure to a gateway that sent none", async () => {
     const term = fakeTerminal(30, 120);
     const { client, views, release } = watchingClient();
-    mount(term, { client, initialTask: "go", sponsorServe: servingAll([]), sponsorDirect: asking({ supported: true, lines: [booked("top_bar")] }, []) });
+    mount(term, { client, initialTask: "go", sponsorDirect: asking({ supported: true, lines: [booked("top_bar")] }, []) });
     await settle(300);
     release();
     await settle(150);
@@ -381,40 +362,31 @@ describe("measured the way the market measures it (2026-11-07)", () => {
 });
 
 describe("an ask that fails", () => {
-  it("keeps ADtention out of a slot the last answer said was booked, and asks it everywhere else", async () => {
+  it("draws nothing but our own tip that turn, whatever the last answer was", async () => {
     const term = fakeTerminal(30, 120);
-    const { client, release } = watchingClient();
-    const served: AdFormat[] = [];
+    const { client, fallback, release } = watchingClient();
     let n = 0;
     const flaky = async (): Promise<DirectAnswer> => {
       n += 1;
-      if (n === 1) return { supported: true, lines: [{ format: "top_bar", hold: true }] };
+      if (n === 1) return { supported: true, lines: [{ format: "top_bar", hold: true }], fallbacks: ALL_FALLBACKS.slice(1) };
       return { supported: true, lines: [], failed: true };
     };
     const stdin = fakeStdin();
-    mount(term, { client, initialTask: "go", sponsorServe: servingAll(served), sponsorFormats: BOTH, sponsorDirect: flaky }, stdin);
+    mount(term, { client, initialTask: "go", sponsorDirect: flaky }, stdin);
     await settle(250);
-    expect(served.sort()).toEqual(["sidebar_card", "status_bar"]);
     release();
     await settle(150);
-    // A second turn, whose ask fails: the top bar stays without a network line.
-    served.length = 0;
+    expect(fallback).toHaveLength(1);
+    // A second turn, whose ask fails: nothing is drawn but the tip.
     stdin.send("again");
     await settle(40);
     stdin.send("\r");
     await settle(300);
     expect(n).toBe(2);
-    expect(served.sort()).toEqual(["sidebar_card", "status_bar"]);
+    expect(lastFrame(term).some((r) => r.includes(`${AD_LABEL} ·`))).toBe(false);
     release();
     await settle(100);
-  });
-
-  it("is nothing booked when no answer ever said otherwise", async () => {
-    const term = fakeTerminal(30, 120);
-    const served: AdFormat[] = [];
-    mount(term, { initialTask: "go", sponsorServe: servingAll(served), sponsorDirect: asking({ supported: true, lines: [], failed: true }, []) });
-    await settle(300);
-    expect(served).toEqual(["top_bar"]);
+    expect(fallback).toHaveLength(1);
   });
 });
 
@@ -462,34 +434,21 @@ const fallbackFor = (format: AdFormat): ServedDirectLine => ({
 });
 const ALL_FALLBACKS = (["top_bar", "sidebar_card", "status_bar"] as const).map(fallbackFor);
 
-/** ADtention with nothing to serve in any place. */
-function servingNone(asked: AdFormat[]) {
-  return async (_cols: number, _signal?: AbortSignal, format: AdFormat = "top_bar") => {
-    asked.push(format);
-    return null;
-  };
-}
-
 describe("a fallback line", () => {
   afterEach(() => {
     delete process.env.FORCE_HYPERLINK;
   });
 
-  it("fills every place ADtention leaves empty, marked as an advertisement, with its short address after it", async () => {
+  it("fills every place nothing else fills, marked as an advertisement, with its short address after it", async () => {
     const term = fakeTerminal(30, 120);
-    const { client, network, direct, fallback, release } = watchingClient();
-    const asked: AdFormat[] = [];
+    const { client, impressions, direct, fallback, release } = watchingClient();
     mount(term, {
       client,
       initialTask: "go",
-      sponsorServe: servingNone(asked),
-      sponsorFormats: BOTH,
       sponsorDirect: asking({ supported: true, lines: [], fallbacks: ALL_FALLBACKS }, []),
     });
     await settle(300);
 
-    // ADtention was asked first, everywhere.
-    expect(asked.sort()).toEqual(["sidebar_card", "status_bar", "top_bar"]);
     const rows = lastFrame(term);
     const top = rows.find((r) => r.includes(FALLBACK.top_bar));
     expect(top).toContain(`${AD_LABEL} · ${FALLBACK.top_bar} · app.clixad.io/r/railway/t`);
@@ -501,30 +460,11 @@ describe("a fallback line", () => {
 
     release();
     await settle(150);
-    // Reported to its own route, once, and never as a booked or an ADtention line.
+    // Reported to its own route, once, and never as a booked line.
     expect(fallback).toHaveLength(1);
     expect(fallback[0]!.map((f) => f.serveToken).sort()).toEqual(["aff_sidebar_card", "aff_status_bar", "aff_top_bar"]);
     expect(direct).toEqual([]);
-    expect(network).toEqual([]);
-  });
-
-  it("is not drawn where ADtention has a line, and not reported", async () => {
-    const term = fakeTerminal(30, 120);
-    const { client, network, fallback, release } = watchingClient();
-    mount(term, {
-      client,
-      initialTask: "go",
-      sponsorServe: servingAll([]),
-      sponsorFormats: BOTH,
-      sponsorDirect: asking({ supported: true, lines: [], fallbacks: ALL_FALLBACKS }, []),
-    });
-    await settle(300);
-    const out = plain(term.output());
-    for (const text of Object.values(FALLBACK)) expect(out).not.toContain(text);
-    release();
-    await settle(150);
-    expect(fallback).toEqual([]);
-    expect(network.map((r) => r.impressionId).sort()).toEqual(["imp_side", "imp_status", "imp_top"]);
+    expect(impressions).toEqual([]);
   });
 
   it("never takes a booked or held place, even if one arrives for it", async () => {
@@ -533,8 +473,6 @@ describe("a fallback line", () => {
     mount(term, {
       client,
       initialTask: "go",
-      sponsorServe: servingNone([]),
-      sponsorFormats: BOTH,
       sponsorDirect: asking(
         {
           supported: true,
@@ -558,7 +496,6 @@ describe("a fallback line", () => {
     const withTerm = fakeTerminal(30, 120);
     mount(withTerm, {
       initialTask: "go",
-      sponsorServe: servingNone([]),
       sponsorDirect: asking({ supported: true, lines: [], fallbacks: [fallbackFor("top_bar")] }, []),
     });
     await settle(300);
@@ -567,7 +504,7 @@ describe("a fallback line", () => {
 
     for (const app of mounted.splice(0)) app.unmount();
     const without = fakeTerminal(30, 120);
-    mount(without, { initialTask: "go", sponsorServe: servingNone([]), sponsorDirect: asking({ supported: true, lines: [] }, []) });
+    mount(without, { initialTask: "go", sponsorDirect: asking({ supported: true, lines: [] }, []) });
     await settle(300);
     const row = lastFrame(without).find((r) => r.includes("✦"));
     expect(row).toContain("✦ clixad ·");
@@ -578,7 +515,6 @@ describe("a fallback line", () => {
     const term = fakeTerminal(30, 60);
     mount(term, {
       initialTask: "go",
-      sponsorServe: servingNone([]),
       sponsorDirect: asking({ supported: true, lines: [], fallbacks: [fallbackFor("top_bar")] }, []),
     });
     await settle(300);
@@ -593,13 +529,186 @@ describe("a fallback line", () => {
     const term = fakeTerminal(30, 120);
     mount(term, {
       initialTask: "go",
-      sponsorServe: servingNone([]),
       sponsorDirect: asking({ supported: true, lines: [], fallbacks: [fallbackFor("top_bar")] }, []),
     });
     await settle(300);
     expect(term.output()).toContain("\u001b]8;;https://app.clixad.io/r/railway/t\u0007");
     expect(clearCount(term)).toBe(0);
     expect(lastFrame(term).filter((r) => r.includes(FALLBACK.top_bar))).toHaveLength(1);
+  });
+});
+
+// ---- the network's ad -----------------------------------------------------------
+
+const GRAVITY: GravityLine = {
+  text: "Northwind: free CI minutes for open source",
+  impressionPath: "/gravity/api.trygravity.ai/track/imp?p=enc_imp",
+  clickPath: "/gravity/api.trygravity.ai/track/click?p=enc_click",
+};
+
+describe("the network's ad", () => {
+  afterEach(() => {
+    delete process.env.FORCE_HYPERLINK;
+  });
+
+  it("goes in the top bar, marked, and alone: no fallback and nothing in the other places", async () => {
+    const term = fakeTerminal(30, 120);
+    const { client, impressions, fallback, release } = watchingClient();
+    mount(term, {
+      client,
+      initialTask: "go",
+      sponsorDirect: asking({ supported: true, lines: [], fallbacks: ALL_FALLBACKS, gravity: GRAVITY }, []),
+    });
+    await settle(300);
+    const rows = lastFrame(term);
+    const top = rows.find((r) => r.includes(GRAVITY.text));
+    expect(top).toContain(`${AD_LABEL} · ${GRAVITY.text}`);
+    const out = plain(term.output());
+    for (const text of Object.values(FALLBACK)) expect(out).not.toContain(text);
+    // Only one advertisement mark on screen: the card's would be a second.
+    expect(rows.filter((r) => r.includes(AD_LABEL)).length).toBe(1);
+    expect(clearCount(term)).toBe(0);
+    release();
+    await settle(150);
+    expect(fallback).toEqual([]);
+    expect(impressions).toEqual([GRAVITY.impressionPath]);
+  });
+
+  it("tells its impression once, when it is first drawn, however often the frame repaints", async () => {
+    const term = fakeTerminal(30, 120);
+    const { client, impressions, release } = watchingClient();
+    let answer: (a: DirectAnswer) => void = () => {};
+    const slow = () => new Promise<DirectAnswer>((r) => (answer = r));
+    mount(term, { client, initialTask: "go", sponsorDirect: slow });
+    await settle(200);
+    // Asked, not yet answered: nothing drawn, nothing told.
+    expect(impressions).toEqual([]);
+    answer({ supported: true, lines: [], gravity: GRAVITY });
+    await settle(600);
+    expect(lastFrame(term).some((r) => r.includes(GRAVITY.text))).toBe(true);
+    expect(impressions).toEqual([GRAVITY.impressionPath]);
+    release();
+    await settle(150);
+    expect(impressions).toHaveLength(1);
+  });
+
+  it("is never cut: where it does not fit whole it is not drawn or told, and the fallback takes the place", async () => {
+    const term = fakeTerminal(30, 60);
+    const { client, impressions, release } = watchingClient();
+    mount(term, {
+      client,
+      initialTask: "go",
+      sponsorDirect: asking(
+        {
+          supported: true,
+          lines: [],
+          fallbacks: [fallbackFor("top_bar")],
+          // 55 columns of copy, where 60 columns leave it 42.
+          gravity: { ...GRAVITY, text: "Northwind: free CI minutes for every open source project" },
+        },
+        [],
+      ),
+    });
+    await settle(300);
+    const out = plain(term.output());
+    expect(out).not.toContain("Northwind");
+    expect(lastFrame(term).some((r) => r.includes(FALLBACK.top_bar))).toBe(true);
+    release();
+    await settle(150);
+    expect(impressions).toEqual([]);
+  });
+
+  it("gives way to a booked line, even one in another place", async () => {
+    const term = fakeTerminal(30, 120);
+    const { client, impressions, release } = watchingClient();
+    mount(term, {
+      client,
+      initialTask: "go",
+      sponsorDirect: asking({ supported: true, lines: [booked("status_bar")], gravity: GRAVITY }, []),
+    });
+    await settle(300);
+    const out = plain(term.output());
+    expect(out).not.toContain("Northwind");
+    expect(out).toContain(BOOKED_TEXT);
+    release();
+    await settle(150);
+    expect(impressions).toEqual([]);
+  });
+
+  it("is a link to the gateway's click address where the terminal understands one", async () => {
+    process.env.FORCE_HYPERLINK = "1";
+    const term = fakeTerminal(30, 120);
+    mount(term, { initialTask: "go", sponsorDirect: asking({ supported: true, lines: [], gravity: GRAVITY }, []) });
+    await settle(300);
+    expect(term.output()).toContain(`\u001b]8;;http://127.0.0.1:8787${GRAVITY.clickPath}\u0007`);
+    expect(clearCount(term)).toBe(0);
+  });
+
+  it("prints the network's short address where the terminal cannot link, only when both fit whole", async () => {
+    process.env.FORCE_HYPERLINK = "0";
+    const withShort = { ...GRAVITY, shortUrl: "https://trygravity.ai/c/k3p9" };
+    const wide = fakeTerminal(30, 120);
+    mount(wide, { initialTask: "go", sponsorDirect: asking({ supported: true, lines: [], gravity: withShort }, []) });
+    await settle(300);
+    expect(lastFrame(wide).find((r) => r.includes(GRAVITY.text))).toContain(`${GRAVITY.text} · trygravity.ai/c/k3p9`);
+    for (const app of mounted.splice(0)) app.unmount();
+    // At 70 columns the line fits and the address does not: the line stays whole and alone.
+    const narrow = fakeTerminal(30, 70);
+    mount(narrow, { initialTask: "go", sponsorDirect: asking({ supported: true, lines: [], gravity: withShort }, []) });
+    await settle(300);
+    const row = lastFrame(narrow).find((r) => r.includes(GRAVITY.text));
+    expect(row).toBeTruthy();
+    expect(row).not.toContain("trygravity.ai/c");
+    expect(row).not.toContain("…");
+  });
+
+  it("is dropped, and never told, when the answer lands after the turn it was asked for", async () => {
+    const term = fakeTerminal(30, 120);
+    const { client, impressions, release } = watchingClient();
+    let answer: (a: DirectAnswer) => void = () => {};
+    const slow = () => new Promise<DirectAnswer>((r) => (answer = r));
+    mount(term, { client, initialTask: "go", sponsorDirect: slow });
+    await settle(150);
+    release();
+    await settle(150);
+    answer({ supported: true, lines: [], gravity: GRAVITY });
+    await settle(200);
+    expect(plain(term.output())).not.toContain("Northwind");
+    expect(impressions).toEqual([]);
+  });
+
+  it("is not asked for with the sponsored line switched off", async () => {
+    process.env.CLIXAD_SPONSOR = "0";
+    const asks: Array<{ formats: readonly AdFormat[]; cols: number }> = [];
+    const { client, impressions } = watchingClient();
+    mount(fakeTerminal(30, 120), { client, initialTask: "go", sponsorDirect: asking({ supported: true, lines: [], gravity: GRAVITY }, asks) });
+    await settle(250);
+    expect(asks).toEqual([]);
+    expect(impressions).toEqual([]);
+  });
+});
+
+describe("reading the network's ad", () => {
+  it("takes paths on the gateway only, and drops the whole ad when any part is wrong", () => {
+    const ok = { text: "Northwind: free CI", impression_path: "/gravity/api.trygravity.ai/track/imp?p=1", click_path: "/gravity/api.trygravity.ai/track/click?p=2", short_url: "https://trygravity.ai/c/x" };
+    expect(parseGravityLine({ gravity: ok })).toEqual({
+      text: "Northwind: free CI",
+      impressionPath: ok.impression_path,
+      clickPath: ok.click_path,
+      shortUrl: ok.short_url,
+    });
+    // An address anywhere but the gateway's proxy is never fetched.
+    expect(parseGravityLine({ gravity: { ...ok, impression_path: "https://api.trygravity.ai/track/imp" } })).toBeUndefined();
+    expect(parseGravityLine({ gravity: { ...ok, impression_path: undefined } })).toBeUndefined();
+    expect(parseGravityLine({ gravity: { ...ok, text: "\u001b[2J" } })).toBeUndefined();
+    // A click address that is not the proxy's is left off; the ad stays.
+    expect(parseGravityLine({ gravity: { ...ok, click_path: "javascript:alert(1)" } })).toEqual({
+      text: ok.text,
+      impressionPath: ok.impression_path,
+      shortUrl: ok.short_url,
+    });
+    expect(parseGravityLine({ lines: [] })).toBeUndefined();
+    expect(parseGravityLine(null)).toBeUndefined();
   });
 });
 

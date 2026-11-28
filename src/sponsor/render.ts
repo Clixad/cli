@@ -161,8 +161,7 @@ const SHORT_AD_COLS = 29;
 /**
  * The narrowest terminal an advertisement is served into at all.
  *
- * Below it nothing is fetched, so nothing is billed — see `adFitsWidth`, and
- * `network.ts`, which refuses the serve rather than the render. The number is
+ * Below it nothing is asked for, so nothing is counted (see `adFitsWidth`). The number is
  * `SHORT_AD_COLS` plus the shortest prefix that still carries the disclosure:
  * at exactly this width a short ad renders **whole**, and one column less is
  * where the corpus stops producing a complete line at any length and the worst
@@ -184,13 +183,11 @@ export const AD_FULL_PREFIX_MIN_COLS =
   visibleLength(HOUSE_MARKER_ROW) + visibleLength(LABEL_ROW) + SHORT_AD_COLS;
 
 /**
- * Whether an advertisement may be *fetched* for a terminal this wide.
+ * Whether an advertisement may be *asked for* for a terminal this wide.
  *
- * The check belongs before the network call and not after it. A serve is the
- * billable event on ADtention's side, so an ad fetched into a terminal too
- * narrow to show it is an impression an advertiser pays for and nobody reads —
- * which is the one thing a slot like this must not manufacture. `network.ts`
- * calls it inside `serve()` so that no caller can route around it.
+ * The check belongs before the ask and not after it: a place the terminal
+ * cannot hold is never named to the gateway, so nothing is fetched for it,
+ * counted for it or sent anywhere on its behalf.
  */
 export function adFitsWidth(cols: number): boolean {
   return cols >= AD_MIN_COLS;
@@ -225,12 +222,11 @@ export const SIDEBAR_CARD_COLS = visibleLength(SIDEBAR_RULE) + SIDEBAR_BODY_COLS
 export const SIDEBAR_MIN_COLS = 50 + SIDEBAR_CARD_COLS;
 
 /**
- * Whether an advertisement in `format` may be *fetched* for a terminal this wide.
+ * Whether an advertisement in `format` may be *asked for* for a terminal this wide.
  *
- * `adFitsWidth`'s rule per format, for its reason: a serve is the billable
- * event, so the width is refused before the network is asked, never after. The
- * top bar and the status bar are both one row of `sponsorRow`, so they share its
- * floor; the card has its own.
+ * `adFitsWidth`'s rule per format, for its reason. The top bar and the status
+ * bar are both one row of `sponsorRow`, so they share its floor; the card has
+ * its own.
  */
 export function adFitsFormat(format: AdFormat, cols: number): boolean {
   return format === "sidebar_card" ? cols >= SIDEBAR_MIN_COLS : adFitsWidth(cols);
@@ -357,6 +353,25 @@ export function sponsorRow(
   }
   const body = visibleLength(line) <= room ? line : `${sliceColumns(line, room - 1).trimEnd()}…`;
   return { marker, label, body, link: null, origin };
+}
+
+/**
+ * The network ad's row: the whole line or nothing (2026-11-27).
+ *
+ * The network's rules say an ad is never cut, so where `sponsorRow` would
+ * shorten the copy this answers null and the row is not drawn, and an ad
+ * that is never drawn is never counted. The short address goes after the line
+ * only when both fit whole; without it the line is still the ad, and a
+ * terminal that understands links can still open it.
+ */
+export function wholeAdRow(line: string, cols: number, linkText?: string): SponsorRow | null {
+  if (!adFitsWidth(cols)) return null;
+  const marker = cols >= AD_FULL_PREFIX_MIN_COLS ? HOUSE_MARKER_ROW : AD_MARKER_ROW;
+  const room = cols - visibleLength(marker) - visibleLength(LABEL_ROW);
+  const width = visibleLength(line);
+  if (!line || width > room) return null;
+  const withLink = linkText ? width + visibleLength(LINK_SEPARATOR) + visibleLength(linkText) <= room : false;
+  return { marker, label: LABEL_ROW, body: line, link: withLink ? linkText! : null, origin: "network" };
 }
 
 /**

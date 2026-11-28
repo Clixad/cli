@@ -1,18 +1,14 @@
 /**
- * The three places this CLI shows an advertisement, by ADtention's names.
+ * The three places this CLI shows an advertisement.
  *
- *  - `top_bar`      the line above the input box — the sponsored line as it has
- *                   always been, and the only format a gateway serves unless it
- *                   is told otherwise.
+ *  - `top_bar`      the line above the input box, the sponsored line as it has
+ *                   always been, with our own tip in it when nothing else is.
  *  - `sidebar_card` two rows to the right of the working line, on a terminal
  *                   wide enough that the working line keeps its room.
  *  - `status_bar`   a row of its own under the status line.
  *
  * All three are drawn in the bottom re-rendered region, only while a model call
- * runs, and never beside or inside anything the model wrote. Each is served
- * under its own publisher id — a serve carries no format, so the id is how the
- * network tells them apart — and all three under the one subject the gateway
- * hands out.
+ * runs, and never beside or inside anything the model wrote.
  *
  * A copy of the gateway's own list, deliberately: this program is bundled for
  * npm and may import nothing but npm packages. The wire
@@ -22,7 +18,7 @@
 export const AD_FORMATS = ["top_bar", "sidebar_card", "status_bar"] as const;
 export type AdFormat = (typeof AD_FORMATS)[number];
 
-/** The formats beyond the original line, served only when the gateway hands them out. */
+/** The two places beyond the top bar, which have no house content. */
 export const EXTRA_AD_FORMATS = ["sidebar_card", "status_bar"] as const;
 export type ExtraAdFormat = (typeof EXTRA_AD_FORMATS)[number];
 
