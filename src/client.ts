@@ -2024,8 +2024,11 @@ export class GatewayClient {
   async networkImpression(path: string, signal?: AbortSignal): Promise<boolean> {
     if (!path.startsWith("/")) return false;
     try {
+      // `manual`: never followed anywhere, so a redirect can never take this
+      // request to a host other than the gateway.
       const res = await gatewayFetch(`${this.config.gatewayUrl}${path}`, {
         headers: { "user-agent": "clixad-cli" },
+        redirect: "manual",
         ...(signal ? { signal } : {}),
       });
       return res.ok;

@@ -510,6 +510,8 @@ describe("the network's ad", () => {
     const [url, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe(`${config.gatewayUrl}/gravity/api.trygravity.ai/track/imp?p=1`);
     expect(JSON.stringify(init.headers ?? {})).not.toContain("adg_");
+    // Never followed: a redirect cannot take it off the gateway.
+    expect(init.redirect).toBe("manual");
     // Anything that is not a path on the gateway is never fetched.
     expect(await client.networkImpression("https://api.trygravity.ai/track/imp")).toBe(false);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
